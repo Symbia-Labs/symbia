@@ -1047,6 +1047,7 @@ name = "symbia"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "ed25519-dalek",
  "futures",
  "getrandom",

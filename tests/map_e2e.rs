@@ -19,8 +19,9 @@ async fn spawn(home: &Path) -> Client {
     ().serve(TokioChildProcess::new(cmd).unwrap()).await.unwrap()
 }
 
-fn cli_verify(path: &Path) -> (bool, String) {
-    let out = StdCommand::new(BIN).arg("verify").arg(path).output().unwrap();
+/// `symbia verify` with `home` as the data directory, so its pinned keys apply.
+fn cli_verify(home: &Path, path: &Path) -> (bool, String) {
+    let out = StdCommand::new(BIN).arg("verify").arg(path).env("SYMBIA_HOME", home).output().unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text.trim().to_string())
 }
@@ -116,7 +117,7 @@ async fn map_run_prediction_then_result() {
         let v = symbia::seal::verify(path).unwrap();
         assert_eq!(v.chain_seq, seq);
         assert_eq!(v.session, session);
-        let (ok, line) = cli_verify(path);
+        let (ok, line) = cli_verify(t.path(), path);
         assert!(ok, "{line}");
         assert!(line.starts_with(&format!("ok {session} seq {seq} ")), "{line}");
     }
@@ -141,12 +142,12 @@ fn cli_verify_fails_with_one_line_reason() {
     .unwrap();
     store.write(&input, std::time::Instant::now()).unwrap();
     let sealed = symbia::seal::seal(&store, &key).unwrap();
-    assert!(cli_verify(&sealed.path).0);
+    assert!(cli_verify(t.path(), &sealed.path).0);
 
     let c = rusqlite::Connection::open(&sealed.path).unwrap();
     c.execute("UPDATE records SET lane = 'apocryphal'", []).unwrap();
     drop(c);
-    let out = StdCommand::new(BIN).arg("verify").arg(&sealed.path).output().unwrap();
+    let out = StdCommand::new(BIN).arg("verify").arg(&sealed.path).env("SYMBIA_HOME", t.path()).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "file sha256 mismatch\n");
 

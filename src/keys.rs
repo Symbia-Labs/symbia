@@ -10,8 +10,15 @@ pub fn device_key_path(home: &Path) -> PathBuf {
     home.join("keys").join("device.ed25519")
 }
 
-/// Load the device key, generating it with mode 0600 on first use.
+/// Load the device key, generating it with mode 0600 on first use, and pin it in `keys/trusted.json`.
 pub fn load_or_create(home: &Path) -> anyhow::Result<SigningKey> {
+    crate::home::ensure(home)?;
+    let key = load_or_generate(home)?;
+    crate::trust::add(home, &hex::encode(key.verifying_key().to_bytes()), "device")?;
+    Ok(key)
+}
+
+fn load_or_generate(home: &Path) -> anyhow::Result<SigningKey> {
     let path = device_key_path(home);
     if !path.exists() {
         let mut seed = [0u8; 32];

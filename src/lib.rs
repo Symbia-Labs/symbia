@@ -2,11 +2,13 @@
 
 pub mod canon;
 pub mod home;
+pub mod http;
 pub mod keys;
 pub mod mcp;
 pub mod record;
 pub mod seal;
 pub mod store;
+pub mod trust;
 
 /// Current UTC time in integer milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
