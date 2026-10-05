@@ -9,14 +9,14 @@ use serde_json::{Value, json};
 
 use crate::canon::{canonical, hex_prefix};
 use crate::now_ms;
-use crate::record::{GENESIS, IdFields, RecordInput, chain_hash, record_id};
+use crate::record::{FORMAT, GENESIS, IdFields, RecordInput, RowFields, chain_hash_v2, record_id, row_digest};
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const FIND_LIMIT_MAX: u32 = 50;
 const FIND_LIMIT_DEFAULT: u32 = 20;
 
 pub const SCHEMA: &str = "
-CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT) STRICT;
+CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT, format INTEGER NOT NULL, mcp_session_id TEXT) STRICT;
 CREATE TABLE chain (seq INTEGER PRIMARY KEY, prev_hash BLOB NOT NULL, hash BLOB NOT NULL, at_ms INTEGER NOT NULL, record_id TEXT) STRICT;
 CREATE TABLE records (
   id TEXT PRIMARY KEY, key TEXT NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL,
@@ -103,11 +103,16 @@ fn fts_query(q: &str) -> Option<String> {
 impl Store {
     /// Create a new session file under `home/sessions/` with a fresh session id.
     pub fn create(home: &Path) -> anyhow::Result<Self> {
-        let now = now_ms();
-        Self::create_with(home, &new_session_id(now)?, now + DEFAULT_TTL_MS)
+        Self::create_for_mcp(home, None)
     }
 
-    pub fn create_with(home: &Path, session: &str, expires_ms: i64) -> anyhow::Result<Self> {
+    /// Create a new session file bound to an MCP session id (streamable HTTP), or to none (stdio).
+    pub fn create_for_mcp(home: &Path, mcp_session_id: Option<&str>) -> anyhow::Result<Self> {
+        let now = now_ms();
+        Self::create_with(home, &new_session_id(now)?, now + DEFAULT_TTL_MS, mcp_session_id)
+    }
+
+    pub fn create_with(home: &Path, session: &str, expires_ms: i64, mcp_session_id: Option<&str>) -> anyhow::Result<Self> {
         crate::home::ensure(home)?;
         let path = home.join("sessions").join(format!("{session}.sqlite"));
         if path.exists() {
@@ -119,7 +124,10 @@ impl Store {
             bail!("could not enable WAL (got {mode})");
         }
         conn.execute_batch(SCHEMA)?;
-        conn.execute("INSERT INTO file_meta (retention, expires_ms, embed_runtime) VALUES ('session', ?1, NULL)", [expires_ms])?;
+        conn.execute(
+            "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('session', ?1, NULL, ?2, ?3)",
+            params![expires_ms, FORMAT, mcp_session_id],
+        )?;
         Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path })
     }
 
@@ -138,6 +146,14 @@ impl Store {
 
     pub fn retention(&self) -> anyhow::Result<String> {
         Ok(self.conn.query_row("SELECT retention FROM file_meta", [], |r| r.get(0))?)
+    }
+
+    pub fn expires_ms(&self) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0))?)
+    }
+
+    pub fn mcp_session_id(&self) -> anyhow::Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT mcp_session_id FROM file_meta", [], |r| r.get(0))?)
     }
 
     pub fn head(&self) -> anyhow::Result<(i64, [u8; 32])> {
@@ -169,9 +185,26 @@ impl Store {
         let (prev_seq, prev_hash) = chain_head(&tx)?;
         let at_ms = now_ms();
         let seq = prev_seq + 1;
-        let hash = chain_hash(&prev_hash, &id, at_ms);
-        let body_text = canonical(&input.body)?;
         let expires_ms: Option<i64> = tx.query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0))?;
+        let links: Vec<(String, String)> = input.links.iter().flatten().map(|l| (l.to_id.clone(), l.rel.clone())).collect();
+        let digest = row_digest(&RowFields {
+            id: &id,
+            key: &input.key,
+            version,
+            kind: &input.kind,
+            lane: &input.lane,
+            lane_reason: &input.lane_reason,
+            body: &input.body,
+            model: &input.model,
+            session: &self.session,
+            at_ms,
+            expires_ms,
+            est_host_ms: input.est_host_ms,
+            est_chars: input.est_chars,
+            links: &links,
+        })?;
+        let hash = chain_hash_v2(&prev_hash, &digest, at_ms);
+        let body_text = canonical(&input.body)?;
         tx.execute(
             "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, est_host_ms, est_chars)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -195,8 +228,8 @@ impl Store {
             "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![seq, prev_hash.as_slice(), hash.as_slice(), at_ms, id],
         )?;
-        for l in input.links.iter().flatten() {
-            tx.execute("INSERT INTO links (from_id, to_id, rel) VALUES (?1, ?2, ?3)", params![id, l.to_id, l.rel])?;
+        for (to_id, rel) in &links {
+            tx.execute("INSERT INTO links (from_id, to_id, rel) VALUES (?1, ?2, ?3)", params![id, to_id, rel])?;
         }
         tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, body_text])?;
         let written = Written { id, version, seq, head: hex_prefix(&hash, 12) };
@@ -338,6 +371,17 @@ mod tests {
         assert!(delta > DEFAULT_TTL_MS - 60_000 && delta <= DEFAULT_TTL_MS, "{delta}");
         assert!(s.path().starts_with(s.home().join("sessions")));
         assert_eq!(s.path().file_name().unwrap().to_str().unwrap(), format!("{}.sqlite", s.session()));
+        let format: i64 = s.conn().query_row("SELECT format FROM file_meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(format, 2);
+        assert_eq!(s.expires_ms().unwrap(), Some(exp));
+        assert_eq!(s.mcp_session_id().unwrap(), None);
+    }
+
+    #[test]
+    fn mcp_session_id_is_stored_in_file_meta() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Store::create_for_mcp(t.path(), Some("abc-123")).unwrap();
+        assert_eq!(s.mcp_session_id().unwrap().as_deref(), Some("abc-123"));
     }
 
     #[test]
@@ -390,7 +434,25 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].1, GENESIS.to_vec());
-        assert_eq!(rows[0].2, chain_hash(&GENESIS, &w1.id, rows[0].3).to_vec());
+        let r1 = s.get(&w1.id).unwrap().unwrap();
+        let digest = row_digest(&RowFields {
+            id: &w1.id,
+            key: "a",
+            version: 1,
+            kind: "observation",
+            lane: "canonical",
+            lane_reason: "test",
+            body: &json!(1),
+            model: "test-model",
+            session: s.session(),
+            at_ms: rows[0].3,
+            expires_ms: r1["expires_ms"].as_i64(),
+            est_host_ms: Some(5),
+            est_chars: Some(100),
+            links: &[],
+        })
+        .unwrap();
+        assert_eq!(rows[0].2, chain_hash_v2(&GENESIS, &digest, rows[0].3).to_vec());
         assert_eq!(rows[1].1, rows[0].2);
         assert_eq!(rows[1].4, w2.id);
         assert_eq!(hex_prefix(&rows[1].2, 12), w2.head);

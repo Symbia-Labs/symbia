@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::canon::{canonical, sha256};
 use crate::now_ms;
-use crate::record::{GENESIS, IdFields, chain_hash, record_id};
+use crate::record::{FORMAT, GENESIS, IdFields, RowFields, chain_hash, chain_hash_v2, record_id, row_digest};
 use crate::store::{Store, chain_head};
 
 /// The `.seal.json` sidecar. Byte fields are lowercase hex.
@@ -122,7 +122,46 @@ fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
     hex::decode(s).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).ok_or_else(|| format!("sidecar {what} is malformed"))
 }
 
-/// Verify a sealed copy against its sidecar. `Err` carries a one-line reason.
+/// A record row as stored, read back for verification.
+struct StoredRow {
+    key: String,
+    version: i64,
+    kind: String,
+    lane: String,
+    lane_reason: String,
+    body: String,
+    model: String,
+    session: String,
+    at_ms: i64,
+    expires_ms: Option<i64>,
+    est_host_ms: Option<i64>,
+    est_chars: Option<i64>,
+    host_ms: Option<i64>,
+    chars: Option<i64>,
+}
+
+/// `file_meta.format`; a file without the column predates it and is format 1.
+fn file_format(conn: &Connection) -> rusqlite::Result<i64> {
+    let has: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('file_meta') WHERE name = 'format'", [], |r| r.get(0))?;
+    if has == 0 {
+        return Ok(1);
+    }
+    conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0))
+}
+
+/// Verify a sealed copy, accepting only a sidecar key in `trusted` (lowercase hex).
+pub fn verify_trusted(path: &Path, trusted: &[String]) -> Result<Verified, String> {
+    let sc = read_sidecar(path).map_err(|e| format!("sidecar unreadable: {e}"))?;
+    let pk = sc.public_key.to_ascii_lowercase();
+    if !trusted.contains(&pk) {
+        let mut short = pk;
+        short.truncate(12);
+        return Err(format!("untrusted key {short}"));
+    }
+    verify(path)
+}
+
+/// Verify a sealed copy against its sidecar, whatever key signed it. `Err` carries a one-line reason.
 pub fn verify(path: &Path) -> Result<Verified, String> {
     let sc = read_sidecar(path).map_err(|e| format!("sidecar unreadable: {e}"))?;
     let want_sha = hex32(&sc.file_sha256, "file_sha256")?;
@@ -148,10 +187,19 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         return Err(format!("retention is {retention:?}, not \"seal\""));
     }
 
+    let format = file_format(&conn).map_err(db)?;
+    if !(1..=FORMAT).contains(&format) {
+        return Err(format!("unknown file format {format}"));
+    }
+
     let mut chain = conn.prepare("SELECT seq, prev_hash, hash, at_ms, record_id FROM chain ORDER BY seq").map_err(db)?;
     let mut rec = conn
-        .prepare("SELECT key, version, kind, lane, json(body), model, session, at_ms FROM records WHERE id = ?1")
+        .prepare(
+            "SELECT key, version, kind, lane, lane_reason, json(body), model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars
+             FROM records WHERE id = ?1",
+        )
         .map_err(db)?;
+    let mut links = conn.prepare("SELECT to_id, rel FROM links WHERE from_id = ?1").map_err(db)?;
     let rows = chain
         .query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
@@ -168,42 +216,94 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         if prev_hash != prev {
             return Err(format!("chain prev_hash mismatch at seq {seq}"));
         }
-        let computed = chain_hash(&prev, rid.as_deref().unwrap_or(""), at_ms);
+        let Some(rid) = rid else {
+            // Format 1 hashed a record-less chain row as an empty id; format 2 has no such rows.
+            if format != 1 {
+                return Err(format!("chain row without record at seq {seq}"));
+            }
+            let computed = chain_hash(&prev, "", at_ms);
+            if hash != computed {
+                return Err(format!("chain hash mismatch at seq {seq}"));
+            }
+            prev = computed;
+            seq_expected += 1;
+            continue;
+        };
+        on_chain += 1;
+        let r = rec
+            .query_row([&rid], |r| {
+                Ok(StoredRow {
+                    key: r.get(0)?,
+                    version: r.get(1)?,
+                    kind: r.get(2)?,
+                    lane: r.get(3)?,
+                    lane_reason: r.get(4)?,
+                    body: r.get(5)?,
+                    model: r.get(6)?,
+                    session: r.get(7)?,
+                    at_ms: r.get(8)?,
+                    expires_ms: r.get(9)?,
+                    est_host_ms: r.get(10)?,
+                    est_chars: r.get(11)?,
+                    host_ms: r.get(12)?,
+                    chars: r.get(13)?,
+                })
+            })
+            .optional()
+            .map_err(db)?;
+        let Some(r) = r else {
+            return Err(format!("record missing at seq {seq}"));
+        };
+        let body: Value = serde_json::from_str(&r.body).map_err(|_| format!("record body unreadable at seq {seq}"))?;
+        let id = record_id(&IdFields {
+            key: &r.key,
+            version: r.version,
+            kind: &r.kind,
+            lane: &r.lane,
+            body: &body,
+            model: &r.model,
+            session: &r.session,
+        })
+        .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
+        if id != rid {
+            return Err(format!("record id mismatch at seq {seq}"));
+        }
+        let computed = if format == 1 {
+            chain_hash(&prev, &rid, at_ms)
+        } else {
+            let row_links: Vec<(String, String)> =
+                links.query_map([&rid], |l| Ok((l.get(0)?, l.get(1)?))).map_err(db)?.collect::<Result<_, _>>().map_err(db)?;
+            // The chain row's at_ms stands in for the record's; the two are compared below.
+            let digest = row_digest(&RowFields {
+                id: &rid,
+                key: &r.key,
+                version: r.version,
+                kind: &r.kind,
+                lane: &r.lane,
+                lane_reason: &r.lane_reason,
+                body: &body,
+                model: &r.model,
+                session: &r.session,
+                at_ms,
+                expires_ms: r.expires_ms,
+                est_host_ms: r.est_host_ms,
+                est_chars: r.est_chars,
+                links: &row_links,
+            })
+            .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
+            chain_hash_v2(&prev, &digest, at_ms)
+        };
         if hash != computed {
             return Err(format!("chain hash mismatch at seq {seq}"));
         }
-        if let Some(rid) = rid {
-            on_chain += 1;
-            let r = rec
-                .query_row([&rid], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, i64>(7)?,
-                    ))
-                })
-                .optional()
-                .map_err(db)?;
-            let Some((key, version, kind, lane, body, model, session, rec_at)) = r else {
-                return Err(format!("record missing at seq {seq}"));
-            };
-            let body: Value = serde_json::from_str(&body).map_err(|_| format!("record body unreadable at seq {seq}"))?;
-            let id = record_id(&IdFields { key: &key, version, kind: &kind, lane: &lane, body: &body, model: &model, session: &session })
-                .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
-            if id != rid {
-                return Err(format!("record id mismatch at seq {seq}"));
-            }
-            if rec_at != at_ms {
-                return Err(format!("record at_ms mismatch at seq {seq}"));
-            }
-            if session != sc.session {
-                return Err(format!("record session mismatch at seq {seq}"));
-            }
+        if r.at_ms != at_ms {
+            return Err(format!("record at_ms mismatch at seq {seq}"));
+        }
+        if r.session != sc.session {
+            return Err(format!("record session mismatch at seq {seq}"));
+        }
+        if r.host_ms.is_none() || r.chars.is_none() {
+            return Err(format!("record cost fields missing at seq {seq}"));
         }
         prev = computed;
         seq_expected += 1;
@@ -211,6 +311,12 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).map_err(db)?;
     if total != on_chain {
         return Err(format!("{} record(s) not on the chain", total - on_chain));
+    }
+    let stray: i64 = conn
+        .query_row("SELECT COUNT(*) FROM links WHERE from_id NOT IN (SELECT record_id FROM chain WHERE record_id IS NOT NULL)", [], |r| r.get(0))
+        .map_err(db)?;
+    if stray != 0 {
+        return Err(format!("{stray} link(s) not on the chain"));
     }
     let last_seq = seq_expected - 1;
     if last_seq != sc.chain_seq {
@@ -225,7 +331,7 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RecordInput;
+    use crate::record::{LinkInput, RecordInput};
     use serde_json::json;
     use std::time::Instant;
 
@@ -254,9 +360,11 @@ mod tests {
         let mut store = Store::create(t.path()).unwrap();
         let key = crate::keys::load_or_create(t.path()).unwrap();
         // Tricky bodies: unicode, escapes, float forms, large integers.
-        store.write(&input("a", json!({"t": "café \u{1F600} \"q\" \\ \n", "f": 0.1, "e": 1e21, "n": -0.0})), Instant::now()).unwrap();
+        let a1 = store.write(&input("a", json!({"t": "café \u{1F600} \"q\" \\ \n", "f": 0.1, "e": 1e21, "n": -0.0})), Instant::now()).unwrap();
         store.write(&input("b", json!({"big": 9007199254740993u64, "neg": -42, "arr": [1.5, "x", null]})), Instant::now()).unwrap();
-        store.write(&input("a", json!(["v2"])), Instant::now()).unwrap();
+        let mut a2 = input("a", json!(["v2"]));
+        a2.links = Some(vec![LinkInput { to_id: a1.id, rel: "revises".into() }]);
+        store.write(&a2, Instant::now()).unwrap();
         Fx { _t: t, store, key }
     }
 
@@ -384,6 +492,80 @@ mod tests {
         );
         resign(&s.path, &f.key);
         assert_eq!(verify(&s.path).unwrap_err(), "1 record(s) not on the chain");
+    }
+
+    #[test]
+    fn tampered_write_time_fields_fail_chain_hash() {
+        let cases = [
+            ("UPDATE records SET lane_reason = 'other' WHERE key = 'b'", 2),
+            ("UPDATE links SET rel = 'cites'", 3),
+            ("UPDATE links SET to_id = (SELECT id FROM records WHERE key = 'b')", 3),
+            ("UPDATE records SET expires_ms = expires_ms + 1 WHERE key = 'b'", 2),
+            ("UPDATE records SET est_host_ms = 1 WHERE key = 'b'", 2),
+            ("UPDATE records SET est_chars = 1 WHERE key = 'b'", 2),
+        ];
+        for (sql, seq) in cases {
+            let f = fx();
+            let s = seal(&f.store, &f.key).unwrap();
+            tamper(&s.path, sql);
+            resign(&s.path, &f.key);
+            assert_eq!(verify(&s.path).unwrap_err(), format!("chain hash mismatch at seq {seq}"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn sealed_records_need_cost_fields_and_no_stray_links() {
+        let cases = [
+            ("UPDATE records SET host_ms = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
+            ("UPDATE records SET chars = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
+            ("INSERT INTO links (from_id, to_id, rel) VALUES ('x', 'y', 'cites')", "1 link(s) not on the chain"),
+            ("UPDATE file_meta SET format = 3", "unknown file format 3"),
+        ];
+        for (sql, want) in cases {
+            let f = fx();
+            let s = seal(&f.store, &f.key).unwrap();
+            tamper(&s.path, sql);
+            resign(&s.path, &f.key);
+            assert_eq!(verify(&s.path).unwrap_err(), want, "{sql}");
+        }
+    }
+
+    /// A seal written by the part 1 build: no `format` column, chain over record ids only.
+    fn format1_fixture() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dst = t.path().join("format1.sqlite");
+        std::fs::copy(src.join("format1.sqlite"), &dst).unwrap();
+        std::fs::copy(src.join("format1.seal.json"), sidecar_path(&dst)).unwrap();
+        (t, dst)
+    }
+
+    #[test]
+    fn format1_seal_still_verifies() {
+        let (_t, path) = format1_fixture();
+        let c = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(file_format(&c).unwrap(), 1);
+        let links: i64 = c.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0)).unwrap();
+        assert_eq!(links, 1);
+        let v = verify(&path).unwrap();
+        assert_eq!(v.chain_seq, 2);
+    }
+
+    #[test]
+    fn verify_trusted_rejects_unpinned_keys() {
+        let f = fx();
+        let s = seal(&f.store, &f.key).unwrap();
+        let own = hex::encode(f.key.verifying_key().to_bytes());
+        assert!(verify_trusted(&s.path, std::slice::from_ref(&own)).is_ok());
+        // Re-signed with a fresh key: the file is internally consistent but the key is not pinned.
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let mut sc = read_sidecar(&s.path).unwrap();
+        sc.public_key = hex::encode(other.verifying_key().to_bytes());
+        std::fs::write(sidecar_path(&s.path), canonical(&sc).unwrap()).unwrap();
+        resign(&s.path, &other);
+        assert!(verify(&s.path).is_ok());
+        assert_eq!(verify_trusted(&s.path, &[own]).unwrap_err(), format!("untrusted key {}", &sc.public_key[..12]));
+        assert!(verify_trusted(&s.path, &[sc.public_key.clone()]).is_ok());
     }
 
     #[test]

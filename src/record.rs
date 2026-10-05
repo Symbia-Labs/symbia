@@ -45,7 +45,63 @@ pub fn record_id(f: &IdFields) -> anyhow::Result<String> {
     Ok(hex::encode(sha256(canonical(&doc)?.as_bytes())))
 }
 
-/// `sha256(prev_hash || record_id_utf8 || at_ms as 8-byte big-endian)`.
+/// Chain format written by this build. Format 1 chained only the record id.
+pub const FORMAT: i64 = 2;
+
+/// The write-time fields a format 2 row digest covers.
+#[derive(Clone, Copy)]
+pub struct RowFields<'a> {
+    pub id: &'a str,
+    pub key: &'a str,
+    pub version: i64,
+    pub kind: &'a str,
+    pub lane: &'a str,
+    pub lane_reason: &'a str,
+    pub body: &'a Value,
+    pub model: &'a str,
+    pub session: &'a str,
+    pub at_ms: i64,
+    pub expires_ms: Option<i64>,
+    pub est_host_ms: Option<i64>,
+    pub est_chars: Option<i64>,
+    /// Outgoing links as `(to_id, rel)`, in any order.
+    pub links: &'a [(String, String)],
+}
+
+/// sha256 of the RFC 8785 JSON of every write-time field, with links sorted by `(to_id, rel)`.
+pub fn row_digest(f: &RowFields) -> anyhow::Result<[u8; 32]> {
+    let mut links = f.links.to_vec();
+    links.sort();
+    let links: Vec<Value> = links.into_iter().map(|(to_id, rel)| json!({"to_id": to_id, "rel": rel})).collect();
+    let doc = json!({
+        "id": f.id,
+        "key": f.key,
+        "version": f.version,
+        "kind": f.kind,
+        "lane": f.lane,
+        "lane_reason": f.lane_reason,
+        "body": f.body,
+        "model": f.model,
+        "session": f.session,
+        "at_ms": f.at_ms,
+        "expires_ms": f.expires_ms,
+        "est_host_ms": f.est_host_ms,
+        "est_chars": f.est_chars,
+        "links": links,
+    });
+    Ok(sha256(canonical(&doc)?.as_bytes()))
+}
+
+/// Format 2: `sha256(prev_hash || row_digest || at_ms as 8-byte big-endian)`.
+pub fn chain_hash_v2(prev_hash: &[u8; 32], row_digest: &[u8; 32], at_ms: i64) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(72);
+    buf.extend_from_slice(prev_hash);
+    buf.extend_from_slice(row_digest);
+    buf.extend_from_slice(&at_ms.to_be_bytes());
+    sha256(&buf)
+}
+
+/// Format 1: `sha256(prev_hash || record_id_utf8 || at_ms as 8-byte big-endian)`.
 pub fn chain_hash(prev_hash: &[u8; 32], record_id: &str, at_ms: i64) -> [u8; 32] {
     let mut buf = Vec::with_capacity(32 + record_id.len() + 8);
     buf.extend_from_slice(prev_hash);
@@ -181,6 +237,80 @@ mod tests {
         buf.extend_from_slice(b"abc");
         buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0]);
         assert_eq!(chain_hash(&GENESIS, "abc", 256), sha256(&buf));
+    }
+
+    fn row<'a>(body: &'a Value, links: &'a [(String, String)]) -> RowFields<'a> {
+        RowFields {
+            id: "i",
+            key: "k",
+            version: 1,
+            kind: "result",
+            lane: "canonical",
+            lane_reason: "r",
+            body,
+            model: "m",
+            session: "s",
+            at_ms: 5,
+            expires_ms: None,
+            est_host_ms: Some(1),
+            est_chars: None,
+            links,
+        }
+    }
+
+    #[test]
+    fn row_digest_matches_hand_computed_digest() {
+        let body = json!({"x": 1});
+        let links = [("b".to_string(), "cites".to_string()), ("a".to_string(), "results_of".to_string())];
+        let text = concat!(
+            r#"{"at_ms":5,"body":{"x":1},"est_chars":null,"est_host_ms":1,"expires_ms":null,"id":"i","key":"k","kind":"result","lane":"canonical","#,
+            r#""lane_reason":"r","links":[{"rel":"results_of","to_id":"a"},{"rel":"cites","to_id":"b"}],"model":"m","session":"s","version":1}"#
+        );
+        assert_eq!(row_digest(&row(&body, &links)).unwrap(), sha256(text.as_bytes()));
+        // Link order does not matter; links are sorted by (to_id, rel).
+        let reversed = [links[1].clone(), links[0].clone()];
+        assert_eq!(row_digest(&row(&body, &reversed)).unwrap(), row_digest(&row(&body, &links)).unwrap());
+    }
+
+    #[test]
+    fn row_digest_changes_with_every_covered_field() {
+        let body = json!({"x": 1});
+        let other_body = json!({"x": 2});
+        let links = [("a".to_string(), "cites".to_string())];
+        let rel = [("a".to_string(), "revises".to_string())];
+        let to = [("b".to_string(), "cites".to_string())];
+        let f = row(&body, &links);
+        let a = row_digest(&f).unwrap();
+        let variants = [
+            RowFields { id: "j", ..f },
+            RowFields { key: "k2", ..f },
+            RowFields { version: 2, ..f },
+            RowFields { kind: "claim", ..f },
+            RowFields { lane: "apocryphal", ..f },
+            RowFields { lane_reason: "r2", ..f },
+            RowFields { body: &other_body, ..f },
+            RowFields { model: "m2", ..f },
+            RowFields { session: "s2", ..f },
+            RowFields { at_ms: 6, ..f },
+            RowFields { expires_ms: Some(9), ..f },
+            RowFields { est_host_ms: None, ..f },
+            RowFields { est_chars: Some(0), ..f },
+            RowFields { links: &rel, ..f },
+            RowFields { links: &to, ..f },
+            RowFields { links: &[], ..f },
+        ];
+        for v in &variants {
+            assert_ne!(row_digest(v).unwrap(), a);
+        }
+    }
+
+    #[test]
+    fn chain_hash_v2_layout() {
+        let digest = [7u8; 32];
+        let mut buf = vec![1u8; 32];
+        buf.extend_from_slice(&digest);
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(chain_hash_v2(&[1u8; 32], &digest, 256), sha256(&buf));
     }
 
     fn input() -> RecordInput {
