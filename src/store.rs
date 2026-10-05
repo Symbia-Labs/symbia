@@ -1,0 +1,482 @@
+//! One SQLite file per session: records, chain, links, evidence and a full-text index.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use anyhow::{Context, bail};
+use rusqlite::{Connection, OptionalExtension, ToSql, params};
+use serde_json::{Value, json};
+
+use crate::canon::{canonical, hex_prefix};
+use crate::now_ms;
+use crate::record::{GENESIS, IdFields, RecordInput, chain_hash, record_id};
+
+pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub const FIND_LIMIT_MAX: u32 = 50;
+const FIND_LIMIT_DEFAULT: u32 = 20;
+
+pub const SCHEMA: &str = "
+CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT) STRICT;
+CREATE TABLE chain (seq INTEGER PRIMARY KEY, prev_hash BLOB NOT NULL, hash BLOB NOT NULL, at_ms INTEGER NOT NULL, record_id TEXT) STRICT;
+CREATE TABLE records (
+  id TEXT PRIMARY KEY, key TEXT NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL,
+  lane TEXT NOT NULL, lane_reason TEXT NOT NULL, body BLOB NOT NULL, model TEXT NOT NULL,
+  session TEXT NOT NULL, at_ms INTEGER NOT NULL, expires_ms INTEGER,
+  est_host_ms INTEGER, est_chars INTEGER, host_ms INTEGER, chars INTEGER,
+  UNIQUE (key, version)) STRICT;
+CREATE TABLE links (from_id TEXT NOT NULL, to_id TEXT NOT NULL, rel TEXT NOT NULL) STRICT;
+CREATE TABLE evidence (sha256 BLOB PRIMARY KEY, bytes INTEGER NOT NULL, media TEXT NOT NULL) STRICT;
+CREATE VIRTUAL TABLE records_fts USING fts5(id UNINDEXED, key, body);
+CREATE INDEX links_from ON links (from_id);
+CREATE INDEX links_to ON links (to_id);
+CREATE INDEX chain_record ON chain (record_id);
+";
+
+pub struct Store {
+    conn: Connection,
+    home: PathBuf,
+    session: String,
+    path: PathBuf,
+}
+
+/// Reference returned for a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    pub id: String,
+    pub version: i64,
+    pub seq: i64,
+    /// First 12 hex chars of the chain hash after this write.
+    pub head: String,
+}
+
+impl Written {
+    /// The terse tool reply for this write.
+    pub fn reply(&self) -> String {
+        json!({"id": self.id, "version": self.version, "seq": self.seq, "head": self.head}).to_string()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FindQuery {
+    pub query: Option<String>,
+    pub kind: Option<String>,
+    pub lane: Option<String>,
+    pub key_prefix: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FindHit {
+    pub id: String,
+    pub key: String,
+    pub version: i64,
+    pub kind: String,
+    pub lane: String,
+}
+
+pub fn new_session_id(at_ms: i64) -> anyhow::Result<String> {
+    let mut r = [0u8; 4];
+    getrandom::fill(&mut r).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    Ok(format!("{at_ms}-{}", hex::encode(r)))
+}
+
+/// Latest chain `(seq, hash)`, or `(0, GENESIS)` for an empty chain.
+pub fn chain_head(conn: &Connection) -> anyhow::Result<(i64, [u8; 32])> {
+    let row: Option<(i64, Vec<u8>)> = conn
+        .query_row("SELECT seq, hash FROM chain ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    match row {
+        None => Ok((0, GENESIS)),
+        Some((seq, hash)) => {
+            let hash = <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| anyhow::anyhow!("chain hash at seq {seq} is not 32 bytes"))?;
+            Ok((seq, hash))
+        }
+    }
+}
+
+/// Quote each whitespace-separated term as an FTS5 phrase so user text is never parsed as query syntax.
+fn fts_query(q: &str) -> Option<String> {
+    let terms: Vec<String> = q.split_whitespace().map(|t| format!("\"{}\"", t.replace('"', "\"\""))).collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+impl Store {
+    /// Create a new session file under `home/sessions/` with a fresh session id.
+    pub fn create(home: &Path) -> anyhow::Result<Self> {
+        let now = now_ms();
+        Self::create_with(home, &new_session_id(now)?, now + DEFAULT_TTL_MS)
+    }
+
+    pub fn create_with(home: &Path, session: &str, expires_ms: i64) -> anyhow::Result<Self> {
+        crate::home::ensure(home)?;
+        let path = home.join("sessions").join(format!("{session}.sqlite"));
+        if path.exists() {
+            bail!("session file {} already exists", path.display());
+        }
+        let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            bail!("could not enable WAL (got {mode})");
+        }
+        conn.execute_batch(SCHEMA)?;
+        conn.execute("INSERT INTO file_meta (retention, expires_ms, embed_runtime) VALUES ('session', ?1, NULL)", [expires_ms])?;
+        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path })
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn retention(&self) -> anyhow::Result<String> {
+        Ok(self.conn.query_row("SELECT retention FROM file_meta", [], |r| r.get(0))?)
+    }
+
+    pub fn head(&self) -> anyhow::Result<(i64, [u8; 32])> {
+        chain_head(&self.conn)
+    }
+
+    /// Write a record, its chain row and its links in one transaction.
+    ///
+    /// `started` marks when handling began; `host_ms` and `chars` are measured against the reply.
+    pub fn write(&mut self, input: &RecordInput, started: Instant) -> anyhow::Result<Written> {
+        input.validate()?;
+        let tx = self.conn.transaction()?;
+        let version: i64 = tx.query_row("SELECT COALESCE(MAX(version), 0) + 1 FROM records WHERE key = ?1", [&input.key], |r| r.get(0))?;
+        let id = record_id(&IdFields {
+            key: &input.key,
+            version,
+            kind: &input.kind,
+            lane: &input.lane,
+            body: &input.body,
+            model: &input.model,
+            session: &self.session,
+        })?;
+        for l in input.links.iter().flatten() {
+            let found: Option<i64> = tx.query_row("SELECT 1 FROM records WHERE id = ?1", [&l.to_id], |r| r.get(0)).optional()?;
+            if found.is_none() {
+                bail!("link target {} not found", l.to_id);
+            }
+        }
+        let (prev_seq, prev_hash) = chain_head(&tx)?;
+        let at_ms = now_ms();
+        let seq = prev_seq + 1;
+        let hash = chain_hash(&prev_hash, &id, at_ms);
+        let body_text = canonical(&input.body)?;
+        let expires_ms: Option<i64> = tx.query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0))?;
+        tx.execute(
+            "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, est_host_ms, est_chars)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id,
+                input.key,
+                version,
+                input.kind,
+                input.lane,
+                input.lane_reason,
+                body_text,
+                input.model,
+                self.session,
+                at_ms,
+                expires_ms,
+                input.est_host_ms,
+                input.est_chars
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![seq, prev_hash.as_slice(), hash.as_slice(), at_ms, id],
+        )?;
+        for l in input.links.iter().flatten() {
+            tx.execute("INSERT INTO links (from_id, to_id, rel) VALUES (?1, ?2, ?3)", params![id, l.to_id, l.rel])?;
+        }
+        tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, body_text])?;
+        let written = Written { id, version, seq, head: hex_prefix(&hash, 12) };
+        let chars = i64::try_from(written.reply().chars().count())?;
+        let host_ms = i64::try_from(started.elapsed().as_millis())?;
+        tx.execute("UPDATE records SET host_ms = ?1, chars = ?2 WHERE id = ?3", params![host_ms, chars, written.id])?;
+        tx.commit()?;
+        Ok(written)
+    }
+
+    pub fn find(&self, q: &FindQuery) -> anyhow::Result<Vec<FindHit>> {
+        let limit = q.limit.unwrap_or(FIND_LIMIT_DEFAULT).clamp(1, FIND_LIMIT_MAX);
+        let mut sql = String::from("SELECT r.id, r.key, r.version, r.kind, r.lane FROM records r JOIN chain c ON c.record_id = r.id");
+        let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+        let fts = q.query.as_deref().and_then(fts_query);
+        if fts.is_some() {
+            sql.push_str(" JOIN records_fts ON records_fts.id = r.id");
+        }
+        sql.push_str(" WHERE 1 = 1");
+        if let Some(m) = fts.clone() {
+            sql.push_str(" AND records_fts MATCH ?");
+            args.push(Box::new(m));
+        }
+        if let Some(k) = &q.kind {
+            sql.push_str(" AND r.kind = ?");
+            args.push(Box::new(k.clone()));
+        }
+        if let Some(l) = &q.lane {
+            sql.push_str(" AND r.lane = ?");
+            args.push(Box::new(l.clone()));
+        }
+        if let Some(p) = &q.key_prefix {
+            sql.push_str(" AND substr(r.key, 1, length(?)) = ?");
+            args.push(Box::new(p.clone()));
+            args.push(Box::new(p.clone()));
+        }
+        sql.push_str(if fts.is_some() { " ORDER BY records_fts.rank, c.seq DESC" } else { " ORDER BY c.seq DESC" });
+        sql.push_str(" LIMIT ?");
+        args.push(Box::new(limit));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok(FindHit { id: r.get(0)?, key: r.get(1)?, version: r.get(2)?, kind: r.get(3)?, lane: r.get(4)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Resolve `(key, version)` to an id; the latest version when `version` is `None`.
+    pub fn id_for_key(&self, key: &str, version: Option<i64>) -> anyhow::Result<Option<String>> {
+        let id = match version {
+            Some(v) => self.conn.query_row("SELECT id FROM records WHERE key = ?1 AND version = ?2", params![key, v], |r| r.get(0)),
+            None => self.conn.query_row("SELECT id FROM records WHERE key = ?1 ORDER BY version DESC LIMIT 1", [key], |r| r.get(0)),
+        };
+        Ok(id.optional()?)
+    }
+
+    /// The full record with its links, or `None`.
+    pub fn get(&self, id: &str) -> anyhow::Result<Option<Value>> {
+        let rec = self
+            .conn
+            .query_row(
+                "SELECT r.id, r.key, r.version, r.kind, r.lane, r.lane_reason, json(r.body), r.model, r.session, r.at_ms, r.expires_ms,
+                        r.est_host_ms, r.est_chars, r.host_ms, r.chars, c.seq
+                 FROM records r LEFT JOIN chain c ON c.record_id = r.id WHERE r.id = ?1",
+                [id],
+                |r| {
+                    let body: String = r.get(6)?;
+                    Ok((
+                        json!({
+                            "id": r.get::<_, String>(0)?,
+                            "key": r.get::<_, String>(1)?,
+                            "version": r.get::<_, i64>(2)?,
+                            "kind": r.get::<_, String>(3)?,
+                            "lane": r.get::<_, String>(4)?,
+                            "lane_reason": r.get::<_, String>(5)?,
+                            "model": r.get::<_, String>(7)?,
+                            "session": r.get::<_, String>(8)?,
+                            "at_ms": r.get::<_, i64>(9)?,
+                            "expires_ms": r.get::<_, Option<i64>>(10)?,
+                            "est_host_ms": r.get::<_, Option<i64>>(11)?,
+                            "est_chars": r.get::<_, Option<i64>>(12)?,
+                            "host_ms": r.get::<_, Option<i64>>(13)?,
+                            "chars": r.get::<_, Option<i64>>(14)?,
+                            "seq": r.get::<_, Option<i64>>(15)?,
+                        }),
+                        body,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((mut rec, body)) = rec else { return Ok(None) };
+        rec["body"] = serde_json::from_str(&body)?;
+        let mut stmt = self.conn.prepare("SELECT to_id, rel FROM links WHERE from_id = ?1 ORDER BY rowid")?;
+        let links: Vec<Value> = stmt
+            .query_map([id], |r| Ok(json!({"to_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?})))?
+            .collect::<Result<_, _>>()?;
+        let mut stmt = self.conn.prepare("SELECT from_id, rel FROM links WHERE to_id = ?1 ORDER BY rowid")?;
+        let linked_from: Vec<Value> = stmt
+            .query_map([id], |r| Ok(json!({"from_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?})))?
+            .collect::<Result<_, _>>()?;
+        rec["links"] = links.into();
+        rec["linked_from"] = linked_from.into();
+        Ok(Some(rec))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::LinkInput;
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let t = tempfile::tempdir().unwrap();
+        let s = Store::create(t.path()).unwrap();
+        (t, s)
+    }
+
+    fn input(key: &str, kind: &str, body: Value) -> RecordInput {
+        RecordInput {
+            key: key.into(),
+            kind: kind.into(),
+            lane: "canonical".into(),
+            lane_reason: "test".into(),
+            body,
+            model: "test-model".into(),
+            est_host_ms: Some(5),
+            est_chars: Some(100),
+            links: None,
+        }
+    }
+
+    #[test]
+    fn new_file_is_wal_session_with_expiry() {
+        let (_t, s) = store();
+        let mode: String = s.conn().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(s.retention().unwrap(), "session");
+        let exp: i64 = s.conn().query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0)).unwrap();
+        let delta = exp - now_ms();
+        assert!(delta > DEFAULT_TTL_MS - 60_000 && delta <= DEFAULT_TTL_MS, "{delta}");
+        assert!(s.path().starts_with(s.home().join("sessions")));
+        assert_eq!(s.path().file_name().unwrap().to_str().unwrap(), format!("{}.sqlite", s.session()));
+    }
+
+    #[test]
+    fn tables_are_strict() {
+        let (_t, s) = store();
+        let err = s.conn().execute("INSERT INTO evidence (sha256, bytes, media) VALUES (x'00', 'many', 'text/plain')", []);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn bundled_sqlite_stores_jsonb() {
+        let (_t, mut s) = store();
+        let w = s.write(&input("k", "observation", json!({"a": 1})), Instant::now()).unwrap();
+        let (is_text, valid): (bool, i64) = s
+            .conn()
+            .query_row("SELECT typeof(body) = 'text', json_valid(body, 8) FROM records WHERE id = ?1", [&w.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert!(!is_text);
+        assert_eq!(valid, 1);
+    }
+
+    #[test]
+    fn versions_increment_per_key() {
+        let (_t, mut s) = store();
+        let a1 = s.write(&input("a", "observation", json!(1)), Instant::now()).unwrap();
+        let b1 = s.write(&input("b", "observation", json!(1)), Instant::now()).unwrap();
+        let a2 = s.write(&input("a", "observation", json!(1)), Instant::now()).unwrap();
+        let a3 = s.write(&input("a", "observation", json!(2)), Instant::now()).unwrap();
+        assert_eq!((a1.version, b1.version, a2.version, a3.version), (1, 1, 2, 3));
+        assert_eq!((a1.seq, b1.seq, a2.seq, a3.seq), (1, 2, 3, 4));
+        assert_ne!(a1.id, a2.id);
+        assert_eq!(s.id_for_key("a", None).unwrap(), Some(a3.id.clone()));
+        assert_eq!(s.id_for_key("a", Some(2)).unwrap(), Some(a2.id));
+        assert_eq!(s.id_for_key("a", Some(9)).unwrap(), None);
+    }
+
+    #[test]
+    fn chain_links_each_write_to_the_last() {
+        let (_t, mut s) = store();
+        let w1 = s.write(&input("a", "observation", json!(1)), Instant::now()).unwrap();
+        let w2 = s.write(&input("b", "observation", json!(2)), Instant::now()).unwrap();
+        type ChainRow = (i64, Vec<u8>, Vec<u8>, i64, String);
+        let rows: Vec<ChainRow> = s
+            .conn()
+            .prepare("SELECT seq, prev_hash, hash, at_ms, record_id FROM chain ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, GENESIS.to_vec());
+        assert_eq!(rows[0].2, chain_hash(&GENESIS, &w1.id, rows[0].3).to_vec());
+        assert_eq!(rows[1].1, rows[0].2);
+        assert_eq!(rows[1].4, w2.id);
+        assert_eq!(hex_prefix(&rows[1].2, 12), w2.head);
+    }
+
+    #[test]
+    fn cost_fields_are_filled() {
+        let (_t, mut s) = store();
+        let w = s.write(&input("a", "tool_call", json!({"tool": "x"})), Instant::now()).unwrap();
+        let rec = s.get(&w.id).unwrap().unwrap();
+        assert_eq!(rec["est_host_ms"], 5);
+        assert_eq!(rec["est_chars"], 100);
+        assert!(rec["host_ms"].as_i64().unwrap() >= 0);
+        assert_eq!(rec["chars"].as_i64().unwrap() as usize, w.reply().chars().count());
+    }
+
+    #[test]
+    fn links_round_trip_and_unknown_targets_fail() {
+        let (_t, mut s) = store();
+        let p = s.write(&input("p", "prediction", json!("rain")), Instant::now()).unwrap();
+        let mut r = input("r", "result", json!("rain"));
+        r.links = Some(vec![LinkInput { to_id: p.id.clone(), rel: "results_of".into() }]);
+        let rw = s.write(&r, Instant::now()).unwrap();
+        let got = s.get(&rw.id).unwrap().unwrap();
+        assert_eq!(got["links"], json!([{"to_id": p.id, "rel": "results_of"}]));
+        assert_eq!(got["body"], json!("rain"));
+        assert_eq!(got["seq"], 2);
+        let back = s.get(&p.id).unwrap().unwrap();
+        assert_eq!(back["linked_from"], json!([{"from_id": rw.id, "rel": "results_of"}]));
+
+        let mut bad = input("x", "result", json!(0));
+        bad.links = Some(vec![LinkInput { to_id: "0".repeat(64), rel: "cites".into() }]);
+        assert!(s.write(&bad, Instant::now()).is_err());
+        // A failed write leaves no trace on the chain.
+        assert_eq!(s.head().unwrap().0, 2);
+    }
+
+    #[test]
+    fn invalid_input_is_rejected_before_writing() {
+        let (_t, mut s) = store();
+        let mut bad = input("a", "observation", json!(1));
+        bad.lane = "main".into();
+        assert!(s.write(&bad, Instant::now()).is_err());
+        assert_eq!(s.head().unwrap().0, 0);
+    }
+
+    #[test]
+    fn fts_find_returns_expected_records() {
+        let (_t, mut s) = store();
+        let a = s.write(&input("map.run1.pressure", "prediction", json!({"text": "boiler pressure stays under 12 bar"})), Instant::now()).unwrap();
+        let b = s.write(&input("map.run1.flow", "prediction", json!({"text": "condensate flow doubles"})), Instant::now()).unwrap();
+        let c = s.write(&input("other.note", "observation", json!({"text": "pressure gauge replaced"})), Instant::now()).unwrap();
+
+        let ids = |q: FindQuery| s.find(&q).unwrap().into_iter().map(|h| h.id).collect::<Vec<_>>();
+        let mut pressure = ids(FindQuery { query: Some("pressure".into()), ..Default::default() });
+        pressure.sort();
+        let mut want = vec![a.id.clone(), c.id.clone()];
+        want.sort();
+        assert_eq!(pressure, want);
+        assert_eq!(ids(FindQuery { query: Some("boiler pressure".into()), ..Default::default() }), vec![a.id.clone()]);
+        assert_eq!(ids(FindQuery { query: Some("pressure".into()), kind: Some("observation".into()), ..Default::default() }), vec![c.id.clone()]);
+        assert_eq!(ids(FindQuery { query: Some("flow".into()), ..Default::default() }), vec![b.id.clone()]);
+        // Keys are indexed too.
+        assert_eq!(ids(FindQuery { query: Some("other".into()), ..Default::default() }), vec![c.id.clone()]);
+        // Without a query: newest first, filtered.
+        assert_eq!(ids(FindQuery { key_prefix: Some("map.run1.".into()), ..Default::default() }), vec![b.id.clone(), a.id.clone()]);
+        assert_eq!(ids(FindQuery { lane: Some("apocryphal".into()), ..Default::default() }), Vec::<String>::new());
+        assert_eq!(ids(FindQuery { limit: Some(1), ..Default::default() }), vec![c.id.clone()]);
+        // FTS syntax in user text is treated as literal terms.
+        assert!(s.find(&FindQuery { query: Some("\"unbalanced AND (".into()), ..Default::default() }).unwrap().is_empty());
+        let hit = &s.find(&FindQuery { query: Some("condensate".into()), ..Default::default() }).unwrap()[0];
+        assert_eq!((hit.key.as_str(), hit.version, hit.kind.as_str(), hit.lane.as_str()), ("map.run1.flow", 1, "prediction", "canonical"));
+    }
+
+    #[test]
+    fn find_limit_is_capped_at_50() {
+        let (_t, mut s) = store();
+        for i in 0..60 {
+            s.write(&input(&format!("k{i}"), "observation", json!(i)), Instant::now()).unwrap();
+        }
+        assert_eq!(s.find(&FindQuery { limit: Some(500), ..Default::default() }).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn get_missing_is_none() {
+        let (_t, s) = store();
+        assert!(s.get("nope").unwrap().is_none());
+    }
+}

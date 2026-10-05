@@ -1,0 +1,36 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "symbia"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[lib]
+name = "symbia"
+path = "src/lib.rs"
+
+[[bin]]
+name = "symbia"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.104"
+ed25519-dalek = "=3.0.0"
+getrandom = "=0.4.3"
+hex = "=0.4.3"
+rmcp = { version = "=3.5.1", features = ["server", "macros", "schemars", "transport-io"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+schemars = "=1.2.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_jcs = "=0.2.0"
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+
+[dev-dependencies]
+rmcp = { version = "=3.5.1", features = ["client"] }
+tempfile = "=3.27.0"
