@@ -202,6 +202,20 @@ mod tests {
         assert!(allowed_hosts("0.0.0.0:1".parse().unwrap()).is_empty());
     }
 
+    #[tokio::test]
+    async fn expired_sessions_are_closed_and_not_found() {
+        let sessions = Arc::new(Sessions::default());
+        let m = ExpiringSessions::new(sessions.clone());
+        let (id, _transport) = m.create_session().await.unwrap();
+        assert!(m.has_session(&id).await.unwrap());
+        sessions.insert(&id, now_ms() + 60_000);
+        assert!(m.has_session(&id).await.unwrap());
+        sessions.insert(&id, now_ms() - 1);
+        assert!(!m.has_session(&id).await.unwrap());
+        assert!(!m.inner.has_session(&id).await.unwrap(), "the rmcp session is closed too");
+        assert!(!sessions.expired(&id, i64::MAX), "and forgotten");
+    }
+
     #[test]
     fn sessions_expire_at_their_expiry() {
         let s = Sessions::default();
