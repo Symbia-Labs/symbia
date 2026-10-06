@@ -67,7 +67,11 @@ pub fn checked(policy: &Policy, path: &str, access: Access, slot: &mut Option<St
 
 /// sha256 of a file, streamed.
 pub fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let mut f = std::fs::File::open(path)?;
+    sha256_read(std::fs::File::open(path)?)
+}
+
+/// sha256 of everything left in a reader, streamed.
+fn sha256_read(mut f: impl Read) -> std::io::Result<[u8; 32]> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -79,9 +83,28 @@ pub fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
     }
 }
 
+/// Open an existing file without following a symlink in its final component, so a link
+/// swapped in after the policy check is refused rather than followed. Directories open too;
+/// callers check the type on the handle.
+pub fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+/// Explain an [`open_nofollow`] failure; `ELOOP` means the final component is a symlink.
+fn open_error(path: &Path, e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        format!("denied: {} is a symlink; it was not followed", path.display())
+    } else {
+        format!("open {}: {e}", path.display())
+    }
+}
+
 /// Write `bytes` to a temp file beside `path`, then rename it over `path`. With `create_only`
-/// the temp file is hard-linked instead, which fails if `path` already exists.
-pub fn atomic_write(path: &Path, bytes: &[u8], create_only: bool) -> std::io::Result<()> {
+/// the temp file is hard-linked instead, which fails if `path` already exists. `mode` is the
+/// existing file's permissions, kept on the new one. Just before the rename the directory's
+/// realpath is checked against `policy` again, in case it was swapped for a symlink.
+pub fn atomic_write(policy: &Policy, path: &Path, bytes: &[u8], create_only: bool, mode: Option<std::fs::Permissions>) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| std::io::Error::other("path has no parent"))?;
     let name = path.file_name().ok_or_else(|| std::io::Error::other("path has no file name"))?;
     let mut r = [0u8; 4];
@@ -90,10 +113,12 @@ pub fn atomic_write(path: &Path, bytes: &[u8], create_only: bool) -> std::io::Re
     let result = (|| {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            f.set_permissions(meta.permissions())?;
+        if let Some(mode) = mode {
+            f.set_permissions(mode)?;
         }
         f.sync_all()?;
+        let dir_real = std::fs::canonicalize(dir)?;
+        policy.check(&show(&dir_real), Access::Write).map_err(std::io::Error::other)?;
         if create_only { std::fs::hard_link(&tmp, path) } else { std::fs::rename(&tmp, path) }
     })();
     if create_only || result.is_err() {
@@ -108,12 +133,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8], create_only: bool) -> std::io::Re
 /// (default and cap 2,000) and 256 KB. Binary files (NUL bytes or not UTF-8) are refused.
 pub fn read(policy: &Policy, path: &str, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
     let real = checked(policy, path, Access::Read, &mut facts.path)?;
-    if real.is_dir() {
+    read_at(&real, offset, limit, facts)
+}
+
+/// [`read`] after the policy check, on its realpath.
+fn read_at(real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
+    let file = open_nofollow(real).map_err(|e| open_error(real, &e))?;
+    if file.metadata().map_err(io)?.is_dir() {
         return Err(format!("{} is a directory; use symbia_fs_list", real.display()));
     }
     let start = offset.unwrap_or(1).max(1);
     let limit = limit.unwrap_or(READ_LINES_MAX).clamp(1, READ_LINES_MAX);
-    let mut reader = BufReader::new(std::fs::File::open(&real).map_err(io)?);
+    let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut buf = Vec::new();
     let (mut n, mut total_bytes, mut shown) = (0u64, 0u64, 0u64);
@@ -414,30 +445,47 @@ pub fn search(policy: &Policy, a: &SearchArgs, deadline: Duration, facts: &mut F
 
 // ---------------------------------------------------------------- write and edit
 
-fn prepare_write(policy: &Policy, path: &str, facts: &mut Facts) -> Result<PathBuf, String> {
-    let real = checked(policy, path, Access::Write, &mut facts.path)?;
-    if real.is_dir() {
+/// Open the target of a write or edit with `O_NOFOLLOW`. `None` if it does not exist yet.
+fn open_target(real: &Path) -> Result<Option<std::fs::File>, String> {
+    let file = match open_nofollow(real) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(open_error(real, &e)),
+    };
+    if file.metadata().map_err(io)?.is_dir() {
         return Err(format!("{} is a directory", real.display()));
     }
-    if real.exists() {
-        facts.sha256_before = Some(hex::encode(sha256_file(&real).map_err(io)?));
-    }
-    Ok(real)
+    Ok(Some(file))
+}
+
+fn mode(file: &std::fs::File) -> Result<std::fs::Permissions, String> {
+    Ok(file.metadata().map_err(io)?.permissions())
 }
 
 /// Write `content` atomically, creating parent directories. With `create_only`, refuse an existing file.
 pub fn write(policy: &Policy, path: &str, content: &str, create_only: bool, facts: &mut Facts) -> Result<String, String> {
-    let real = prepare_write(policy, path, facts)?;
+    let real = checked(policy, path, Access::Write, &mut facts.path)?;
+    write_at(policy, &real, content, create_only, facts)
+}
+
+/// [`write`] after the policy check, on its realpath.
+fn write_at(policy: &Policy, real: &Path, content: &str, create_only: bool, facts: &mut Facts) -> Result<String, String> {
+    let existing = open_target(real)?;
+    let mut keep = None;
+    if let Some(f) = existing {
+        keep = Some(mode(&f)?);
+        facts.sha256_before = Some(hex::encode(sha256_read(f).map_err(io)?));
+    }
     if create_only && facts.sha256_before.is_some() {
         return Err(format!("{} exists and create_only is set", real.display()));
     }
     if let Some(dir) = real.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
-    atomic_write(&real, content.as_bytes(), create_only).map_err(|e| format!("write {}: {e}", real.display()))?;
+    atomic_write(policy, real, content.as_bytes(), create_only, keep).map_err(|e| format!("write {}: {e}", real.display()))?;
     let after = crate::canon::sha256(content.as_bytes());
     facts.sha256_after = Some(hex::encode(after));
-    Ok(json!({"path": show(&real), "bytes": content.len(), "sha256": hex_prefix(&after, PREFIX)}).to_string())
+    Ok(json!({"path": show(real), "bytes": content.len(), "sha256": hex_prefix(&after, PREFIX)}).to_string())
 }
 
 /// Byte offsets of every occurrence of `needle`, overlapping ones included.
@@ -457,21 +505,32 @@ pub fn edit(policy: &Policy, path: &str, old: &str, new: &str, facts: &mut Facts
     if old.is_empty() {
         return Err("old is empty".into());
     }
-    let real = prepare_write(policy, path, facts)?;
-    let bytes = std::fs::read(&real).map_err(|e| format!("read {}: {e}", real.display()))?;
+    let real = checked(policy, path, Access::Write, &mut facts.path)?;
+    edit_at(policy, &real, old, new, facts)
+}
+
+/// [`edit`] after the policy check, on its realpath.
+fn edit_at(policy: &Policy, real: &Path, old: &str, new: &str, facts: &mut Facts) -> Result<String, String> {
+    let Some(mut file) = open_target(real)? else {
+        return Err(format!("read {}: no such file", real.display()));
+    };
+    let keep = mode(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", real.display()))?;
+    facts.sha256_before = Some(hex::encode(crate::canon::sha256(&bytes)));
     let text = std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8 text", real.display()))?;
     let found = occurrences(text, old);
     let [pos] = found[..] else {
         return Err(format!("old matches {} times in {}; it must match exactly once", found.len(), real.display()));
     };
     let edited = format!("{}{new}{}", &text[..pos], &text[pos + old.len()..]);
-    atomic_write(&real, edited.as_bytes(), false).map_err(|e| format!("write {}: {e}", real.display()))?;
+    atomic_write(policy, real, edited.as_bytes(), false, Some(keep)).map_err(|e| format!("write {}: {e}", real.display()))?;
     let before = crate::canon::sha256(&bytes);
     let after = crate::canon::sha256(edited.as_bytes());
     facts.sha256_after = Some(hex::encode(after));
     let line = text[..pos].matches('\n').count() + 1;
     Ok(json!({
-        "path": show(&real),
+        "path": show(real),
         "line": line,
         "sha256_before": hex_prefix(&before, PREFIX),
         "sha256_after": hex_prefix(&after, PREFIX),
@@ -704,6 +763,66 @@ mod tests {
         // Overlapping occurrences count.
         std::fs::write(&f, "aaa").unwrap();
         assert!(edit(&p, &s(&f), "aa", "b", &mut Facts::default()).unwrap_err().starts_with("old matches 2 times"));
+    }
+
+    #[test]
+    fn symbia_home_refuses_write_and_edit_but_evidence_reads() {
+        let t = tempfile::tempdir().unwrap();
+        let user = t.path().join("user");
+        let sym = user.join("Library/Application Support/Symbia");
+        crate::home::ensure(&sym).unwrap();
+        let p = Policy::new(std::slice::from_ref(&user), &sym, &user).unwrap();
+        std::os::unix::fs::symlink(&sym, user.join("sym-dir")).unwrap();
+        for target in ["sessions/s.jsonl", "seals/s.seal", "evidence/abc", "config.json"] {
+            let f = sym.join(target);
+            std::fs::write(&f, "orig").unwrap();
+            let file_link = user.join(format!("link-{}", target.replace('/', "-")));
+            std::os::unix::fs::symlink(&f, &file_link).unwrap();
+            for via in [f.clone(), user.join("sym-dir").join(target), file_link] {
+                let e = write(&p, &s(&via), "new", false, &mut Facts::default()).unwrap_err();
+                assert!(e.contains("$SYMBIA_HOME"), "write {}: {e}", via.display());
+                let e = edit(&p, &s(&via), "orig", "new", &mut Facts::default()).unwrap_err();
+                assert!(e.contains("$SYMBIA_HOME"), "edit {}: {e}", via.display());
+            }
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), "orig", "{target}");
+        }
+        let out = read(&p, &s(&sym.join("evidence/abc")), None, None, &mut Facts::default()).unwrap();
+        assert_eq!(out, "     1\torig\n");
+        std::fs::write(sym.join("keys/device.ed25519"), "SECRET").unwrap();
+        assert!(read(&p, &s(&sym.join("keys/device.ed25519")), None, None, &mut Facts::default()).unwrap_err().contains("deny list"));
+    }
+
+    #[test]
+    fn symlink_swapped_in_after_the_check_is_refused_at_open() {
+        let (t, root, p) = setup();
+        let outside = t.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let f = root.join("f.txt");
+        std::fs::write(&f, "inside").unwrap();
+        // The check passes on the regular file; then the file becomes a link to outside the roots.
+        let real = p.check(&s(&f), Access::Write).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink(&outside, &f).unwrap();
+        let e = read_at(&real, None, None, &mut Facts::default()).unwrap_err();
+        assert!(e.contains("is a symlink"), "{e}");
+        let e = edit_at(&p, &real, "secret", "owned", &mut Facts::default()).unwrap_err();
+        assert!(e.contains("is a symlink"), "{e}");
+        let e = write_at(&p, &real, "owned", false, &mut Facts::default()).unwrap_err();
+        assert!(e.contains("is a symlink"), "{e}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+        assert!(std::fs::symlink_metadata(&f).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn rename_rechecks_the_directory_realpath() {
+        let (t, root, p) = setup();
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // A directory that resolves outside the roots by the time of the rename.
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+        let e = atomic_write(&p, &root.join("d/f.txt"), b"x", false, None).unwrap_err();
+        assert!(e.to_string().contains("outside the allowed roots"), "{e}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]

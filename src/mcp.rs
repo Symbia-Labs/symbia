@@ -484,9 +484,11 @@ mod tests {
     #[tokio::test]
     async fn file_tools_write_one_tool_call_record_each_even_when_refused() {
         let (t, s) = server();
-        let s = s.with_policy(Policy::new(&[t.path().join("root")], t.path(), t.path()).unwrap());
-        std::fs::create_dir_all(t.path().join("root")).unwrap();
-        let f = t.path().join("root/a.txt").display().to_string();
+        // The root sits outside `SYMBIA_HOME`, which the tools may not write.
+        let w = tempfile::tempdir().unwrap();
+        let s = s.with_policy(Policy::new(&[w.path().join("root")], t.path(), t.path()).unwrap());
+        std::fs::create_dir_all(w.path().join("root")).unwrap();
+        let f = w.path().join("root/a.txt").display().to_string();
         let reply = s.symbia_fs_write(Parameters(FsWriteArgs { path: f.clone(), content: "secret body".into(), create_only: None })).await.unwrap();
         let e = s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None })).await.unwrap_err();
         assert!(e.starts_with("denied"));
@@ -513,8 +515,9 @@ mod tests {
     #[tokio::test]
     async fn exec_record_names_its_evidence() {
         let (t, s) = server();
-        let s = s.with_policy(Policy::new(&[t.path().to_path_buf()], t.path(), t.path()).unwrap());
-        let reply = s.symbia_exec(Parameters(ExecArgs { command: "echo hi; exit 3".into(), cwd: t.path().display().to_string(), timeout_ms: None })).await.unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let s = s.with_policy(Policy::new(&[w.path().to_path_buf()], t.path(), t.path()).unwrap());
+        let reply = s.symbia_exec(Parameters(ExecArgs { command: "echo hi; exit 3".into(), cwd: w.path().display().to_string(), timeout_ms: None })).await.unwrap();
         let v: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["exit"], 3);
         let rec = &tool_calls(&s)[0];

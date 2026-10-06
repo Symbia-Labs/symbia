@@ -44,3 +44,26 @@ globset 0.4.20 · grep 0.4.1 (grep-regex 0.1.14, grep-searcher 0.1.17 via lock) 
 - **TOCTOU.** The policy check and the file operation are separate steps; a symlink swapped in between is not caught.
 - **Config reload.** `config.json` is read at start; changing roots needs a restart.
 - **Out of scope per B3.md:** the importer, the decider, routines, retrieval, the broker, promotion, and registering the binary with the Claude app.
+
+## Fixes (B3-FIX.md)
+
+This section supersedes the `sessions`/`seals` and TOCTOU bullets above.
+
+| Fix | What changed | Tests |
+|---|---|---|
+| `$SYMBIA_HOME` read-only | `Policy` keeps `$SYMBIA_HOME` (both spellings). `Access::Write` on a path whose lexical path or realpath falls under it is refused: `fs_write`, `fs_edit`, and `exec`'s `cwd`. Reads still pass where a root (or the evidence read root) covers them; `keys/` stays on the deny list. | `policy::tests::symbia_home_is_read_only_even_inside_a_root`; `files::tests::symbia_home_refuses_write_and_edit_but_evidence_reads` (`sessions/`, `seals/`, `evidence/`, `config.json`: directly, via a directory symlink and via a file symlink; file unchanged; evidence reads, keys refused); `exec::tests::cwd_inside_symbia_home_is_refused` |
+| `O_NOFOLLOW` | `read`, `write` and `edit` split into check, then `read_at`/`write_at`/`edit_at` on the realpath. Those open the target with `O_NOFOLLOW` (`ELOOP` → `denied: … is a symlink`), then hash, read and take the mode from that handle. | `files::tests::symlink_swapped_in_after_the_check_is_refused_at_open`: the check passes on a regular file, the file is then replaced by a link to outside the roots, and all three refuse; the outside file is unchanged |
+| Re-check before rename | `atomic_write` takes the policy. The temp file is created beside the target; immediately before `rename`/`hard_link` the directory is realpath'd and checked for `Write` again. On refusal the temp file is removed. | `files::tests::rename_rechecks_the_directory_realpath` |
+| `.identity/` | Added to `.gitignore`. Not read or deleted. | — |
+
+Fixture change: two `mcp` tests used one temp dir as both root and `$SYMBIA_HOME`; their roots now sit in a second temp dir.
+
+**Gate:** `cargo test` 97 passed (89 unit, 1 `b3_replace`, 3 `cli_trust`, 2 `map_e2e`, 2 `s1_resume`); `b3_replace` 5 of 5 repeat runs; clippy clean; `cargo build --release` 11.8 MB.
+
+**Still uncovered:**
+
+- **Parent components.** `O_NOFOLLOW` guards only the final component. A parent directory swapped for a symlink between check and open is followed on reads, lists and searches; nothing re-checks them.
+- **Write window.** Re-check and `rename` are separate path-based calls, so a swap in between still lands. Closing it needs `openat`/`renameat` on a held directory handle.
+- **Brief outside writes.** `create_dir_all` and the temp file run before the re-check. If a parent is swapped in that window, empty directories and, for a moment, the temp file (with the new content) can appear outside the roots; the temp file is then removed.
+- **Exec is not confined.** Only `cwd` is checked, then used by path. The command itself runs with the user's rights and can write anywhere, `$SYMBIA_HOME` included. The seal still detects changes to sealed files.
+- **Hard links.** A hard link inside a root to a file under `$SYMBIA_HOME` or `keys/` passes the realpath check. Writes and edits replace the link by rename, so the original is untouched, but reads go through it. Only `exec` can make one.

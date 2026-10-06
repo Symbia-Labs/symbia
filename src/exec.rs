@@ -308,4 +308,18 @@ mod tests {
         assert!(exec(&p, &sym, "true", &r, Some(600_001), &mut facts).await.is_err());
         assert!(exec(&p, &sym, "true", &r, Some(0), &mut facts).await.is_err());
     }
+
+    #[tokio::test]
+    async fn cwd_inside_symbia_home_is_refused() {
+        let (t, root, sym, _p) = setup();
+        // The root covers `SYMBIA_HOME`, yet no cwd under it is allowed, directly or via a symlink.
+        let p = Policy::new(&[t.path().to_path_buf()], &sym, t.path()).unwrap();
+        std::os::unix::fs::symlink(&sym, root.join("sym")).unwrap();
+        for cwd in [sym.clone(), sym.join("sessions"), sym.join("evidence"), root.join("sym/seals")] {
+            let e = exec(&p, &sym, "touch x", &cwd.display().to_string(), None, &mut Facts::default()).await.err().unwrap();
+            assert!(e.contains("$SYMBIA_HOME"), "{}: {e}", cwd.display());
+        }
+        assert!(!sym.join("sessions/x").exists());
+        run(&p, &sym, "true", &root, None).await;
+    }
 }

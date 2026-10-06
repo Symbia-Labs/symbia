@@ -41,6 +41,8 @@ pub struct Policy {
     /// Extra roots for reads only: the evidence folder.
     read_roots: Vec<Spelled>,
     deny: Vec<Spelled>,
+    /// `$SYMBIA_HOME`: readable where a root covers it, never writable.
+    own: Spelled,
     user_home: PathBuf,
 }
 
@@ -116,7 +118,8 @@ impl Policy {
             .chain([symbia_home.join("keys")])
             .map(|d| Spelled::new(&d))
             .collect::<anyhow::Result<_>>()?;
-        Ok(Self { roots, read_roots, deny, user_home: user_home.to_path_buf() })
+        let own = Spelled::new(symbia_home)?;
+        Ok(Self { roots, read_roots, deny, own, user_home: user_home.to_path_buf() })
     }
 
     /// A path falls on the deny list. Walks use this on every entry they visit.
@@ -130,6 +133,9 @@ impl Policy {
         let resolved = real(&lex).map_err(|e| format!("cannot resolve {}: {e}", lex.display()))?;
         if self.denied(&lex) || self.denied(&resolved) {
             return Err(format!("denied: {} is on the deny list", lex.display()));
+        }
+        if access == Access::Write && (self.own.holds(&lex) || self.own.holds(&resolved)) {
+            return Err(format!("denied: {} is inside $SYMBIA_HOME, which the tools may not write", lex.display()));
         }
         let extra: &[Spelled] = if access == Access::Read { &self.read_roots } else { &[] };
         let roots = || self.roots.iter().chain(extra);
@@ -261,6 +267,28 @@ mod tests {
         let ev = s(&sym.join("evidence/abc"));
         assert!(p.check(&ev, Access::Read).is_ok());
         assert!(p.check(&ev, Access::Write).is_err());
+    }
+
+    #[test]
+    fn symbia_home_is_read_only_even_inside_a_root() {
+        let t = tempfile::tempdir().unwrap();
+        let user = t.path().join("user");
+        let sym = user.join("Library/Application Support/Symbia");
+        crate::home::ensure(&sym).unwrap();
+        std::fs::create_dir_all(user.join("work")).unwrap();
+        let p = Policy::new(std::slice::from_ref(&user), &sym, &user).unwrap();
+        std::os::unix::fs::symlink(&sym, user.join("work/sym")).unwrap();
+        for target in ["sessions/s.jsonl", "seals/s.seal", "evidence/abc", "config.json", "", "new/x"] {
+            for p_ in [sym.join(target), user.join("work/sym").join(target)] {
+                let e = p.check(&s(&p_), Access::Write).unwrap_err();
+                assert!(e.contains("$SYMBIA_HOME"), "{}: {e}", p_.display());
+            }
+            if !target.is_empty() {
+                assert!(p.check(&s(&sym.join(target)), Access::Read).is_ok(), "{target}");
+            }
+        }
+        assert!(p.check(&s(&sym.join("keys/device.ed25519")), Access::Read).unwrap_err().contains("deny list"));
+        assert!(p.check(&s(&user.join("work/x")), Access::Write).is_ok());
     }
 
     #[test]
