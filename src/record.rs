@@ -64,15 +64,27 @@ pub struct RowFields<'a> {
     pub expires_ms: Option<i64>,
     pub est_host_ms: Option<i64>,
     pub est_chars: Option<i64>,
-    /// Outgoing links as `(to_id, rel)`, in any order.
-    pub links: &'a [(String, String)],
+    /// Outgoing links as `(to_id, rel, to_session)`, in any order. `to_session` is set only for
+    /// a target in another session.
+    pub links: &'a [Link],
 }
 
-/// sha256 of the RFC 8785 JSON of every write-time field, with links sorted by `(to_id, rel)`.
+/// A stored link: `(to_id, rel, to_session)`.
+pub type Link = (String, String, Option<String>);
+
+/// sha256 of the RFC 8785 JSON of every write-time field, with links sorted by `(to_id, rel,
+/// to_session)`. A link's `to_session` is hashed when set and left out when null, so digests
+/// of files written before it existed are unchanged.
 pub fn row_digest(f: &RowFields) -> anyhow::Result<[u8; 32]> {
     let mut links = f.links.to_vec();
     links.sort();
-    let links: Vec<Value> = links.into_iter().map(|(to_id, rel)| json!({"to_id": to_id, "rel": rel})).collect();
+    let links: Vec<Value> = links
+        .into_iter()
+        .map(|(to_id, rel, to_session)| match to_session {
+            None => json!({"to_id": to_id, "rel": rel}),
+            Some(s) => json!({"to_id": to_id, "rel": rel, "to_session": s}),
+        })
+        .collect();
     let doc = json!({
         "id": f.id,
         "key": f.key,
@@ -116,7 +128,7 @@ pub const GENESIS: [u8; 32] = [0u8; 32];
 pub struct LinkInput {
     /// Id of the record this one links to.
     pub to_id: String,
-    /// One of results_of, revises, supersedes, cites.
+    /// One of results_of, revises, supersedes, cites. Example: {"to_id": "<record id>", "rel": "results_of"}.
     pub rel: String,
 }
 
@@ -239,7 +251,11 @@ mod tests {
         assert_eq!(chain_hash(&GENESIS, "abc", 256), sha256(&buf));
     }
 
-    fn row<'a>(body: &'a Value, links: &'a [(String, String)]) -> RowFields<'a> {
+    fn link(to: &str, rel: &str) -> Link {
+        (to.to_string(), rel.to_string(), None)
+    }
+
+    fn row<'a>(body: &'a Value, links: &'a [Link]) -> RowFields<'a> {
         RowFields {
             id: "i",
             key: "k",
@@ -261,7 +277,7 @@ mod tests {
     #[test]
     fn row_digest_matches_hand_computed_digest() {
         let body = json!({"x": 1});
-        let links = [("b".to_string(), "cites".to_string()), ("a".to_string(), "results_of".to_string())];
+        let links = [link("b", "cites"), link("a", "results_of")];
         let text = concat!(
             r#"{"at_ms":5,"body":{"x":1},"est_chars":null,"est_host_ms":1,"expires_ms":null,"id":"i","key":"k","kind":"result","lane":"canonical","#,
             r#""lane_reason":"r","links":[{"rel":"results_of","to_id":"a"},{"rel":"cites","to_id":"b"}],"model":"m","session":"s","version":1}"#
@@ -270,15 +286,23 @@ mod tests {
         // Link order does not matter; links are sorted by (to_id, rel).
         let reversed = [links[1].clone(), links[0].clone()];
         assert_eq!(row_digest(&row(&body, &reversed)).unwrap(), row_digest(&row(&body, &links)).unwrap());
+        // A cross-session link carries its session.
+        let external = [("a".to_string(), "results_of".to_string(), Some("s0".to_string()))];
+        let text = concat!(
+            r#"{"at_ms":5,"body":{"x":1},"est_chars":null,"est_host_ms":1,"expires_ms":null,"id":"i","key":"k","kind":"result","lane":"canonical","#,
+            r#""lane_reason":"r","links":[{"rel":"results_of","to_id":"a","to_session":"s0"}],"model":"m","session":"s","version":1}"#
+        );
+        assert_eq!(row_digest(&row(&body, &external)).unwrap(), sha256(text.as_bytes()));
     }
 
     #[test]
     fn row_digest_changes_with_every_covered_field() {
         let body = json!({"x": 1});
         let other_body = json!({"x": 2});
-        let links = [("a".to_string(), "cites".to_string())];
-        let rel = [("a".to_string(), "revises".to_string())];
-        let to = [("b".to_string(), "cites".to_string())];
+        let links = [link("a", "cites")];
+        let rel = [link("a", "revises")];
+        let to = [link("b", "cites")];
+        let session = [("a".to_string(), "cites".to_string(), Some("s0".to_string()))];
         let f = row(&body, &links);
         let a = row_digest(&f).unwrap();
         let variants = [
@@ -297,6 +321,7 @@ mod tests {
             RowFields { est_chars: Some(0), ..f },
             RowFields { links: &rel, ..f },
             RowFields { links: &to, ..f },
+            RowFields { links: &session, ..f },
             RowFields { links: &[], ..f },
         ];
         for v in &variants {

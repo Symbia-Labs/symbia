@@ -1,84 +1,10 @@
 //! R2: the real binary seals its session when the stdio transport closes, and never seals an
 //! empty session. The exec record names the command, sandbox and network setting.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+mod common;
 
+use common::stdio::{BIN, Mcp, seals};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-
-const BIN: &str = env!("CARGO_BIN_EXE_symbia");
-
-struct Mcp {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: Lines<BufReader<ChildStdout>>,
-}
-
-impl Mcp {
-    async fn start(home: &Path) -> Self {
-        let mut child = Command::new(BIN)
-            .arg("mcp")
-            .env("SYMBIA_HOME", home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut m = Self { child, stdin, stdout };
-        m.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "r2", "version": "0"}}}))
-            .await;
-        assert!(m.reply(0).await["result"]["protocolVersion"].is_string());
-        m.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
-        m
-    }
-
-    async fn send(&mut self, msg: Value) {
-        let stdin = self.stdin.as_mut().unwrap();
-        stdin.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
-        stdin.flush().await.unwrap();
-    }
-
-    async fn reply(&mut self, id: i64) -> Value {
-        loop {
-            let line = self.stdout.next_line().await.unwrap().expect("server closed stdout");
-            let v: Value = serde_json::from_str(&line).unwrap();
-            if v["id"] == id {
-                return v;
-            }
-        }
-    }
-
-    /// Call a tool; the parsed text reply, or `Err(text)` for a tool error.
-    async fn tool(&mut self, id: i64, name: &str, args: Value) -> Result<Value, String> {
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}})).await;
-        let r = self.reply(id).await;
-        let text = r["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{r}")).to_string();
-        if r["result"]["isError"] == true { Err(text) } else { Ok(serde_json::from_str(&text).unwrap()) }
-    }
-
-    /// Close stdin and wait for the process to exit; returns its stderr.
-    async fn close(mut self) -> String {
-        drop(self.stdin.take());
-        let out = tokio::time::timeout(Duration::from_secs(20), self.child.wait_with_output()).await.expect("exit after EOF").unwrap();
-        assert!(out.status.success(), "{out:?}");
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    }
-}
-
-fn seals(home: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(home.join("seals"))
-        .map(|d| d.map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "sqlite")).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
-}
 
 #[tokio::test]
 async fn closing_stdin_seals_a_session_with_records() {

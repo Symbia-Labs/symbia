@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::files::Facts;
-use crate::policy::{Access, Network, Policy};
+use crate::policy::{Access, ExecRead, Network, Policy};
 use crate::store::Evidence;
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -141,11 +141,31 @@ fn sbpl_str(p: &Path) -> Result<String, String> {
     Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
 }
 
-/// The seatbelt profile for one call: deny-list paths neither readable nor writable,
-/// `$SYMBIA_HOME` not writable, and with `exec_network: "deny"` no outbound IP traffic.
+/// `(<rule> (<filter> "p") ...)\n` over `paths`.
+fn sbpl_rule(rule: &str, filter: &str, paths: &[&Path]) -> Result<String, String> {
+    let mut s = format!("({rule}");
+    for p in paths {
+        s.push_str(&format!(" ({filter} {})", sbpl_str(p)?));
+    }
+    s.push_str(")\n");
+    Ok(s)
+}
+
+/// The seatbelt profile for one call. With `exec_read: "home"` the user's home is unreadable
+/// except its roots, read allowances and the evidence folder (metadata of the home and of the
+/// folders leading to them stays readable). In every mode deny-list paths are neither readable
+/// nor writable, `$SYMBIA_HOME` is not writable, and with `exec_network: "deny"` no outbound IP
+/// traffic leaves. SBPL takes the last matching rule, so the deny list comes after the allows.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn profile(policy: &Policy) -> Result<String, String> {
     let mut p = String::from("(version 1)\n(allow default)\n");
+    if policy.exec_read() == ExecRead::Home {
+        p.push_str(&sbpl_rule("deny file-read*", "subpath", &policy.home_paths())?);
+        let ancestors = policy.exec_ancestor_paths();
+        let meta: Vec<&Path> = policy.home_paths().into_iter().chain(ancestors.iter().map(PathBuf::as_path)).collect();
+        p.push_str(&sbpl_rule("allow file-read-metadata", "literal", &meta)?);
+        p.push_str(&sbpl_rule("allow file-read*", "subpath", &policy.exec_read_paths())?);
+    }
     for d in policy.deny_paths() {
         p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(d)?));
     }
@@ -201,6 +221,8 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     if !dir.is_dir() {
         return Err(format!("cwd {} is not a directory", dir.display()));
     }
+    let rules = crate::rules::load(policy, &dir);
+    crate::rules::check(&rules.rules, command)?;
     let mut shell = shell(policy, Path::new(SANDBOX_EXEC), command)?;
     let evidence = home.join("evidence");
     std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
@@ -262,8 +284,17 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     facts.stdout_sha256 = Some(hex::encode(stdout.sha256));
     facts.stderr_sha256 = Some(hex::encode(stderr.sha256));
     facts.truncated = stdout.cut || stderr.cut;
-    let reply = json!({"exit": exit, "duration_ms": duration_ms, "stdout": stdout.reply(), "stderr": stderr.reply()}).to_string();
-    Ok(Ran { reply, stdout, stderr })
+    let mut reply = json!({"exit": exit, "duration_ms": duration_ms});
+    // An empty stream is left out of the reply; its evidence and digest are still kept.
+    for (name, s) in [("stdout", &stdout), ("stderr", &stderr)] {
+        if s.bytes > 0 {
+            reply[name] = s.reply();
+        }
+    }
+    if !rules.notes.is_empty() {
+        reply["policy"] = rules.notes.into();
+    }
+    Ok(Ran { reply: reply.to_string(), stdout, stderr })
 }
 
 #[cfg(test)]
@@ -409,6 +440,75 @@ mod tests {
         assert!(prof.ends_with("(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n"));
     }
 
+    #[test]
+    fn home_profile_orders_deny_home_then_allows_then_deny_list() {
+        let t = tempfile::tempdir().unwrap();
+        let user = t.path().join("user");
+        let root = user.join("work/proj");
+        let sym = t.path().join("sym");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = Policy::new(std::slice::from_ref(&root), &sym, &user).unwrap();
+        let prof = profile(&p).unwrap();
+        let lines: Vec<&str> = prof.lines().collect();
+        let q = |p: &Path| sbpl_str(p).unwrap();
+        assert_eq!(lines[0..2], ["(version 1)", "(allow default)"]);
+        assert!(lines[2].starts_with("(deny file-read* (subpath ") && lines[2].contains(&q(&user)), "{prof}");
+        assert!(lines[3].starts_with("(allow file-read-metadata (literal ") && lines[3].contains(&format!("(literal {})", q(&user.join("work")))), "{prof}");
+        assert!(!lines[3].contains(&format!("(literal {})", q(&root))), "{prof}");
+        assert!(lines[4].starts_with("(allow file-read* (subpath "), "{prof}");
+        for allowed in [root.clone(), user.join(".zshrc"), user.join(".cargo"), sym.join("evidence")] {
+            assert!(lines[4].contains(&format!("(subpath {})", q(&allowed))), "{}: {prof}", allowed.display());
+        }
+        assert!(!lines[4].contains(".npmrc"));
+        // The deny list follows every allow, so it wins; then the data directory's write deny.
+        let first_deny = lines.iter().position(|l| l.starts_with("(deny file-read* file-write*")).unwrap();
+        assert_eq!(first_deny, 5, "{prof}");
+        assert!(lines.last().unwrap().starts_with("(deny file-write* (subpath "), "{prof}");
+        // `deny_list` drops the home rules.
+        let c = crate::policy::Config { exec_read: ExecRead::DenyList, ..Default::default() };
+        let prof = profile(&Policy::with_config(std::slice::from_ref(&root), &sym, &user, &c).unwrap()).unwrap();
+        assert!(!prof.contains("allow file-read") && prof.lines().nth(2).unwrap().starts_with("(deny file-read* file-write*"), "{prof}");
+    }
+
+    #[tokio::test]
+    async fn empty_streams_are_left_out_of_the_reply() {
+        let (_t, root, sym, p) = setup();
+        let (r, ran, facts) = run(&p, &sym, "echo out", &root, None).await;
+        assert_eq!(r["stdout"]["tail"], "out\n");
+        assert!(r.get("stderr").is_none(), "{r}");
+        assert!(facts.stderr_sha256.is_some() && ran.stderr.path.exists());
+        let (r, _, _) = run(&p, &sym, "true", &root, None).await;
+        assert_eq!(r.as_object().unwrap().keys().collect::<Vec<_>>(), ["duration_ms", "exit"]);
+    }
+
+    #[tokio::test]
+    async fn command_rules_refuse_before_running() {
+        let (t, root, sym, _p) = setup();
+        let c = crate::policy::Config { exec_deny: vec!["chmod:*".into()], ..Default::default() };
+        let p = Policy::with_config(std::slice::from_ref(&root), &sym, t.path(), &c).unwrap();
+        for cmd in ["mkdir x && chmod 600 x", "FOO=1 chmod 600 x"] {
+            let mut facts = Facts::default();
+            let e = exec(&p, &sym, cmd, &root.display().to_string(), None, &mut facts).await.err().unwrap();
+            assert!(e.starts_with("refused:") && e.contains("\"chmod:*\"") && e.contains(crate::rules::CONFIG_SOURCE), "{e}");
+            assert_eq!(facts.command.as_deref(), Some(cmd));
+        }
+        assert!(!root.join("x").exists(), "nothing ran");
+        let (r, _, _) = run(&p, &sym, "echo \"a && chmod\"", &root, None).await;
+        assert_eq!(r["stdout"]["tail"], "a && chmod\n");
+        assert!(r.get("policy").is_none());
+        // Rules imported from the user's Claude Code settings; a malformed project file is noted.
+        std::fs::create_dir_all(t.path().join(".claude")).unwrap();
+        std::fs::write(t.path().join(".claude/settings.json"), r#"{"permissions": {"deny": ["Bash(touch:*)"]}}"#).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.local.json"), "{oops").unwrap();
+        let e = exec(&p, &sym, "touch y", &root.display().to_string(), None, &mut Facts::default()).await.err().unwrap();
+        assert!(e.contains(&t.path().join(".claude/settings.json").display().to_string()), "{e}");
+        let (r, _, _) = run(&p, &sym, "echo ok", &root, None).await;
+        assert_eq!(r["exit"], 0);
+        let notes = r["policy"].as_array().unwrap();
+        assert!(notes.len() == 1 && notes[0].as_str().unwrap().contains("settings.local.json"), "{r}");
+    }
+
     #[cfg(target_os = "macos")]
     mod sandbox {
         use super::*;
@@ -533,6 +633,105 @@ mod tests {
             // Local files and processes are unaffected.
             let (r, _, _) = run(&p, &sym, "echo hi | cat", &root, None).await;
             assert_eq!(r["stdout"]["tail"], "hi\n");
+        }
+
+        /// A temp user home holding a fake gh token, a private note and zsh startup files, with
+        /// `SYMBIA_HOME` at its macOS default inside it and one root at `work/proj`.
+        fn home_setup(extra: Value) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Policy) {
+            let t = tempfile::tempdir().unwrap();
+            let user = t.path().join("user");
+            let root = user.join("work/proj");
+            let sym = user.join("Library/Application Support/Symbia");
+            std::fs::create_dir_all(user.join(".config/gh")).unwrap();
+            std::fs::create_dir_all(user.join("notes")).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            crate::home::ensure(&sym).unwrap();
+            std::fs::write(user.join(".config/gh/hosts.yml"), format!("github.com:\n  oauth_token: {SECRET}\n")).unwrap();
+            std::fs::write(user.join("notes/private.txt"), SECRET).unwrap();
+            std::fs::write(user.join(".zshenv"), "export R3_ENV=zshenv-read\n").unwrap();
+            std::fs::write(user.join(".zshrc"), "export R3_RC=zshrc-read\n").unwrap();
+            std::fs::write(root.join("inside.txt"), "inside ok").unwrap();
+            let mut config = json!({"roots": [root]});
+            for (k, v) in extra.as_object().unwrap() {
+                config[k] = v.clone();
+            }
+            std::fs::write(sym.join("config.json"), config.to_string()).unwrap();
+            let p = Policy::load(&sym, &user).unwrap();
+            (t, user, root, sym, p)
+        }
+
+        #[tokio::test]
+        async fn home_mode_hides_the_home_outside_roots_and_allowances() {
+            let (_t, user, root, sym, p) = home_setup(json!({}));
+            assert_eq!(p.exec_read(), ExecRead::Home, "the default");
+            for f in [user.join(".config/gh/hosts.yml"), user.join("notes/private.txt")] {
+                let (r, ran, _) = run(&p, &sym, &format!("cat {}", quote(&f)), &root, None).await;
+                refused(&r, &ran);
+                assert!(r["stderr"]["tail"].as_str().unwrap().contains("Operation not permitted"), "{r}");
+            }
+            // The data directory's own files are unreadable too, but evidence is not.
+            let (r, _, _) = run(&p, &sym, &format!("cat {}", quote(&sym.join("config.json"))), &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
+            std::fs::write(sym.join("evidence/e1"), "evidence ok").unwrap();
+            let (r, _, _) = run(&p, &sym, &format!("cat {}", quote(&sym.join("evidence/e1"))), &root, None).await;
+            assert_eq!(r["stdout"]["tail"], "evidence ok", "{r}");
+            // Inside the root: reads, writes, and the working directory resolve.
+            let (r, _, _) = run(&p, &sym, "cat inside.txt && echo x > out.txt && cat out.txt && pwd", &root, None).await;
+            let real_root = std::fs::canonicalize(&root).unwrap();
+            assert_eq!(r["stdout"]["tail"], format!("inside okx\n{}\n", real_root.display()), "{r}");
+            // Paths outside the home stay readable; the toolchain runs.
+            let (r, _, _) = run(&p, &sym, "head -c 1 /etc/hosts >/dev/null && cargo --version && git --version", &root, None).await;
+            assert_eq!(r["exit"], 0, "{r}");
+            // A login shell with this home still starts and reads its startup files.
+            let home = quote(&user);
+            let (r, _, _) = run(&p, &sym, &format!("HOME={home} /bin/zsh -lc 'echo $R3_ENV'"), &root, None).await;
+            assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("zshenv-read\n")), "{r}");
+            let (r, _, _) = run(&p, &sym, &format!("HOME={home} /bin/zsh -ic 'echo $R3_RC' </dev/null"), &root, None).await;
+            assert_eq!(r["exit"], 0, "{r}");
+            assert!(r["stdout"]["tail"].as_str().unwrap().contains("zshrc-read"), "{r}");
+            assert!(!r.get("stderr").is_some_and(|e| e["tail"].as_str().unwrap().contains("not permitted")), "{r}");
+        }
+
+        #[tokio::test]
+        async fn deny_list_mode_restores_r2_reads() {
+            let (_t, user, root, sym, p) = home_setup(json!({"exec_read": "deny_list"}));
+            let (r, _, _) = run(&p, &sym, &format!("cat {}", quote(&user.join("notes/private.txt"))), &root, None).await;
+            assert_eq!(r["stdout"]["tail"], SECRET, "{r}");
+            // The credential folders stay refused in every mode.
+            let (r, ran, _) = run(&p, &sym, &format!("cat {}", quote(&user.join(".config/gh/hosts.yml"))), &root, None).await;
+            refused(&r, &ran);
+        }
+
+        #[tokio::test]
+        async fn deny_list_path_inside_a_root_is_refused_in_home_mode() {
+            let (_t, user, _root, sym, _p) = home_setup(json!({}));
+            std::fs::write(user.join(".config/other.txt"), "other ok").unwrap();
+            for roots in [json!([user.join(".config")]), json!([user])] {
+                let mut c: Value = serde_json::from_str(&std::fs::read_to_string(sym.join("config.json")).unwrap()).unwrap();
+                c["roots"] = roots;
+                std::fs::write(sym.join("config.json"), c.to_string()).unwrap();
+                let p = Policy::load(&sym, &user).unwrap();
+                let cwd = user.join(".config");
+                let (r, ran, _) = run(&p, &sym, "cat gh/hosts.yml", &cwd, None).await;
+                refused(&r, &ran);
+                let (r, _, _) = run(&p, &sym, "cat other.txt", &cwd, None).await;
+                assert_eq!(r["stdout"]["tail"], "other ok", "{r}");
+            }
+        }
+
+        /// The real home with the default settings: the shell's startup files, cargo and git
+        /// still work when the home is unreadable. Nothing is written under the real home.
+        #[tokio::test]
+        async fn real_home_toolchain_still_runs() {
+            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+            let t = tempfile::tempdir().unwrap();
+            let root = t.path().join("root");
+            let sym = t.path().join("sym");
+            std::fs::create_dir_all(&root).unwrap();
+            crate::home::ensure(&sym).unwrap();
+            let p = Policy::new(std::slice::from_ref(&root), &sym, &home).unwrap();
+            let (r, _, _) = run(&p, &sym, "cargo --version && git --version", &root, None).await;
+            assert_eq!(r["exit"], 0, "{r}");
         }
 
         #[test]

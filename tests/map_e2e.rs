@@ -95,7 +95,7 @@ async fn map_run_prediction_then_result() {
     let r = call(&client, "symbia_get", json!({"key": "map.boiler.pressure.result"})).await.unwrap();
     assert!(p["seq"].as_i64().unwrap() < r["seq"].as_i64().unwrap());
     assert!(pred["seq"].as_i64().unwrap() < res["seq"].as_i64().unwrap());
-    assert_eq!(r["links"], json!([{"to_id": pred_id, "rel": "results_of"}]));
+    assert_eq!(r["links"], json!([{"to_id": pred_id, "rel": "results_of", "to_session": null}]));
     assert_eq!(p["linked_from"], json!([{"from_id": res_id, "rel": "results_of"}]));
     assert!(p["at_ms"].as_i64().unwrap() <= r["at_ms"].as_i64().unwrap());
 

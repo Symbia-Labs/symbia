@@ -9,6 +9,7 @@ pub mod keys;
 pub mod mcp;
 pub mod policy;
 pub mod record;
+pub mod rules;
 pub mod seal;
 pub mod store;
 pub mod trust;

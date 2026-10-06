@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use rusqlite::{Connection, OptionalExtension, ToSql, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql, params};
 use serde_json::{Value, json};
 
 use crate::canon::{canonical, hex_prefix};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, RecordInput, RowFields, chain_hash_v2, record_id, row_digest};
+use crate::record::{FORMAT, GENESIS, IdFields, Link, RecordInput, RowFields, chain_hash_v2, record_id, row_digest};
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const FIND_LIMIT_MAX: u32 = 50;
@@ -24,7 +24,7 @@ CREATE TABLE records (
   session TEXT NOT NULL, at_ms INTEGER NOT NULL, expires_ms INTEGER,
   est_host_ms INTEGER, est_chars INTEGER, host_ms INTEGER, chars INTEGER,
   UNIQUE (key, version)) STRICT;
-CREATE TABLE links (from_id TEXT NOT NULL, to_id TEXT NOT NULL, rel TEXT NOT NULL) STRICT;
+CREATE TABLE links (from_id TEXT NOT NULL, to_id TEXT NOT NULL, rel TEXT NOT NULL, to_session TEXT) STRICT;
 CREATE TABLE evidence (sha256 BLOB PRIMARY KEY, bytes INTEGER NOT NULL, media TEXT NOT NULL) STRICT;
 CREATE VIRTUAL TABLE records_fts USING fts5(id UNINDEXED, key, body);
 CREATE INDEX links_from ON links (from_id);
@@ -37,6 +37,7 @@ pub struct Store {
     home: PathBuf,
     session: String,
     path: PathBuf,
+    started_ms: i64,
 }
 
 /// Reference returned for a write.
@@ -102,6 +103,27 @@ pub fn chain_head(conn: &Connection) -> anyhow::Result<(i64, [u8; 32])> {
     }
 }
 
+/// The session holding record `id` in another session file or seal under `home`, newest file
+/// first; `own` (the current session file) is skipped. Files that cannot be read are skipped.
+pub fn find_elsewhere(home: &Path, own: &Path, id: &str) -> Option<String> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for dir in ["sessions", "seals"] {
+        let Ok(entries) = std::fs::read_dir(home.join(dir)) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "sqlite") && p != own {
+                let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                files.push((mtime, p));
+            }
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.into_iter().find_map(|(_, p)| {
+        let conn = Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+        conn.query_row("SELECT session FROM records WHERE id = ?1", [id], |r| r.get(0)).optional().ok()?
+    })
+}
+
 /// Quote each whitespace-separated term as an FTS5 phrase so user text is never parsed as query syntax.
 fn fts_query(q: &str) -> Option<String> {
     let terms: Vec<String> = q.split_whitespace().map(|t| format!("\"{}\"", t.replace('"', "\"\""))).collect();
@@ -136,7 +158,12 @@ impl Store {
             "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('session', ?1, NULL, ?2, ?3)",
             params![expires_ms, FORMAT, mcp_session_id],
         )?;
-        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path })
+        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms() })
+    }
+
+    /// When this session file was created.
+    pub fn started_ms(&self) -> i64 {
+        self.started_ms
     }
 
     pub fn conn(&self) -> &Connection {
@@ -191,17 +218,22 @@ impl Store {
             model: &input.model,
             session: &self.session,
         })?;
+        let mut links: Vec<Link> = Vec::new();
         for l in input.links.iter().flatten() {
             let found: Option<i64> = tx.query_row("SELECT 1 FROM records WHERE id = ?1", [&l.to_id], |r| r.get(0)).optional()?;
-            if found.is_none() {
-                bail!("link target {} not found", l.to_id);
-            }
+            let to_session = match found {
+                Some(_) => None,
+                None => match find_elsewhere(&self.home, &self.path, &l.to_id) {
+                    Some(s) => Some(s),
+                    None => bail!("link target {} not found", l.to_id),
+                },
+            };
+            links.push((l.to_id.clone(), l.rel.clone(), to_session));
         }
         let (prev_seq, prev_hash) = chain_head(&tx)?;
         let at_ms = now_ms();
         let seq = prev_seq + 1;
         let expires_ms: Option<i64> = tx.query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0))?;
-        let links: Vec<(String, String)> = input.links.iter().flatten().map(|l| (l.to_id.clone(), l.rel.clone())).collect();
         let digest = row_digest(&RowFields {
             id: &id,
             key: &input.key,
@@ -243,8 +275,8 @@ impl Store {
             "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![seq, prev_hash.as_slice(), hash.as_slice(), at_ms, id],
         )?;
-        for (to_id, rel) in &links {
-            tx.execute("INSERT INTO links (from_id, to_id, rel) VALUES (?1, ?2, ?3)", params![id, to_id, rel])?;
+        for (to_id, rel, to_session) in &links {
+            tx.execute("INSERT INTO links (from_id, to_id, rel, to_session) VALUES (?1, ?2, ?3, ?4)", params![id, to_id, rel, to_session])?;
         }
         tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, body_text])?;
         for e in evidence {
@@ -342,9 +374,11 @@ impl Store {
             .optional()?;
         let Some((mut rec, body)) = rec else { return Ok(None) };
         rec["body"] = serde_json::from_str(&body)?;
-        let mut stmt = self.conn.prepare("SELECT to_id, rel FROM links WHERE from_id = ?1 ORDER BY rowid")?;
+        let mut stmt = self.conn.prepare("SELECT to_id, rel, to_session FROM links WHERE from_id = ?1 ORDER BY rowid")?;
         let links: Vec<Value> = stmt
-            .query_map([id], |r| Ok(json!({"to_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?})))?
+            .query_map([id], |r| {
+                Ok(json!({"to_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?, "to_session": r.get::<_, Option<String>>(2)?}))
+            })?
             .collect::<Result<_, _>>()?;
         let mut stmt = self.conn.prepare("SELECT from_id, rel FROM links WHERE to_id = ?1 ORDER BY rowid")?;
         let linked_from: Vec<Value> = stmt
@@ -508,7 +542,7 @@ mod tests {
         r.links = Some(vec![LinkInput { to_id: p.id.clone(), rel: "results_of".into() }]);
         let rw = s.write(&r, Instant::now()).unwrap();
         let got = s.get(&rw.id).unwrap().unwrap();
-        assert_eq!(got["links"], json!([{"to_id": p.id, "rel": "results_of"}]));
+        assert_eq!(got["links"], json!([{"to_id": p.id, "rel": "results_of", "to_session": null}]));
         assert_eq!(got["body"], json!("rain"));
         assert_eq!(got["seq"], 2);
         let back = s.get(&p.id).unwrap().unwrap();
@@ -519,6 +553,40 @@ mod tests {
         assert!(s.write(&bad, Instant::now()).is_err());
         // A failed write leaves no trace on the chain.
         assert_eq!(s.head().unwrap().0, 2);
+    }
+
+    #[test]
+    fn links_reach_records_in_earlier_sessions() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let mut a = Store::create(t.path()).unwrap();
+        let p = a.write(&input("p", "prediction", json!("rain")), Instant::now()).unwrap();
+        crate::seal::seal(&a, &key).unwrap();
+        // Only the seal holds A's prediction: the live file is gone.
+        let a_session = a.session().to_string();
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        std::fs::remove_file(&a_path).unwrap();
+
+        let mut b = Store::create(t.path()).unwrap();
+        assert!(b.started_ms() > 0 && b.started_ms() <= now_ms());
+        let mut r = input("r", "result", json!("rain"));
+        r.links = Some(vec![LinkInput { to_id: p.id.clone(), rel: "results_of".into() }]);
+        let rw = b.write(&r, Instant::now()).unwrap();
+        let got = b.get(&rw.id).unwrap().unwrap();
+        assert_eq!(got["links"], json!([{"to_id": p.id, "rel": "results_of", "to_session": a_session}]));
+        // A same-session link next to it has no session.
+        let mut r2 = input("r2", "result", json!(1));
+        r2.links = Some(vec![LinkInput { to_id: rw.id.clone(), rel: "cites".into() }, LinkInput { to_id: p.id.clone(), rel: "cites".into() }]);
+        let w2 = b.write(&r2, Instant::now()).unwrap();
+        let links = &b.get(&w2.id).unwrap().unwrap()["links"];
+        assert_eq!(links[0]["to_session"], Value::Null);
+        assert_eq!(links[1]["to_session"], a_session.as_str());
+        // Unknown anywhere: refused, nothing written.
+        let mut bad = input("x", "result", json!(0));
+        bad.links = Some(vec![LinkInput { to_id: "f".repeat(64), rel: "results_of".into() }]);
+        assert!(b.write(&bad, Instant::now()).unwrap_err().to_string().contains("not found"));
+        assert_eq!(b.head().unwrap().0, 2);
     }
 
     #[test]

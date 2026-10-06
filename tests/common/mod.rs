@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod stdio;
+
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::Value;

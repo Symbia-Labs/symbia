@@ -99,6 +99,9 @@ pub struct FsWriteArgs {
     /// Refuse if the file already exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_only: Option<bool>,
+    /// Append to the file, creating it if missing. Not with create_only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -258,8 +261,19 @@ impl SymbiaServer {
             est_chars: None,
             links: None,
         };
-        self.with_store(|s| s.write_with(&input, started, Some(text.chars().count()), evidence).map_err(err))?;
+        self.with_store(|s| {
+            s.write_with(&input, started, Some(text.chars().count()), evidence).map_err(err)?;
+            self.checkpoint(s, &input.kind);
+            Ok(())
+        })?;
         result
+    }
+
+    /// Seal if a checkpoint is due after a write. A failure goes to stderr and never fails the write.
+    fn checkpoint(&self, store: &Store, kind: &str) {
+        if let Err(e) = seal::checkpoint(store, &self.key, kind) {
+            eprintln!("symbia: checkpoint seal of {} failed: {e:#}", store.session());
+        }
     }
 
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
@@ -302,7 +316,7 @@ impl SymbiaServer {
     #[tool(
         title = "Session status",
         annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
-        description = "Session status: build, session, MCP session id, expiry, retention, file, chain seq and head, last seal, public key."
+        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key."
     )]
     pub async fn symbia_status(&self) -> Result<String, String> {
         self.with_store(|store| {
@@ -312,6 +326,7 @@ impl SymbiaServer {
             Ok(json!({
                 "build": crate::BUILD,
                 "session": store.session(),
+                "session_started_ms": store.started_ms(),
                 "mcp_session_id": store.mcp_session_id().map_err(err)?,
                 "expires_ms": store.expires_ms().map_err(err)?,
                 "retention": store.retention().map_err(err)?,
@@ -328,11 +343,15 @@ impl SymbiaServer {
     #[tool(
         title = "Write a record",
         annotations(title = "Write a record", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
-        description = "Write a record to the ledger. Returns {id, version, seq, head}."
+        description = "Write a record to the ledger. links is a list of {\"to_id\": \"<record id>\", \"rel\": \"<rel>\"}, rel one of results_of, revises, supersedes, cites; the target may be in an earlier session. A prediction is sealed at once. Returns {id, version, seq, head}."
     )]
     pub async fn symbia_record(&self, Parameters(args): Parameters<RecordInput>) -> Result<String, String> {
         let started = Instant::now();
-        self.with_store(|store| Ok(store.write(&args, started).map_err(err)?.reply()))
+        self.with_store(|store| {
+            let reply = store.write(&args, started).map_err(err)?.reply();
+            self.checkpoint(store, &args.kind);
+            Ok(reply)
+        })
     }
 
     #[tool(
@@ -429,10 +448,18 @@ impl SymbiaServer {
     #[tool(
         title = "Write a file",
         annotations(title = "Write a file", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false),
-        description = "Write a file atomically (temp file then rename). Returns {path, bytes, sha256}."
+        description = "Write a file atomically (temp file then rename), or with append add to its end (created if missing). Returns {path, bytes, sha256}; append adds size."
     )]
     pub async fn symbia_fs_write(&self, Parameters(args): Parameters<FsWriteArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_write", args, |p, a, f| crate::files::write(p, &a.path, &a.content, a.create_only.unwrap_or(false), f)).await
+        self.file_tool("symbia_fs_write", args, |p, a, f| match (a.create_only.unwrap_or(false), a.append.unwrap_or(false)) {
+            (true, true) => {
+                f.path = Some(a.path.clone());
+                Err("create_only and append cannot both be set".into())
+            }
+            (create_only, false) => crate::files::write(p, &a.path, &a.content, create_only, f),
+            (false, true) => crate::files::append(p, &a.path, &a.content, f),
+        })
+        .await
     }
 
     #[tool(
@@ -447,7 +474,7 @@ impl SymbiaServer {
     #[tool(
         title = "Run a command",
         annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path. Commands run sandboxed: deny-list paths are off limits, the data directory is read-only, and network may be off."
+        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary."
     )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
         let started = Instant::now();
@@ -543,7 +570,7 @@ mod tests {
         let s = s.with_policy(Policy::new(&[w.path().join("root")], t.path(), t.path()).unwrap());
         std::fs::create_dir_all(w.path().join("root")).unwrap();
         let f = w.path().join("root/a.txt").display().to_string();
-        let reply = s.symbia_fs_write(Parameters(FsWriteArgs { path: f.clone(), content: "secret body".into(), create_only: None })).await.unwrap();
+        let reply = s.symbia_fs_write(Parameters(FsWriteArgs { path: f.clone(), content: "secret body".into(), create_only: None, append: None })).await.unwrap();
         let e = s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None })).await.unwrap_err();
         assert!(e.starts_with("denied"));
         let recs = tool_calls(&s);
@@ -592,7 +619,7 @@ mod tests {
         let key = Arc::new(crate::keys::load_or_create(t.path()).unwrap());
         let s = SymbiaServer::for_http(t.path(), key, Arc::default(), policy(t.path()));
         let f = t.path().join("x").display().to_string();
-        let e = s.symbia_fs_write(Parameters(FsWriteArgs { path: f, content: "x".into(), create_only: None })).await.unwrap_err();
+        let e = s.symbia_fs_write(Parameters(FsWriteArgs { path: f, content: "x".into(), create_only: None, append: None })).await.unwrap_err();
         assert_eq!(e, NO_SESSION);
         assert!(!t.path().join("x").exists());
     }
@@ -708,6 +735,126 @@ mod tests {
         assert!(sessions.expired("sid-1", v["expires_ms"].as_i64().unwrap()));
         assert_eq!(s.bind(&with_session_header("sid-2")).unwrap_err(), "Mcp-Session-Id does not match this session");
         assert_eq!(std::fs::read_dir(t.path().join("sessions")).unwrap().filter(|e| e.as_ref().unwrap().path().extension().unwrap() == "sqlite").count(), 1);
+    }
+
+    fn seal_seqs(home: &Path) -> Vec<i64> {
+        let mut v: Vec<i64> = std::fs::read_dir(home.join("seals"))
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension()? == "sqlite").then(|| seal::read_sidecar(&p).unwrap().chain_seq)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn fifty_tool_calls_make_a_checkpoint_seal() {
+        let (t, s) = server();
+        let w = tempfile::tempdir().unwrap();
+        let s = s.with_policy(Policy::new(&[w.path().to_path_buf()], t.path(), t.path()).unwrap());
+        let list = || FsListArgs { path: w.path().display().to_string(), depth: None, glob: None };
+        for _ in 0..49 {
+            s.symbia_fs_list(Parameters(list())).await.unwrap();
+        }
+        assert!(seal_seqs(t.path()).is_empty());
+        s.symbia_fs_list(Parameters(list())).await.unwrap();
+        assert_eq!(seal_seqs(t.path()), [50]);
+        let path = seal::last_seal(t.path(), &s.with_store(|st| Ok(st.session().to_string())).unwrap()).unwrap().0;
+        assert!(seal::verify(&path).is_ok());
+        // Refused calls are records too and count toward the next one.
+        for _ in 0..50 {
+            s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None })).await.unwrap_err();
+        }
+        assert_eq!(seal_seqs(t.path()), [50, 100]);
+    }
+
+    #[tokio::test]
+    async fn a_prediction_is_sealed_at_once_and_not_again() {
+        let (t, s) = server();
+        s.symbia_record(Parameters(rec("a"))).await.unwrap();
+        assert!(seal_seqs(t.path()).is_empty(), "a claim waits");
+        let reply: Value = serde_json::from_str(&s.symbia_record(Parameters(RecordInput { kind: "prediction".into(), ..rec("p") })).await.unwrap()).unwrap();
+        assert_eq!(reply.as_object().unwrap().len(), 4, "the reply is unchanged");
+        assert_eq!(seal_seqs(t.path()), [2]);
+        // Sealed at its head: neither an explicit seal nor the exit seal makes another.
+        s.symbia_seal().await.unwrap();
+        assert!(s.seal_pending().unwrap().is_none());
+        assert_eq!(seal_seqs(t.path()), [2]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_checkpoint_does_not_fail_the_write() {
+        let (t, s) = server();
+        // A file where the seal copy would go makes `VACUUM INTO` fail.
+        let session = s.with_store(|st| Ok(st.session().to_string())).unwrap();
+        std::fs::create_dir_all(t.path().join("seals").join(format!("{session}-1.sqlite"))).unwrap();
+        let reply = s.symbia_record(Parameters(RecordInput { kind: "prediction".into(), ..rec("p") })).await;
+        assert!(reply.is_ok(), "{reply:?}");
+        assert_eq!(s.with_store(|st| Ok(st.head().unwrap().0)).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_names_when_the_session_started() {
+        let before = crate::now_ms();
+        let (_t, s) = server();
+        let v: Value = serde_json::from_str(&s.symbia_status().await.unwrap()).unwrap();
+        let started = v["session_started_ms"].as_i64().unwrap();
+        assert!(started >= before && started <= crate::now_ms());
+    }
+
+    #[tokio::test]
+    async fn fs_write_appends_and_refuses_append_with_create_only() {
+        let (t, s) = server();
+        let w = tempfile::tempdir().unwrap();
+        let s = s.with_policy(Policy::new(&[w.path().to_path_buf()], t.path(), t.path()).unwrap());
+        let f = w.path().join("log.txt").display().to_string();
+        let args = |content: &str, create_only, append| FsWriteArgs { path: f.clone(), content: content.into(), create_only, append };
+        s.symbia_fs_write(Parameters(args("a\n", None, Some(true)))).await.unwrap();
+        s.symbia_fs_write(Parameters(args("b\n", None, Some(true)))).await.unwrap();
+        assert_eq!(std::fs::read_to_string(w.path().join("log.txt")).unwrap(), "a\nb\n");
+        let e = s.symbia_fs_write(Parameters(args("c\n", Some(true), Some(true)))).await.unwrap_err();
+        assert_eq!(e, "create_only and append cannot both be set");
+        assert_eq!(std::fs::read_to_string(w.path().join("log.txt")).unwrap(), "a\nb\n");
+        let recs = tool_calls(&s);
+        assert_eq!(recs[1]["body"]["sha256_before"], hex::encode(sha256(b"a\n")));
+        assert_eq!(recs[1]["body"]["sha256_after"], hex::encode(sha256(b"a\nb\n")));
+        assert_eq!((recs[2]["body"]["error"].as_str(), recs[2]["body"]["path"].as_str()), (Some(e.as_str()), Some(f.as_str())));
+    }
+
+    #[test]
+    fn record_tool_states_the_link_shape_and_rels() {
+        let (_t, s) = server();
+        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_record").unwrap();
+        let d = tool.description.unwrap();
+        assert!(d.contains(r#"{"to_id": "<record id>", "rel": "<rel>"}"#), "{d}");
+        for rel in crate::record::RELS {
+            assert!(d.contains(rel), "{rel}");
+        }
+        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_exec").unwrap().description.unwrap();
+        assert!(exec.contains("not a boundary"), "{exec}");
+    }
+
+    #[tokio::test]
+    async fn refused_rel_lists_the_allowed_ones() {
+        let (_t, s) = server();
+        let links = Some(vec![crate::record::LinkInput { to_id: "x".into(), rel: "likes".into() }]);
+        let e = s.symbia_record(Parameters(RecordInput { links, ..rec("a") })).await.unwrap_err();
+        assert!(e.contains("results_of, revises, supersedes, cites"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn get_shows_each_links_session() {
+        let t = tempfile::tempdir().unwrap();
+        let a = SymbiaServer::new(t.path()).unwrap();
+        let p: Value = serde_json::from_str(&a.symbia_record(Parameters(RecordInput { kind: "prediction".into(), ..rec("p") })).await.unwrap()).unwrap();
+        let a_session = a.with_store(|st| Ok(st.session().to_string())).unwrap();
+        let b = SymbiaServer::new(t.path()).unwrap();
+        let links = Some(vec![crate::record::LinkInput { to_id: p["id"].as_str().unwrap().into(), rel: "results_of".into() }]);
+        let r: Value = serde_json::from_str(&b.symbia_record(Parameters(RecordInput { kind: "result".into(), links, ..rec("r") })).await.unwrap()).unwrap();
+        let got: Value = serde_json::from_str(&b.symbia_get(Parameters(GetArgs { id: r["id"].as_str().map(String::from), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(got["links"][0]["to_session"], a_session.as_str());
     }
 
     #[test]

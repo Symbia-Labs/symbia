@@ -6,8 +6,31 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::Context;
 use serde::Deserialize;
 
-/// Denied even inside a root, relative to the user's home directory.
-pub const DENY_IN_HOME: [&str; 5] = [".ssh", ".gnupg", ".aws", "Library/Keychains", "Library/Application Support/Claude"];
+/// Denied even inside a root, relative to the user's home directory. These hold keys and
+/// credentials and stay refused in every mode, for the file tools and exec alike.
+pub const DENY_IN_HOME: [&str; 13] = [
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    "Library/Keychains",
+    "Library/Application Support/Claude",
+    ".config/gh",
+    ".netrc",
+    ".docker/config.json",
+    ".kube",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "Library/Cookies",
+];
+
+/// Default `read_roots`: toolchain source the file tools may read but not write.
+pub const READ_ROOTS_DEFAULT: [&str; 2] = ["~/.cargo/registry", "~/.rustup/toolchains"];
+
+/// Default `exec_read_allow`: files in the home a shell and toolchain need under `exec_read: "home"`.
+/// `~/.npmrc` is left out on purpose: it holds tokens.
+pub const EXEC_READ_ALLOW_DEFAULT: [&str; 9] =
+    ["~/.zshenv", "~/.zprofile", "~/.zshrc", "~/.zlogin", "~/.cargo", "~/.rustup", "~/.local/bin", "~/.gitconfig", "~/.config/git"];
 
 /// What a tool wants to do at a path. Reads may also reach `$SYMBIA_HOME/evidence`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,24 +80,66 @@ impl Network {
     }
 }
 
+/// What `symbia_exec` commands may read (`exec_read` in config.json).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum ExecRead {
+    /// Nothing under the user's home except the roots, the read allowances and the evidence folder.
+    #[default]
+    #[serde(rename = "home")]
+    Home,
+    /// Everything but the deny list (R2).
+    #[serde(rename = "deny_list")]
+    DenyList,
+}
+
+/// `$SYMBIA_HOME/config.json`. Every key is optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Read-write roots for the tools; default the user's home.
+    pub roots: Option<Vec<String>>,
+    pub exec_network: Network,
+    pub exec_read: ExecRead,
+    /// Paths under the home exec may still read with `exec_read: "home"`.
+    pub exec_read_allow: Vec<String>,
+    /// Exec command rules in Claude Code's syntax: `"chmod:*"` or an exact command.
+    pub exec_deny: Vec<String>,
+    /// Also load `Bash(...)` deny rules from Claude Code's settings files.
+    pub exec_import_claude_rules: bool,
+    /// Read-only roots for the file tools.
+    pub read_roots: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            roots: None,
+            exec_network: Network::Allow,
+            exec_read: ExecRead::Home,
+            exec_read_allow: EXEC_READ_ALLOW_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            exec_deny: Vec::new(),
+            exec_import_claude_rules: true,
+            read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Policy {
     roots: Vec<Spelled>,
-    /// Extra roots for reads only: the evidence folder.
+    /// `$SYMBIA_HOME/evidence`: readable by the file tools and exec, never writable.
+    evidence: Spelled,
+    /// Extra roots for the file tools, reads only.
     read_roots: Vec<Spelled>,
     deny: Vec<Spelled>,
     /// `$SYMBIA_HOME`: readable where a root covers it, never writable.
     own: Spelled,
-    user_home: PathBuf,
+    user_home: Spelled,
     network: Network,
-}
-
-#[derive(Deserialize)]
-struct Config {
-    #[serde(default)]
-    roots: Option<Vec<String>>,
-    #[serde(default)]
-    exec_network: Network,
+    exec_read: ExecRead,
+    exec_read_allow: Vec<Spelled>,
+    exec_deny: Vec<String>,
+    import_claude_rules: bool,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -113,20 +178,18 @@ pub fn real(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 impl Policy {
-    /// Load roots from `$SYMBIA_HOME/config.json` (`{"roots": [...], "exec_network": "allow"|"deny"}`);
-    /// the default root is `user_home`, the default network `allow`.
+    /// Load [`Config`] from `$SYMBIA_HOME/config.json`; a missing file means every default.
+    /// The default root is `user_home`.
     pub fn load(symbia_home: &Path, user_home: &Path) -> anyhow::Result<Self> {
         let cfg = symbia_home.join("config.json");
-        let (roots, network) = match std::fs::read(&cfg) {
-            Ok(bytes) => {
-                let c: Config = serde_json::from_slice(&bytes).with_context(|| format!("parse {}", cfg.display()))?;
-                (c.roots.unwrap_or_else(|| vec![user_home.display().to_string()]), c.exec_network)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (vec![user_home.display().to_string()], Network::Allow),
+        let c: Config = match std::fs::read(&cfg) {
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parse {}", cfg.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("read {}", cfg.display())),
         };
+        let roots = c.roots.clone().unwrap_or_else(|| vec![user_home.display().to_string()]);
         let roots: Vec<PathBuf> = roots.iter().map(|r| expand(r, user_home)).collect::<anyhow::Result<_>>()?;
-        Ok(Self::new(&roots, symbia_home, user_home)?.with_network(network))
+        Self::with_config(&roots, symbia_home, user_home, &c)
     }
 
     /// Load from the process environment: `HOME` is the user's home directory.
@@ -135,17 +198,34 @@ impl Policy {
         Self::load(symbia_home, Path::new(&home))
     }
 
+    /// A policy with these roots and every other setting at its default.
     pub fn new(roots: &[PathBuf], symbia_home: &Path, user_home: &Path) -> anyhow::Result<Self> {
+        Self::with_config(roots, symbia_home, user_home, &Config::default())
+    }
+
+    /// A policy with these roots and the rest of `c` (its `roots` key is ignored).
+    pub fn with_config(roots: &[PathBuf], symbia_home: &Path, user_home: &Path, c: &Config) -> anyhow::Result<Self> {
+        let spell = |list: &[String]| -> anyhow::Result<Vec<Spelled>> { list.iter().map(|p| Spelled::new(&expand(p, user_home)?)).collect() };
         let roots = roots.iter().map(|r| Spelled::new(r)).collect::<anyhow::Result<_>>()?;
-        let read_roots = vec![Spelled::new(&symbia_home.join("evidence"))?];
         let deny = DENY_IN_HOME
             .iter()
             .map(|d| user_home.join(d))
             .chain([symbia_home.join("keys")])
             .map(|d| Spelled::new(&d))
             .collect::<anyhow::Result<_>>()?;
-        let own = Spelled::new(symbia_home)?;
-        Ok(Self { roots, read_roots, deny, own, user_home: user_home.to_path_buf(), network: Network::Allow })
+        Ok(Self {
+            roots,
+            evidence: Spelled::new(&symbia_home.join("evidence"))?,
+            read_roots: spell(&c.read_roots)?,
+            deny,
+            own: Spelled::new(symbia_home)?,
+            user_home: Spelled::new(user_home)?,
+            network: c.exec_network,
+            exec_read: c.exec_read,
+            exec_read_allow: spell(&c.exec_read_allow)?,
+            exec_deny: c.exec_deny.clone(),
+            import_claude_rules: c.exec_import_claude_rules,
+        })
     }
 
     pub fn with_network(mut self, network: Network) -> Self {
@@ -155,6 +235,24 @@ impl Policy {
 
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    pub fn exec_read(&self) -> ExecRead {
+        self.exec_read
+    }
+
+    /// `exec_deny` rules from config.json.
+    pub fn exec_deny(&self) -> &[String] {
+        &self.exec_deny
+    }
+
+    pub fn import_claude_rules(&self) -> bool {
+        self.import_claude_rules
+    }
+
+    /// The user's home directory as given.
+    pub fn user_home(&self) -> &Path {
+        &self.user_home.lex
     }
 
     /// Every deny-list path, as spelled and as its realpath when that differs.
@@ -167,6 +265,33 @@ impl Policy {
         self.own.both().collect()
     }
 
+    /// The user's home, both spellings.
+    pub fn home_paths(&self) -> Vec<&Path> {
+        self.user_home.both().collect()
+    }
+
+    /// What exec may read under the home with `exec_read: "home"`: the roots, the read
+    /// allowances and the evidence folder, both spellings.
+    pub fn exec_read_paths(&self) -> Vec<&Path> {
+        self.roots.iter().chain(&self.exec_read_allow).chain([&self.evidence]).flat_map(Spelled::both).collect()
+    }
+
+    /// Folders strictly between the home and each root or read allowance inside it, both
+    /// spellings: exec may read their metadata, so paths through them resolve.
+    pub fn exec_ancestor_paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let homes: Vec<&Path> = self.home_paths();
+        for p in self.roots.iter().chain(&self.exec_read_allow).flat_map(Spelled::both) {
+            let Some(home) = homes.iter().copied().find(|h| p.starts_with(h) && p != *h) else { continue };
+            for a in p.ancestors().skip(1).take_while(|a| *a != home) {
+                if !out.iter().any(|o| o == a) {
+                    out.push(a.to_path_buf());
+                }
+            }
+        }
+        out
+    }
+
     /// A path falls on the deny list. Walks use this on every entry they visit.
     pub fn denied(&self, path: &Path) -> bool {
         self.deny.iter().any(|d| d.holds(path))
@@ -174,7 +299,7 @@ impl Policy {
 
     /// Check `path` for `access`. Returns the realpath to operate on.
     pub fn check(&self, path: &str, access: Access) -> Result<PathBuf, String> {
-        let lex = lexical(&expand(path, &self.user_home).map_err(|e| e.to_string())?);
+        let lex = lexical(&expand(path, &self.user_home.lex).map_err(|e| e.to_string())?);
         let resolved = real(&lex).map_err(|e| format!("cannot resolve {}: {e}", lex.display()))?;
         if self.denied(&lex) || self.denied(&resolved) {
             return Err(format!("denied: {} is on the deny list", lex.display()));
@@ -183,7 +308,8 @@ impl Policy {
             return Err(format!("denied: {} is inside $SYMBIA_HOME, which the tools may not write", lex.display()));
         }
         let extra: &[Spelled] = if access == Access::Read { &self.read_roots } else { &[] };
-        let roots = || self.roots.iter().chain(extra);
+        let evidence = (access == Access::Read).then_some(&self.evidence);
+        let roots = || self.roots.iter().chain(extra).chain(evidence);
         if !roots().any(|r| r.holds(&lex)) {
             return Err(format!("denied: {} is outside the allowed roots", lex.display()));
         }
@@ -373,5 +499,69 @@ mod tests {
         }
         assert!(p.own_paths().contains(&sym.as_path()));
         assert!(p.own_paths().contains(&std::fs::canonicalize(&sym).unwrap().as_path()));
+    }
+
+    #[test]
+    fn read_roots_are_readable_but_not_writable() {
+        let (_t, user, sym, _p) = setup();
+        let reg = user.join(".cargo/registry/src/index/serde-1.0.0/src/lib.rs");
+        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
+        std::fs::write(&reg, "pub fn f() {}").unwrap();
+        std::fs::create_dir_all(user.join(".rustup/toolchains/stable/lib")).unwrap();
+        // Roots that do not cover the home: only the read roots reach the toolchain.
+        std::fs::write(sym.join("config.json"), serde_json::json!({"roots": [user.join("work")]}).to_string()).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        for f in [reg.clone(), user.join(".rustup/toolchains/stable/lib")] {
+            assert!(p.check(&s(&f), Access::Read).is_ok(), "{}", f.display());
+            assert!(p.check(&s(&f), Access::Write).unwrap_err().contains("outside the allowed roots"), "{}", f.display());
+        }
+        assert!(p.check("~/.cargo/registry/x", Access::Read).is_ok());
+        assert!(p.check("~/.cargo/config.toml", Access::Read).is_err());
+        // Configurable, `~` expanded; the deny list still wins.
+        std::fs::write(sym.join("config.json"), serde_json::json!({"roots": [user.join("work")], "read_roots": ["~/ref", "~"]}).to_string()).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        assert!(p.check(&s(&user.join("ref/a")), Access::Read).is_ok());
+        assert!(p.check(&s(&reg), Access::Read).is_ok(), "~ covers the registry now");
+        assert!(p.check(&s(&user.join(".ssh/id")), Access::Read).unwrap_err().contains("deny list"));
+        assert!(p.check(&s(&user.join(".config/gh/hosts.yml")), Access::Read).unwrap_err().contains("deny list"));
+        assert!(p.check(&s(&user.join("ref/a")), Access::Write).is_err());
+    }
+
+    #[test]
+    fn config_sets_exec_read_rules_and_imports() {
+        let (_t, user, sym, p) = setup();
+        assert_eq!((p.exec_read(), p.import_claude_rules(), p.exec_deny().len()), (ExecRead::Home, true, 0));
+        std::fs::write(
+            sym.join("config.json"),
+            r#"{"exec_read": "deny_list", "exec_deny": ["chmod:*"], "exec_import_claude_rules": false, "exec_read_allow": ["~/.tool"]}"#,
+        )
+        .unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        assert_eq!((p.exec_read(), p.import_claude_rules(), p.exec_deny()), (ExecRead::DenyList, false, &["chmod:*".to_string()][..]));
+        assert!(p.exec_read_paths().contains(&user.join(".tool").as_path()));
+        assert!(!p.exec_read_paths().contains(&user.join(".zshrc").as_path()));
+        std::fs::write(sym.join("config.json"), r#"{"exec_read": "everything"}"#).unwrap();
+        assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[test]
+    fn exec_read_paths_and_ancestors() {
+        let (_t, user, sym, _p) = setup();
+        let root = user.join("work/a/proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = Policy::new(std::slice::from_ref(&root), &sym, &user).unwrap();
+        let reads = p.exec_read_paths();
+        for want in [root.clone(), user.join(".zshrc"), user.join(".cargo"), user.join(".config/git"), sym.join("evidence")] {
+            assert!(reads.contains(&want.as_path()), "{}", want.display());
+        }
+        assert!(!reads.contains(&user.join(".npmrc").as_path()));
+        let anc = p.exec_ancestor_paths();
+        for want in [user.join("work"), user.join("work/a"), user.join(".config"), user.join(".local")] {
+            assert!(anc.contains(&want), "{}", want.display());
+        }
+        assert!(!anc.contains(&user) && !anc.contains(&root));
+        let real_user = std::fs::canonicalize(&user).unwrap();
+        assert!(anc.contains(&real_user.join("work/a")), "realpath spelling too");
+        assert!(p.home_paths().contains(&real_user.as_path()));
     }
 }

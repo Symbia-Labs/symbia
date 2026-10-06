@@ -482,6 +482,32 @@ pub fn write(policy: &Policy, path: &str, content: &str, create_only: bool, fact
     write_at(policy, &real, content, create_only, facts)
 }
 
+/// Append `content` to a file, creating it (and its parent directories) if missing. The whole
+/// new file is written atomically, so `sha256_before` and `sha256_after` cover what changed.
+pub fn append(policy: &Policy, path: &str, content: &str, facts: &mut Facts) -> Result<String, String> {
+    let real = checked(policy, path, Access::Write, &mut facts.path)?;
+    append_at(policy, &real, content, facts)
+}
+
+/// [`append`] after the policy check, on its realpath.
+fn append_at(policy: &Policy, real: &Path, content: &str, facts: &mut Facts) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut keep = None;
+    if let Some(mut f) = open_target(real)? {
+        keep = Some(mode(&f)?);
+        f.read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", real.display()))?;
+        facts.sha256_before = Some(hex::encode(crate::canon::sha256(&bytes)));
+    }
+    bytes.extend_from_slice(content.as_bytes());
+    if let Some(dir) = real.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    atomic_write(policy, real, &bytes, false, keep).map_err(|e| format!("write {}: {e}", real.display()))?;
+    let after = crate::canon::sha256(&bytes);
+    facts.sha256_after = Some(hex::encode(after));
+    Ok(json!({"path": show(real), "bytes": content.len(), "size": bytes.len(), "sha256": hex_prefix(&after, PREFIX)}).to_string())
+}
+
 /// [`write`] after the policy check, on its realpath.
 fn write_at(policy: &Policy, real: &Path, content: &str, create_only: bool, facts: &mut Facts) -> Result<String, String> {
     let existing = open_target(real)?;
@@ -802,6 +828,27 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(f.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["f.txt"]);
         assert!(std::fs::read_dir(&root).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn append_creates_then_appends_and_records_both_digests() {
+        let (_t, root, p) = setup();
+        let f = root.join("new/log.txt");
+        let mut facts = Facts::default();
+        let r = v(&append(&p, &s(&f), "one\n", &mut facts).unwrap());
+        assert_eq!((r["bytes"].clone(), r["size"].clone()), (json!(4), json!(4)));
+        assert!(facts.sha256_before.is_none());
+        assert_eq!(facts.sha256_after, Some(hex::encode(crate::canon::sha256(b"one\n"))));
+        let mut facts = Facts::default();
+        let r = v(&append(&p, &s(&f), "two\n", &mut facts).unwrap());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\ntwo\n");
+        assert_eq!((r["bytes"].clone(), r["size"].clone()), (json!(4), json!(8)));
+        assert_eq!(r["sha256"], hex_prefix(&crate::canon::sha256(b"one\ntwo\n"), 12));
+        assert_eq!(facts.sha256_before, Some(hex::encode(crate::canon::sha256(b"one\n"))));
+        assert_eq!(facts.sha256_after, Some(hex::encode(crate::canon::sha256(b"one\ntwo\n"))));
+        assert_eq!(std::fs::read_dir(f.parent().unwrap()).unwrap().count(), 1, "no temp files left");
+        // The path policy applies as for writes.
+        assert!(append(&p, "/etc/hosts", "x", &mut Facts::default()).unwrap_err().starts_with("denied"));
     }
 
     #[test]

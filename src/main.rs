@@ -110,26 +110,32 @@ async fn shutdown_signal() {
     }
 }
 
-/// Serve over stdio until the transport closes or a signal arrives, then seal the session
-/// if anything was written since its last seal.
+/// Seal on exit if anything was written since the last seal; a failure goes to stderr.
+fn seal_on_exit(server: &symbia::mcp::SymbiaServer) {
+    if let Err(e) = server.seal_pending() {
+        eprintln!("symbia mcp: seal on exit failed: {e}");
+    }
+}
+
+/// Serve over stdio until the transport closes or a signal arrives. Seal the session at once,
+/// since a client may kill the process soon after, then drain in-flight tool calls and seal
+/// again if any of them wrote.
 fn run_mcp() -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let server = symbia::mcp::SymbiaServer::new(&home)?;
     let handle = server.clone();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let r = rt.block_on(async move {
+    let r = rt.block_on(async {
         let running = server.serve(rmcp::transport::stdio()).await?;
-        tokio::select! {
-            r = running.waiting() => { r?; }
-            () = shutdown_signal() => {}
-        }
-        anyhow::Ok(())
+        let r = tokio::select! {
+            r = running.waiting() => r.map(|_| ()).map_err(anyhow::Error::from),
+            () = shutdown_signal() => Ok(()),
+        };
+        seal_on_exit(&handle);
+        r
     });
-    // Stop the runtime first so no tool call writes after the seal.
     rt.shutdown_timeout(DRAIN);
-    if let Err(e) = handle.seal_pending() {
-        eprintln!("symbia mcp: seal on exit failed: {e}");
-    }
+    seal_on_exit(&handle);
     r
 }
 
@@ -168,6 +174,9 @@ fn run_verify(path: &Path, extra: &[&str]) -> ExitCode {
     match symbia::seal::verify_trusted(path, &trusted) {
         Ok(v) => {
             println!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]);
+            for x in &v.external {
+                println!("external {} {} {} session {}", &x.from_id[..12], x.rel, &x.to_id[..x.to_id.len().min(12)], x.session);
+            }
             ExitCode::SUCCESS
         }
         Err(reason) => {

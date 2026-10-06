@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::canon::{canonical, sha256};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, RowFields, chain_hash, chain_hash_v2, record_id, row_digest};
+use crate::record::{FORMAT, GENESIS, IdFields, Link, RowFields, chain_hash, chain_hash_v2, record_id, row_digest};
 use crate::store::{Store, chain_head};
 
 /// The `.seal.json` sidecar. Byte fields are lowercase hex.
@@ -37,6 +37,17 @@ pub struct Verified {
     pub session: String,
     pub chain_seq: i64,
     pub chain_head: String,
+    /// Links to records in other sessions: hashed with the row, target not checked here.
+    pub external: Vec<External>,
+}
+
+/// A link whose target lives in another session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct External {
+    pub from_id: String,
+    pub to_id: String,
+    pub rel: String,
+    pub session: String,
 }
 
 /// `seals/<session>-<seq>.sqlite` → `seals/<session>-<seq>.seal.json`.
@@ -110,6 +121,21 @@ pub fn seal_pending(store: &Store, key: &SigningKey) -> anyhow::Result<Option<Se
         return Ok(None);
     }
     seal(store, key).map(Some)
+}
+
+/// Records written since the last seal that trigger a checkpoint seal.
+pub const CHECKPOINT_RECORDS: i64 = 50;
+
+/// After a write of a record of `kind`: seal if it is a `prediction` (so a prediction is sealed
+/// before the work it predicts) or if [`CHECKPOINT_RECORDS`] records were written since the
+/// last seal. A checkpoint is an ordinary seal; `None` when none was due.
+pub fn checkpoint(store: &Store, key: &SigningKey, kind: &str) -> anyhow::Result<Option<Sealed>> {
+    let (seq, _) = store.head()?;
+    let sealed = last_seal(store.home(), store.session()).map_or(0, |(_, s)| s.chain_seq);
+    if seq > sealed && (kind == "prediction" || seq - sealed >= CHECKPOINT_RECORDS) {
+        return seal(store, key).map(Some);
+    }
+    Ok(None)
 }
 
 /// The newest seal of `session` under `home/seals`, by chain seq.
@@ -209,7 +235,16 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
              FROM records WHERE id = ?1",
         )
         .map_err(db)?;
-    let mut links = conn.prepare("SELECT to_id, rel FROM links WHERE from_id = ?1").map_err(db)?;
+    // Files from before cross-session links have no `to_session` column; every link is local there.
+    let has_to_session: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_table_info('links') WHERE name = 'to_session'", [], |r| r.get(0)).map_err(db)?;
+    let links_sql = if has_to_session > 0 {
+        "SELECT to_id, rel, to_session FROM links WHERE from_id = ?1"
+    } else {
+        "SELECT to_id, rel, NULL FROM links WHERE from_id = ?1"
+    };
+    let mut links = conn.prepare(links_sql).map_err(db)?;
+    let mut external = Vec::new();
     let rows = chain
         .query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
@@ -281,8 +316,13 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         let computed = if format == 1 {
             chain_hash(&prev, &rid, at_ms)
         } else {
-            let row_links: Vec<(String, String)> =
-                links.query_map([&rid], |l| Ok((l.get(0)?, l.get(1)?))).map_err(db)?.collect::<Result<_, _>>().map_err(db)?;
+            let row_links: Vec<Link> =
+                links.query_map([&rid], |l| Ok((l.get(0)?, l.get(1)?, l.get(2)?))).map_err(db)?.collect::<Result<_, _>>().map_err(db)?;
+            for (to_id, rel, to_session) in &row_links {
+                if let Some(s) = to_session {
+                    external.push(External { from_id: rid.clone(), to_id: to_id.clone(), rel: rel.clone(), session: s.clone() });
+                }
+            }
             // The chain row's at_ms stands in for the record's; the two are compared below.
             let digest = row_digest(&RowFields {
                 id: &rid,
@@ -335,7 +375,7 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
     if prev != want_head {
         return Err("chain head mismatch".into());
     }
-    Ok(Verified { session: sc.session, chain_seq: last_seq, chain_head: sc.chain_head })
+    Ok(Verified { session: sc.session, chain_seq: last_seq, chain_head: sc.chain_head, external })
 }
 
 #[cfg(test)]
@@ -599,5 +639,61 @@ mod tests {
         assert!(seal_pending(&store, &key).unwrap().is_none());
         store.write(&input("a", json!(2)), Instant::now()).unwrap();
         assert_eq!(seal_pending(&store, &key).unwrap().unwrap().sidecar.chain_seq, 2);
+    }
+
+    #[test]
+    fn cross_session_links_verify_as_external() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let mut a = Store::create(t.path()).unwrap();
+        let mut p = input("p", json!("rain"));
+        p.kind = "prediction".into();
+        let pw = a.write(&p, Instant::now()).unwrap();
+        seal(&a, &key).unwrap();
+        let mut b = Store::create(t.path()).unwrap();
+        let local = b.write(&input("l", json!(1)), Instant::now()).unwrap();
+        let mut r = input("r", json!("rain"));
+        r.links = Some(vec![LinkInput { to_id: pw.id.clone(), rel: "results_of".into() }, LinkInput { to_id: local.id, rel: "cites".into() }]);
+        let rw = b.write(&r, Instant::now()).unwrap();
+        let s = seal(&b, &key).unwrap();
+        assert!(s.verified);
+        let v = verify(&s.path).unwrap();
+        assert_eq!(v.external, [External { from_id: rw.id, to_id: pw.id, rel: "results_of".into(), session: a.session().into() }]);
+        // The session is hashed with the row: dropping or changing it breaks the chain.
+        for sql in ["UPDATE links SET to_session = NULL WHERE rel = 'results_of'", "UPDATE links SET to_session = 'other' WHERE rel = 'results_of'", "UPDATE links SET to_session = 'x' WHERE rel = 'cites'"] {
+            let copy = t.path().join("copy.sqlite");
+            std::fs::copy(&s.path, &copy).unwrap();
+            std::fs::copy(sidecar_path(&s.path), sidecar_path(&copy)).unwrap();
+            tamper(&copy, sql);
+            resign(&copy, &key);
+            assert_eq!(verify(&copy).unwrap_err(), "chain hash mismatch at seq 2", "{sql}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_seals_every_50_records_and_after_predictions() {
+        let t = tempfile::tempdir().unwrap();
+        let mut store = Store::create(t.path()).unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        for i in 1..=120 {
+            store.write(&input("a", json!(i)), Instant::now()).unwrap();
+            let s = checkpoint(&store, &key, "observation").unwrap();
+            assert_eq!(s.is_some(), i % 50 == 0, "at {i}");
+        }
+        // A prediction seals at once; again at the same head does nothing.
+        let mut p = input("p", json!("rain"));
+        p.kind = "prediction".into();
+        store.write(&p, Instant::now()).unwrap();
+        let s = checkpoint(&store, &key, "prediction").unwrap().unwrap();
+        assert_eq!((s.sidecar.chain_seq, s.verified), (121, true));
+        assert!(checkpoint(&store, &key, "prediction").unwrap().is_none());
+        assert!(seal_pending(&store, &key).unwrap().is_none());
+        // The count runs from the last seal, whatever made it.
+        for _ in 0..49 {
+            store.write(&input("b", json!(0)), Instant::now()).unwrap();
+            assert!(checkpoint(&store, &key, "observation").unwrap().is_none());
+        }
+        store.write(&input("b", json!(0)), Instant::now()).unwrap();
+        assert_eq!(checkpoint(&store, &key, "observation").unwrap().unwrap().sidecar.chain_seq, 171);
     }
 }
