@@ -29,8 +29,8 @@ pub const READ_ROOTS_DEFAULT: [&str; 2] = ["~/.cargo/registry", "~/.rustup/toolc
 
 /// Default `exec_read_allow`: files in the home a shell and toolchain need under `exec_read: "home"`.
 /// `~/.npmrc` is left out on purpose: it holds tokens.
-pub const EXEC_READ_ALLOW_DEFAULT: [&str; 9] =
-    ["~/.zshenv", "~/.zprofile", "~/.zshrc", "~/.zlogin", "~/.cargo", "~/.rustup", "~/.local/bin", "~/.gitconfig", "~/.config/git"];
+pub const EXEC_READ_ALLOW_DEFAULT: [&str; 8] =
+    ["~/.zshenv", "~/.zprofile", "~/.zlogin", "~/.cargo", "~/.rustup", "~/.local/bin", "~/.gitconfig", "~/.config/git"];
 
 /// What a tool wants to do at a path. Reads may also reach `$SYMBIA_HOME/evidence`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,9 +551,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let p = Policy::new(std::slice::from_ref(&root), &sym, &user).unwrap();
         let reads = p.exec_read_paths();
-        for want in [root.clone(), user.join(".zshrc"), user.join(".cargo"), user.join(".config/git"), sym.join("evidence")] {
+        for want in [root.clone(), user.join(".zprofile"), user.join(".cargo"), user.join(".config/git"), sym.join("evidence")] {
             assert!(reads.contains(&want.as_path()), "{}", want.display());
         }
+        // `zsh -lc` never reads .zshrc, and people keep tokens there.
+        assert!(!reads.contains(&user.join(".zshrc").as_path()));
         assert!(!reads.contains(&user.join(".npmrc").as_path()));
         let anc = p.exec_ancestor_paths();
         for want in [user.join("work"), user.join("work/a"), user.join(".config"), user.join(".local")] {

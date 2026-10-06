@@ -456,7 +456,7 @@ mod tests {
         assert!(lines[3].starts_with("(allow file-read-metadata (literal ") && lines[3].contains(&format!("(literal {})", q(&user.join("work")))), "{prof}");
         assert!(!lines[3].contains(&format!("(literal {})", q(&root))), "{prof}");
         assert!(lines[4].starts_with("(allow file-read* (subpath "), "{prof}");
-        for allowed in [root.clone(), user.join(".zshrc"), user.join(".cargo"), sym.join("evidence")] {
+        for allowed in [root.clone(), user.join(".zprofile"), user.join(".cargo"), sym.join("evidence")] {
             assert!(lines[4].contains(&format!("(subpath {})", q(&allowed))), "{}: {prof}", allowed.display());
         }
         assert!(!lines[4].contains(".npmrc"));
@@ -686,10 +686,10 @@ mod tests {
             let home = quote(&user);
             let (r, _, _) = run(&p, &sym, &format!("HOME={home} /bin/zsh -lc 'echo $R3_ENV'"), &root, None).await;
             assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("zshenv-read\n")), "{r}");
-            let (r, _, _) = run(&p, &sym, &format!("HOME={home} /bin/zsh -ic 'echo $R3_RC' </dev/null"), &root, None).await;
-            assert_eq!(r["exit"], 0, "{r}");
-            assert!(r["stdout"]["tail"].as_str().unwrap().contains("zshrc-read"), "{r}");
-            assert!(!r.get("stderr").is_some_and(|e| e["tail"].as_str().unwrap().contains("not permitted")), "{r}");
+            // .zshrc is not an allowance: exec's `zsh -lc` never reads it, and people keep tokens there.
+            let (r, _, _) = run(&p, &sym, &format!("cat {}", quote(&user.join(".zshrc"))), &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
+            assert!(!r.to_string().contains("zshrc-read"), "{r}");
         }
 
         #[tokio::test]

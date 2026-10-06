@@ -37,7 +37,7 @@ I ran the debug binary over stdio with the real `$HOME`, a temp `SYMBIA_HOME`, `
 
 - **Command rules are a policy convenience, not a boundary.** `eval`, `$(...)`, `sh -c`, scripts and absolute paths (`/bin/chmod`) get around them. The sandbox is the boundary. The exec tool description says so too.
 - **A root at the home cancels home mode.** With no `roots` key the root defaults to `~`, so the allow rule re-opens the whole home and only the deny list is left. The benchmark's credential paths are on the deny list now, so they stay closed in that case. Other files in the home do not.
-- **`~/.zshrc` is readable by default, and on this machine it holds a plaintext API key.** Under the spec's defaults, exec can read it.
+- **`~/.zshrc` was readable by default, and on this machine it holds a plaintext API key.** Fixed after review: `~/.zshrc` is no longer a default allowance (exec runs `zsh -lc`, which never reads it), and a test checks that exec cannot read it.
 - **Rule syntax goes past the spec in one place:** a rule with `*` anywhere is a wildcard (`Bash(rm -rf *)` is the form in the real `~/.claude/settings.json`). The `:*` and exact forms behave as specified.
 - **Each checkpoint is a full copy of the session file.** A long session leaves one copy per 50 records under `seals/`.
 - **The process still exits about 5 s after SIGTERM.** The drain waits on rmcp's blocking stdin reader. The seal lands in milliseconds, before the drain starts.
