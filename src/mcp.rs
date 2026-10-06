@@ -191,6 +191,15 @@ impl SymbiaServer {
         self
     }
 
+    /// Seal the session if a record was written after its last seal (on exit). `None` when
+    /// there is nothing to seal, including an HTTP server never bound to a session.
+    pub fn seal_pending(&self) -> Result<Option<seal::Sealed>, String> {
+        match self.lock()?.as_ref() {
+            Some(store) => seal::seal_pending(store, &self.key).map_err(err),
+            None => Ok(None),
+        }
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Option<Store>>, String> {
         self.store.lock().map_err(|_| "state lock poisoned".to_string())
     }
@@ -280,6 +289,7 @@ impl SymbiaServer {
             None => {
                 let store = Store::create_for_mcp(&self.home, Some(id)).map_err(err)?;
                 sessions.insert(id, store.expires_ms().map_err(err)?.unwrap_or(i64::MAX));
+                sessions.track(&self.store);
                 *slot = Some(store);
             }
         }
@@ -437,7 +447,7 @@ impl SymbiaServer {
     #[tool(
         title = "Run a command",
         annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path."
+        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path. Commands run sandboxed: deny-list paths are off limits, the data directory is read-only, and network may be off."
     )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
         let started = Instant::now();
@@ -569,6 +579,9 @@ mod tests {
         assert_eq!(rec["body"]["exit"], 3);
         assert_eq!(rec["body"]["stdout_sha256"], sha);
         assert!(rec["body"]["cwd"].as_str().is_some());
+        assert_eq!(rec["body"]["command"], "echo hi; exit 3");
+        assert_eq!(rec["body"]["sandbox"], crate::exec::SANDBOX);
+        assert_eq!(rec["body"]["network"], "allow");
         let n: i64 = s.with_store(|st| Ok(st.conn().query_row("SELECT COUNT(*) FROM evidence WHERE sha256 = ?1", [hex::decode(&sha).unwrap()], |r| r.get(0)).unwrap())).unwrap();
         assert_eq!(n, 1);
     }

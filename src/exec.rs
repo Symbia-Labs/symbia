@@ -1,5 +1,6 @@
 //! `symbia_exec`: run `/bin/zsh -lc <command>` in its own process group, keep the full
-//! output as evidence and reply with its tail.
+//! output as evidence and reply with its tail. On macOS the shell runs under
+//! `sandbox-exec` with a profile built from the path policy.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,9 +13,12 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::files::Facts;
-use crate::policy::{Access, Policy};
+use crate::policy::{Access, Network, Policy};
 use crate::store::Evidence;
 
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+/// `sandbox` in the facts: what confined the command.
+pub const SANDBOX: &str = if cfg!(target_os = "macos") { "seatbelt" } else { "none" };
 pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
 pub const TIMEOUT_MAX_MS: u64 = 600_000;
 pub const TAIL_BYTES: usize = 8 * 1024;
@@ -131,6 +135,51 @@ fn kill_group(pgid: i32) {
     }
 }
 
+/// `p` as an SBPL string literal.
+fn sbpl_str(p: &Path) -> Result<String, String> {
+    let s = p.to_str().ok_or_else(|| format!("{} is not UTF-8 and cannot go in the sandbox profile", p.display()))?;
+    Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+/// The seatbelt profile for one call: deny-list paths neither readable nor writable,
+/// `$SYMBIA_HOME` not writable, and with `exec_network: "deny"` no outbound IP traffic.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn profile(policy: &Policy) -> Result<String, String> {
+    let mut p = String::from("(version 1)\n(allow default)\n");
+    for d in policy.deny_paths() {
+        p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(d)?));
+    }
+    for o in policy.own_paths() {
+        p.push_str(&format!("(deny file-write* (subpath {}))\n", sbpl_str(o)?));
+    }
+    if policy.network() == Network::Deny {
+        p.push_str("(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n");
+    }
+    Ok(p)
+}
+
+/// The shell for `command`: under `sandbox_exec` on macOS, refused if that is missing.
+#[cfg(target_os = "macos")]
+fn shell(policy: &Policy, sandbox_exec: &Path, command: &str) -> Result<tokio::process::Command, String> {
+    if !sandbox_exec.is_file() {
+        return Err(format!("refused: {} is missing; exec does not run unsandboxed", sandbox_exec.display()));
+    }
+    let mut c = tokio::process::Command::new(sandbox_exec);
+    c.arg("-p").arg(profile(policy)?).arg("/bin/zsh").arg("-lc").arg(command);
+    Ok(c)
+}
+
+/// No sandbox off macOS yet. A network deny cannot be enforced, so it is refused.
+#[cfg(not(target_os = "macos"))]
+fn shell(policy: &Policy, _sandbox_exec: &Path, command: &str) -> Result<tokio::process::Command, String> {
+    if policy.network() == Network::Deny {
+        return Err("refused: exec_network \"deny\" needs the macOS sandbox".into());
+    }
+    let mut c = tokio::process::Command::new("/bin/zsh");
+    c.arg("-lc").arg(command);
+    Ok(c)
+}
+
 /// What a finished command left behind: the reply and the two evidence streams.
 pub struct Ran {
     pub reply: String,
@@ -141,6 +190,9 @@ pub struct Ran {
 /// Run `command` in `cwd`. On timeout the whole process group is killed and what was
 /// captured so far is returned.
 pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms: Option<u64>, facts: &mut Facts) -> Result<Ran, String> {
+    facts.command = Some(command.to_string());
+    facts.sandbox = Some(SANDBOX);
+    facts.network = Some(policy.network().as_str());
     let timeout_ms = timeout_ms.unwrap_or(TIMEOUT_DEFAULT_MS);
     if !(1..=TIMEOUT_MAX_MS).contains(&timeout_ms) {
         return Err(format!("timeout_ms must be 1 to {TIMEOUT_MAX_MS}"));
@@ -149,15 +201,15 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     if !dir.is_dir() {
         return Err(format!("cwd {} is not a directory", dir.display()));
     }
+    let mut shell = shell(policy, Path::new(SANDBOX_EXEC), command)?;
     let evidence = home.join("evidence");
     std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
     let out: Shared = Arc::new(Mutex::new(Some(Capture::new(&evidence, "stdout").map_err(|e| e.to_string())?)));
     let err: Shared = Arc::new(Mutex::new(Some(Capture::new(&evidence, "stderr").map_err(|e| e.to_string())?)));
 
     let started = Instant::now();
-    let mut child = tokio::process::Command::new("/bin/zsh")
-        .arg("-lc")
-        .arg(command)
+    // sandbox-exec applies the profile and execs the shell in place, so the group is the shell's.
+    let mut child = shell
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -165,7 +217,7 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("spawn /bin/zsh: {e}"))?;
+        .map_err(|e| format!("spawn shell: {e}"))?;
     let pgid = child.id().and_then(|id| i32::try_from(id).ok()).ok_or("child has no pid")?;
     let mut pumps = Vec::new();
     if let Some(o) = child.stdout.take() {
@@ -321,5 +373,173 @@ mod tests {
         }
         assert!(!sym.join("sessions/x").exists());
         run(&p, &sym, "true", &root, None).await;
+    }
+
+    #[test]
+    fn facts_name_the_command_sandbox_and_network() {
+        let (_t, root, sym, p) = setup();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (_, _, facts) = rt.block_on(run(&p, &sym, "echo 'a b'", &root, None));
+        assert_eq!(facts.command.as_deref(), Some("echo 'a b'"));
+        assert_eq!(facts.sandbox, Some(SANDBOX));
+        assert_eq!(facts.network, Some("allow"));
+        // A refused call still says what was asked.
+        let mut facts = Facts::default();
+        assert!(rt.block_on(exec(&p.with_network(Network::Deny), &sym, "ls", "/etc", None, &mut facts)).is_err());
+        assert_eq!((facts.command.as_deref(), facts.network), (Some("ls"), Some("deny")));
+    }
+
+    #[test]
+    fn profile_quotes_paths_and_follows_the_network_setting() {
+        let t = tempfile::tempdir().unwrap();
+        let user = t.path().join("we\"ird \\home");
+        let sym = t.path().join("sym");
+        std::fs::create_dir_all(&user).unwrap();
+        let p = Policy::new(std::slice::from_ref(&user), &sym, &user).unwrap();
+        let prof = profile(&p).unwrap();
+        assert!(prof.starts_with("(version 1)\n(allow default)\n"));
+        let quoted = |d: &Path| format!("\"{}\"", d.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\""));
+        for d in crate::policy::DENY_IN_HOME.iter().map(|d| user.join(d)).chain([sym.join("keys")]) {
+            assert!(prof.contains(&format!("(deny file-read* file-write* (subpath {}))", quoted(&d))), "{prof}");
+        }
+        assert!(prof.contains("we\\\"ird \\\\home/.ssh"), "{prof}");
+        assert!(prof.contains(&format!("(deny file-write* (subpath {}))", quoted(&sym))));
+        assert!(!prof.contains("network"));
+        let prof = profile(&p.with_network(Network::Deny)).unwrap();
+        assert!(prof.ends_with("(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod sandbox {
+        use super::*;
+
+        const SECRET: &str = "SECRET-7c1f-not-for-exec";
+
+        /// A user home named `user` holding `.ssh/id_test`, a root beside it and `SYMBIA_HOME`
+        /// with a key file. The policy's user home is the temp one, not the real `$HOME`.
+        fn setup(user: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Policy) {
+            let t = tempfile::tempdir().unwrap();
+            let user = t.path().join(user);
+            let root = t.path().join("root");
+            let sym = t.path().join("sym");
+            std::fs::create_dir_all(user.join(".ssh")).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(user.join(".ssh/id_test"), SECRET).unwrap();
+            crate::home::ensure(&sym).unwrap();
+            std::fs::write(sym.join("keys/test.key"), SECRET).unwrap();
+            let p = Policy::new(std::slice::from_ref(&root), &sym, &user).unwrap();
+            (t, user, root, sym, p)
+        }
+
+        fn quote(p: &Path) -> String {
+            format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+        }
+
+        /// The command failed and the secret is nowhere in the reply or the evidence.
+        fn refused(r: &Value, ran: &Ran) {
+            assert_ne!(r["exit"], 0, "{r}");
+            for s in [&ran.stdout, &ran.stderr] {
+                assert!(!s.tail.contains(SECRET));
+                assert!(!std::fs::read_to_string(&s.path).unwrap().contains(SECRET));
+            }
+        }
+
+        #[tokio::test]
+        async fn deny_list_paths_cannot_be_read() {
+            for user in ["user", "we\"ird home"] {
+                let (_t, home, root, sym, p) = setup(user);
+                for f in [home.join(".ssh/id_test"), sym.join("keys/test.key")] {
+                    let (r, ran, _) = run(&p, &sym, &format!("cat {}", quote(&f)), &root, None).await;
+                    refused(&r, &ran);
+                    assert!(r["stderr"]["tail"].as_str().unwrap().contains("Operation not permitted"), "{r}");
+                    // Through the realpath, `..` or a symlink inside the root: still refused.
+                    let real = std::fs::canonicalize(&f).unwrap();
+                    std::os::unix::fs::symlink(&f, root.join("link")).unwrap();
+                    let (r, ran, _) = run(&p, &sym, &format!("cat {} || cat link", quote(&real)), &root, None).await;
+                    refused(&r, &ran);
+                    std::fs::remove_file(root.join("link")).unwrap();
+                }
+                // The profile with an odd home still runs ordinary commands.
+                let (r, _, _) = run(&p, &sym, "echo ok", &root, None).await;
+                assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("ok\n")), "{user}");
+            }
+        }
+
+        #[tokio::test]
+        async fn symbia_home_cannot_be_written() {
+            let (_t, _home, root, sym, p) = setup("user");
+            let (r, _, _) = run(&p, &sym, &format!("echo x > {}", quote(&sym.join("x"))), &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
+            assert!(!sym.join("x").exists());
+            let file = std::fs::read_dir(sym.join("sessions")).unwrap().count();
+            let (r, _, _) = run(&p, &sym, &format!("touch {}", quote(&sym.join("sessions/new.sqlite"))), &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
+            assert_eq!(std::fs::read_dir(sym.join("sessions")).unwrap().count(), file);
+            // Reading it outside the keys is still allowed.
+            std::fs::write(sym.join("config.json"), "{}").unwrap();
+            let (r, _, _) = run(&p, &sym, &format!("cat {}", quote(&sym.join("config.json"))), &root, None).await;
+            assert_eq!(r["stdout"]["tail"], "{}");
+        }
+
+        #[tokio::test]
+        async fn roots_and_tools_still_work() {
+            let (_t, _home, root, sym, p) = setup("user");
+            let (r, _, _) = run(&p, &sym, "mkdir -p d && echo hi > d/f && cat d/f && rm d/f", &root, None).await;
+            assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("hi\n")), "{r}");
+            let (r, _, _) = run(&p, &sym, "cargo --version", &root, None).await;
+            assert_eq!(r["exit"], 0, "{r}");
+            assert!(r["stdout"]["tail"].as_str().unwrap().starts_with("cargo "), "{r}");
+        }
+
+        /// A loopback HTTP server that counts connections.
+        async fn listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+            use tokio::io::AsyncWriteExt;
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let s = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut c, _)) = l.accept().await {
+                    s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = c.read(&mut buf).await;
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+                }
+            });
+            (port, seen)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn exec_network_deny_blocks_loopback() {
+            let (_t, home, root, sym, _p) = setup("user");
+            let curl = |port: u16| format!("curl -s -m 3 http://127.0.0.1:{port}/");
+
+            // Default: no `exec_network` key.
+            std::fs::write(sym.join("config.json"), json!({"roots": [root]}).to_string()).unwrap();
+            let p = Policy::load(&sym, &home).unwrap();
+            let (port, seen) = listener().await;
+            let (r, _, facts) = run(&p, &sym, &curl(port), &root, None).await;
+            assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("ok")), "{r}");
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(facts.network, Some("allow"));
+
+            std::fs::write(sym.join("config.json"), json!({"roots": [root], "exec_network": "deny"}).to_string()).unwrap();
+            let p = Policy::load(&sym, &home).unwrap();
+            let (port, seen) = listener().await;
+            let (r, _, facts) = run(&p, &sym, &curl(port), &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0, "the listener saw a connection");
+            assert_eq!(facts.network, Some("deny"));
+            // Local files and processes are unaffected.
+            let (r, _, _) = run(&p, &sym, "echo hi | cat", &root, None).await;
+            assert_eq!(r["stdout"]["tail"], "hi\n");
+        }
+
+        #[test]
+        fn missing_sandbox_exec_refuses() {
+            let (_t, _home, _root, _sym, p) = setup("user");
+            let e = shell(&p, Path::new("/nonexistent/sandbox-exec"), "true").err().unwrap();
+            assert!(e.contains("does not run unsandboxed"), "{e}");
+        }
     }
 }

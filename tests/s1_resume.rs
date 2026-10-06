@@ -215,6 +215,34 @@ async fn s1_resume_continues_the_same_file_and_chain() {
     drop(server);
 }
 
+/// R2: on SIGTERM `symbia serve` seals each session with unsealed records, and only those.
+#[tokio::test]
+async fn sigterm_seals_sessions_with_records() {
+    let t = tempfile::tempdir().unwrap();
+    let mut server = start(t.path()).await;
+    let mut a = connect(&server.addr).await;
+    let sid = a.initialize().await;
+    a.tool(&sid, 1, "symbia_record", record("before.term")).await;
+    let mut b = connect(&server.addr).await;
+    let empty = b.initialize().await;
+    b.tool(&empty, 1, "symbia_status", json!({})).await;
+
+    let pid = i32::try_from(server.child.id().unwrap()).unwrap();
+    // SAFETY: signals our own child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(20), server.child.wait()).await.unwrap().unwrap();
+    assert!(status.success(), "{status:?}");
+
+    let seals: Vec<PathBuf> =
+        std::fs::read_dir(t.path().join("seals")).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "sqlite")).collect();
+    assert_eq!(seals.len(), 1, "{seals:?}");
+    let v = symbia::seal::verify(&seals[0]).unwrap();
+    assert_eq!(v.chain_seq, 1);
+    let c = rusqlite::Connection::open_with_flags(&seals[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mcp: String = c.query_row("SELECT mcp_session_id FROM file_meta", [], |r| r.get(0)).unwrap();
+    assert_eq!(mcp, sid);
+}
+
 /// Out of scope for S1, recorded so the report describes observed behavior: sessions live in
 /// the server's memory, so after a restart the old session id is 404 and the client must
 /// initialize again, which opens a new file. The old file stays on disk with its chain intact.

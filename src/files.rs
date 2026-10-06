@@ -37,6 +37,12 @@ pub struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256_after: Option<String>,

@@ -102,6 +102,16 @@ pub fn seal(store: &Store, key: &SigningKey) -> anyhow::Result<Sealed> {
     Ok(Sealed { path, sidecar, verified })
 }
 
+/// Seal `store` if a record was written after its last seal. `None` for an empty session
+/// or one already sealed at its head.
+pub fn seal_pending(store: &Store, key: &SigningKey) -> anyhow::Result<Option<Sealed>> {
+    let (seq, _) = store.head()?;
+    if seq == 0 || last_seal(store.home(), store.session()).is_some_and(|(_, s)| s.chain_seq >= seq) {
+        return Ok(None);
+    }
+    seal(store, key).map(Some)
+}
+
 /// The newest seal of `session` under `home/seals`, by chain seq.
 pub fn last_seal(home: &Path, session: &str) -> Option<(PathBuf, Sidecar)> {
     let prefix = format!("{session}-");
@@ -574,5 +584,20 @@ mod tests {
         let s = seal(&f.store, &f.key).unwrap();
         std::fs::remove_file(sidecar_path(&s.path)).unwrap();
         assert!(verify(&s.path).unwrap_err().starts_with("sidecar unreadable"));
+    }
+
+    #[test]
+    fn seal_pending_skips_empty_and_already_sealed_sessions() {
+        let t = tempfile::tempdir().unwrap();
+        let mut store = Store::create(t.path()).unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        assert!(seal_pending(&store, &key).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(t.path().join("seals")).unwrap().count(), 0);
+        store.write(&input("a", json!(1)), Instant::now()).unwrap();
+        let s = seal_pending(&store, &key).unwrap().unwrap();
+        assert_eq!((s.sidecar.chain_seq, s.verified), (1, true));
+        assert!(seal_pending(&store, &key).unwrap().is_none());
+        store.write(&input("a", json!(2)), Instant::now()).unwrap();
+        assert_eq!(seal_pending(&store, &key).unwrap().unwrap().sidecar.chain_seq, 2);
     }
 }

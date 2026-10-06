@@ -33,6 +33,28 @@ impl Spelled {
     fn holds(&self, p: &Path) -> bool {
         p.starts_with(&self.lex) || p.starts_with(&self.real)
     }
+
+    fn both(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.lex.as_path()).chain((self.real != self.lex).then_some(self.real.as_path()))
+    }
+}
+
+/// Whether `symbia_exec` commands may open network connections (`exec_network` in config.json).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    #[default]
+    Allow,
+    Deny,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Allow => "allow",
+            Network::Deny => "deny",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,12 +66,15 @@ pub struct Policy {
     /// `$SYMBIA_HOME`: readable where a root covers it, never writable.
     own: Spelled,
     user_home: PathBuf,
+    network: Network,
 }
 
 #[derive(Deserialize)]
 struct Config {
     #[serde(default)]
     roots: Option<Vec<String>>,
+    #[serde(default)]
+    exec_network: Network,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -88,19 +113,20 @@ pub fn real(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 impl Policy {
-    /// Load roots from `$SYMBIA_HOME/config.json` (`{"roots": [...]}`); the default root is `user_home`.
+    /// Load roots from `$SYMBIA_HOME/config.json` (`{"roots": [...], "exec_network": "allow"|"deny"}`);
+    /// the default root is `user_home`, the default network `allow`.
     pub fn load(symbia_home: &Path, user_home: &Path) -> anyhow::Result<Self> {
         let cfg = symbia_home.join("config.json");
-        let roots = match std::fs::read(&cfg) {
+        let (roots, network) = match std::fs::read(&cfg) {
             Ok(bytes) => {
                 let c: Config = serde_json::from_slice(&bytes).with_context(|| format!("parse {}", cfg.display()))?;
-                c.roots.unwrap_or_else(|| vec![user_home.display().to_string()])
+                (c.roots.unwrap_or_else(|| vec![user_home.display().to_string()]), c.exec_network)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![user_home.display().to_string()],
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (vec![user_home.display().to_string()], Network::Allow),
             Err(e) => return Err(e).with_context(|| format!("read {}", cfg.display())),
         };
         let roots: Vec<PathBuf> = roots.iter().map(|r| expand(r, user_home)).collect::<anyhow::Result<_>>()?;
-        Self::new(&roots, symbia_home, user_home)
+        Ok(Self::new(&roots, symbia_home, user_home)?.with_network(network))
     }
 
     /// Load from the process environment: `HOME` is the user's home directory.
@@ -119,7 +145,26 @@ impl Policy {
             .map(|d| Spelled::new(&d))
             .collect::<anyhow::Result<_>>()?;
         let own = Spelled::new(symbia_home)?;
-        Ok(Self { roots, read_roots, deny, own, user_home: user_home.to_path_buf() })
+        Ok(Self { roots, read_roots, deny, own, user_home: user_home.to_path_buf(), network: Network::Allow })
+    }
+
+    pub fn with_network(mut self, network: Network) -> Self {
+        self.network = network;
+        self
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Every deny-list path, as spelled and as its realpath when that differs.
+    pub fn deny_paths(&self) -> Vec<&Path> {
+        self.deny.iter().flat_map(Spelled::both).collect()
+    }
+
+    /// `$SYMBIA_HOME`, as spelled and as its realpath when that differs.
+    pub fn own_paths(&self) -> Vec<&Path> {
+        self.own.both().collect()
     }
 
     /// A path falls on the deny list. Walks use this on every entry they visit.
@@ -301,5 +346,32 @@ mod tests {
         let p = Policy::load(&sym, &user).unwrap();
         assert!(p.check(&s(&other.join("x")), Access::Write).is_ok());
         assert!(p.check(&s(&user.join("x")), Access::Read).is_err());
+    }
+
+    #[test]
+    fn config_sets_exec_network() {
+        let (_t, user, sym, p) = setup();
+        assert_eq!(p.network(), Network::Allow);
+        assert_eq!(Policy::load(&sym, &user).unwrap().network(), Network::Allow);
+        std::fs::write(sym.join("config.json"), r#"{"exec_network": "deny"}"#).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        assert_eq!(p.network(), Network::Deny);
+        assert!(p.check(&s(&user.join("x")), Access::Read).is_ok(), "roots still default to home");
+        std::fs::write(sym.join("config.json"), r#"{"exec_network": "allow"}"#).unwrap();
+        assert_eq!(Policy::load(&sym, &user).unwrap().network(), Network::Allow);
+        std::fs::write(sym.join("config.json"), r#"{"exec_network": "off"}"#).unwrap();
+        assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[test]
+    fn deny_paths_list_both_spellings() {
+        let (_t, user, sym, p) = setup();
+        let deny = p.deny_paths();
+        for d in DENY_IN_HOME.iter().map(|d| user.join(d)).chain([sym.join("keys")]) {
+            assert!(deny.contains(&d.as_path()), "{}", d.display());
+            assert!(deny.contains(&real(&d).unwrap().as_path()), "{}", d.display());
+        }
+        assert!(p.own_paths().contains(&sym.as_path()));
+        assert!(p.own_paths().contains(&std::fs::canonicalize(&sym).unwrap().as_path()));
     }
 }

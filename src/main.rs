@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use rmcp::ServiceExt;
 
@@ -89,15 +90,47 @@ fn parse_verify<'a>(mut rest: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
     }
 }
 
+/// How long in-flight tool calls get to finish before the exit seal.
+const DRAIN: Duration = Duration::from_secs(5);
+
+/// SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let term = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = term => {}
+    }
+}
+
+/// Serve over stdio until the transport closes or a signal arrives, then seal the session
+/// if anything was written since its last seal.
 fn run_mcp() -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let server = symbia::mcp::SymbiaServer::new(&home)?;
+    let handle = server.clone();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(async move {
+    let r = rt.block_on(async move {
         let running = server.serve(rmcp::transport::stdio()).await?;
-        running.waiting().await?;
-        Ok(())
-    })
+        tokio::select! {
+            r = running.waiting() => { r?; }
+            () = shutdown_signal() => {}
+        }
+        anyhow::Ok(())
+    });
+    // Stop the runtime first so no tool call writes after the seal.
+    rt.shutdown_timeout(DRAIN);
+    if let Err(e) = handle.seal_pending() {
+        eprintln!("symbia mcp: seal on exit failed: {e}");
+    }
+    r
 }
 
 fn run_serve(listen: String, remote: bool) -> anyhow::Result<()> {
@@ -105,14 +138,13 @@ fn run_serve(listen: String, remote: bool) -> anyhow::Result<()> {
     symbia::http::check_listen(addr, remote)?;
     let home = symbia::home::from_env()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(async move {
+    let r = rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         eprintln!("symbia serve: http://{}{}", listener.local_addr()?, symbia::http::PATH);
-        tokio::select! {
-            r = symbia::http::serve(home, listener) => r,
-            _ = tokio::signal::ctrl_c() => Ok(()),
-        }
-    })
+        symbia::http::serve(home, listener, shutdown_signal()).await
+    });
+    rt.shutdown_timeout(DRAIN);
+    r
 }
 
 /// Exit 0 with `ok ...`, 1 with a one-line reason, or 2 for a bad `--trust` key.

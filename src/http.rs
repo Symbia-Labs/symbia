@@ -8,11 +8,12 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::bail;
 use bytes::Bytes;
+use ed25519_dalek::SigningKey;
 use futures::Stream;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -26,18 +27,44 @@ use tokio::net::TcpListener;
 
 use crate::mcp::SymbiaServer;
 use crate::now_ms;
-use crate::store::DEFAULT_TTL_MS;
+use crate::store::{DEFAULT_TTL_MS, Store};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7341";
 pub const PATH: &str = "/mcp";
 
-/// Expiry of each bound MCP session, keyed by `Mcp-Session-Id`.
-#[derive(Debug, Default)]
+/// A session's store slot, shared with its `SymbiaServer`.
+pub type Slot = Arc<Mutex<Option<Store>>>;
+
+/// Expiry of each bound MCP session, keyed by `Mcp-Session-Id`, and the stores to seal on shutdown.
+#[derive(Default)]
 pub struct Sessions {
     expires: Mutex<HashMap<String, i64>>,
+    stores: Mutex<Vec<Weak<Mutex<Option<Store>>>>>,
 }
 
 impl Sessions {
+    /// Remember a bound session's store so shutdown can seal it while it is alive.
+    pub fn track(&self, slot: &Slot) {
+        let mut stores = self.stores.lock().unwrap_or_else(|e| e.into_inner());
+        stores.retain(|w| w.strong_count() > 0);
+        stores.push(Arc::downgrade(slot));
+    }
+
+    /// Seal every live session with records written after its last seal. Returns the failures.
+    pub fn seal_all(&self, key: &SigningKey) -> Vec<String> {
+        let stores: Vec<Slot> = self.stores.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+        let mut failed = Vec::new();
+        for slot in stores {
+            let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(store) = guard.as_ref()
+                && let Err(e) = crate::seal::seal_pending(store, key)
+            {
+                failed.push(format!("{}: {e:#}", store.session()));
+            }
+        }
+        failed
+    }
+
     pub fn insert(&self, id: &str, expires_ms: i64) {
         self.expires.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), expires_ms);
     }
@@ -150,18 +177,26 @@ fn not_found() -> Response<BoxBody<Bytes, Infallible>> {
     r
 }
 
-/// Serve MCP over streamable HTTP on `listener` until the process ends.
-pub async fn serve(home: PathBuf, listener: TcpListener) -> anyhow::Result<()> {
+/// Serve MCP over streamable HTTP on `listener` until `shutdown` completes, then seal every
+/// live session that has unsealed records. Seal failures go to stderr.
+pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     crate::home::ensure(&home)?;
     let key = Arc::new(crate::keys::load_or_create(&home)?);
     let sessions = Arc::new(Sessions::default());
     let manager = Arc::new(ExpiringSessions::new(sessions.clone()));
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts(listener.local_addr()?));
     let policy = Arc::new(crate::policy::Policy::from_env(&home)?);
-    let service =
-        StreamableHttpService::new(move || Ok(SymbiaServer::for_http(&home, key.clone(), sessions.clone(), policy.clone())), manager, config);
-    loop {
-        let (stream, _) = listener.accept().await?;
+    let (k, s) = (key.clone(), sessions.clone());
+    let service = StreamableHttpService::new(move || Ok(SymbiaServer::for_http(&home, k.clone(), s.clone(), policy.clone())), manager, config);
+    let mut shutdown = std::pin::pin!(shutdown);
+    let result = loop {
+        let stream = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((stream, _)) => stream,
+                Err(e) => break Err(e.into()),
+            },
+            () = &mut shutdown => break Ok(()),
+        };
         let service = service.clone();
         tokio::spawn(async move {
             let handler = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -176,7 +211,11 @@ pub async fn serve(home: PathBuf, listener: TcpListener) -> anyhow::Result<()> {
             // A dropped connection ends only this task; the MCP session lives on.
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), handler).await;
         });
+    };
+    for e in sessions.seal_all(&key) {
+        eprintln!("symbia serve: seal on exit failed: {e}");
     }
+    result
 }
 
 #[cfg(test)]
