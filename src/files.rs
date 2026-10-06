@@ -143,6 +143,14 @@ fn read_at(real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Fac
         return Err(format!("{} is a directory; use symbia_fs_list", real.display()));
     }
     let start = offset.unwrap_or(1).max(1);
+    // The caller's limit applies when it is at or under the cap; above it, the cap does.
+    let line_cut = match limit {
+        Some(l) if l <= READ_LINES_MAX => {
+            let l = l.max(1);
+            format!("requested limit of {l} line{}", if l == 1 { "" } else { "s" })
+        }
+        _ => "2,000-line cap".to_string(),
+    };
     let limit = limit.unwrap_or(READ_LINES_MAX).clamp(1, READ_LINES_MAX);
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
@@ -172,7 +180,7 @@ fn read_at(real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Fac
             continue;
         }
         if shown == limit {
-            cut = Some(format!("{READ_LINES_MAX}-line cap"));
+            cut = Some(line_cut.clone());
             continue;
         }
         let line = text.strip_suffix('\n').unwrap_or(text);
@@ -572,7 +580,7 @@ mod tests {
         assert!(out.starts_with("     1\tline 1\n"));
         assert!(out.contains("  2000\tline 2000\n"));
         assert!(!out.contains("line 2001\n"));
-        assert!(out.ends_with("[cut at the 2000-line cap: lines 1-2000 of 4500 shown; continue with offset 2001]\n"), "{}", &out[out.len() - 120..]);
+        assert!(out.ends_with("[cut at the 2,000-line cap: lines 1-2000 of 4500 shown; continue with offset 2001]\n"), "{}", &out[out.len() - 120..]);
         assert!(facts.truncated);
         assert_eq!(facts.sha256_before.as_deref(), Some(hex::encode(crate::canon::sha256(text.as_bytes()))).as_deref());
 
@@ -581,9 +589,58 @@ mod tests {
         assert!(out.starts_with("  4001\tline 4001\n") && out.ends_with("  4500\tline 4500\n"));
         assert!(!facts.truncated);
         let out = read(&p, &s(&f), Some(10), Some(2), &mut Facts::default()).unwrap();
-        assert_eq!(out, "    10\tline 10\n    11\tline 11\n[cut at the 2000-line cap: lines 10-11 of 4500 shown; continue with offset 12]\n");
+        assert_eq!(out, "    10\tline 10\n    11\tline 11\n[cut at the requested limit of 2 lines: lines 10-11 of 4500 shown; continue with offset 12]\n");
         let out = read(&p, &s(&f), Some(9000), None, &mut Facts::default()).unwrap();
         assert!(out.contains("past the end: the file has 4500 lines"));
+    }
+
+    fn numbered(lines: u64) -> String {
+        (1..=lines).map(|i| format!("line {i}\n")).collect()
+    }
+
+    fn tail(out: &str) -> &str {
+        out.lines().last().unwrap()
+    }
+
+    #[test]
+    fn read_cut_by_the_callers_limit_says_so() {
+        let (_t, root, p) = setup();
+        let f = root.join("a.txt");
+        std::fs::write(&f, numbered(10)).unwrap();
+        let out = read(&p, &s(&f), None, Some(3), &mut Facts::default()).unwrap();
+        assert_eq!(tail(&out), "[cut at the requested limit of 3 lines: lines 1-3 of 10 shown; continue with offset 4]");
+        let out = read(&p, &s(&f), Some(5), Some(1), &mut Facts::default()).unwrap();
+        assert_eq!(tail(&out), "[cut at the requested limit of 1 line: lines 5-5 of 10 shown; continue with offset 6]");
+        // A limit at the cap is still the caller's.
+        std::fs::write(&f, numbered(2500)).unwrap();
+        let out = read(&p, &s(&f), None, Some(2000), &mut Facts::default()).unwrap();
+        assert_eq!(tail(&out), "[cut at the requested limit of 2000 lines: lines 1-2000 of 2500 shown; continue with offset 2001]");
+    }
+
+    #[test]
+    fn read_cut_by_the_line_cap_says_so() {
+        let (_t, root, p) = setup();
+        let f = root.join("a.txt");
+        std::fs::write(&f, numbered(2500)).unwrap();
+        let want = "[cut at the 2,000-line cap: lines 1-2000 of 2500 shown; continue with offset 2001]";
+        // No limit, and a limit above the cap, both stop at the cap.
+        for limit in [None, Some(5000)] {
+            let out = read(&p, &s(&f), None, limit, &mut Facts::default()).unwrap();
+            assert_eq!(tail(&out), want, "{limit:?}");
+        }
+    }
+
+    #[test]
+    fn read_cut_by_the_byte_cap_says_so() {
+        let (_t, root, p) = setup();
+        let f = root.join("a.txt");
+        std::fs::write(&f, format!("{}\n", "x".repeat(1000)).repeat(400)).unwrap();
+        let shown = READ_BYTES_MAX as u64 / 1008;
+        // The byte cap applies before either line limit is reached.
+        for limit in [None, Some(300)] {
+            let out = read(&p, &s(&f), None, limit, &mut Facts::default()).unwrap();
+            assert_eq!(tail(&out), format!("[cut at the 256 KB cap: lines 1-{shown} of 400 shown; continue with offset {}]", shown + 1), "{limit:?}");
+        }
     }
 
     #[test]

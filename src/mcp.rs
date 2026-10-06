@@ -289,7 +289,11 @@ impl SymbiaServer {
 
 #[tool_router]
 impl SymbiaServer {
-    #[tool(description = "Session status: build, session, MCP session id, expiry, retention, file, chain seq and head, last seal, public key.")]
+    #[tool(
+        title = "Session status",
+        annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
+        description = "Session status: build, session, MCP session id, expiry, retention, file, chain seq and head, last seal, public key."
+    )]
     pub async fn symbia_status(&self) -> Result<String, String> {
         self.with_store(|store| {
             let (seq, head) = store.head().map_err(err)?;
@@ -311,13 +315,21 @@ impl SymbiaServer {
         })
     }
 
-    #[tool(description = "Write a record to the ledger. Returns {id, version, seq, head}.")]
+    #[tool(
+        title = "Write a record",
+        annotations(title = "Write a record", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        description = "Write a record to the ledger. Returns {id, version, seq, head}."
+    )]
     pub async fn symbia_record(&self, Parameters(args): Parameters<RecordInput>) -> Result<String, String> {
         let started = Instant::now();
         self.with_store(|store| Ok(store.write(&args, started).map_err(err)?.reply()))
     }
 
-    #[tool(description = "Find records by full-text query, kind, lane or key prefix. Returns [{id, key, version, kind, lane}].")]
+    #[tool(
+        title = "Find records",
+        annotations(title = "Find records", read_only_hint = true, open_world_hint = false),
+        description = "Find records by full-text query, kind, lane or key prefix. Returns [{id, key, version, kind, lane}]."
+    )]
     pub async fn symbia_find(&self, Parameters(args): Parameters<FindArgs>) -> Result<String, String> {
         if args.limit.is_some_and(|l| l > FIND_LIMIT_MAX) {
             return Err(format!("limit must be at most {FIND_LIMIT_MAX}"));
@@ -330,7 +342,11 @@ impl SymbiaServer {
         })
     }
 
-    #[tool(description = "Get one full record with its links, by id or by key and optional version.")]
+    #[tool(
+        title = "Get a record",
+        annotations(title = "Get a record", read_only_hint = true, open_world_hint = false),
+        description = "Get one full record with its links, by id or by key and optional version."
+    )]
     pub async fn symbia_get(&self, Parameters(args): Parameters<GetArgs>) -> Result<String, String> {
         self.with_store(|store| {
             let id = match (args.id, args.key) {
@@ -343,7 +359,11 @@ impl SymbiaServer {
         })
     }
 
-    #[tool(description = "Seal the session: signed, verified copy under seals/. Returns {path, file_sha256, chain_seq, verified}.")]
+    #[tool(
+        title = "Seal the session",
+        annotations(title = "Seal the session", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        description = "Seal the session: signed, verified copy under seals/. Returns {path, file_sha256, chain_seq, verified}."
+    )]
     pub async fn symbia_seal(&self) -> Result<String, String> {
         self.with_store(|store| {
             let s = seal::seal(store, &self.key).map_err(err)?;
@@ -357,17 +377,29 @@ impl SymbiaServer {
         })
     }
 
-    #[tool(description = "Read a text file with 1-based line numbers. Caps: 2,000 lines and 256 KB; the reply says where to continue. Binary files are refused with size and sha256.")]
+    #[tool(
+        title = "Read a file",
+        annotations(title = "Read a file", read_only_hint = true, open_world_hint = false),
+        description = "Read a text file with 1-based line numbers. Caps: 2,000 lines and 256 KB; the reply says which limit cut it and where to continue. Binary files are refused with size and sha256."
+    )]
     pub async fn symbia_fs_read(&self, Parameters(args): Parameters<FsReadArgs>) -> Result<String, String> {
         self.file_tool("symbia_fs_read", args, |p, a, f| crate::files::read(p, &a.path, a.offset, a.limit, f)).await
     }
 
-    #[tool(description = "List a directory to depth 1-5 with type, size and mtime_ms; optional glob. Cap 1,000 entries, with a truncated flag.")]
+    #[tool(
+        title = "List a folder",
+        annotations(title = "List a folder", read_only_hint = true, open_world_hint = false),
+        description = "List a directory to depth 1-5 with type, size and mtime_ms; optional glob. Cap 1,000 entries, with a truncated flag."
+    )]
     pub async fn symbia_fs_list(&self, Parameters(args): Parameters<FsListArgs>) -> Result<String, String> {
         self.file_tool("symbia_fs_list", args, |p, a, f| crate::files::list(p, &a.path, a.depth, a.glob.as_deref(), f)).await
     }
 
-    #[tool(description = "Search files (ripgrep engine, respects .gitignore) for a regex or literal. Returns matches with file, line and context. Stops at max_matches or 30 s, flagged.")]
+    #[tool(
+        title = "Search files",
+        annotations(title = "Search files", read_only_hint = true, open_world_hint = false),
+        description = "Search files (ripgrep engine, respects .gitignore) for a regex or literal. Returns matches with file, line and context. Stops at max_matches or 30 s, flagged."
+    )]
     pub async fn symbia_fs_search(&self, Parameters(args): Parameters<FsSearchArgs>) -> Result<String, String> {
         self.file_tool("symbia_fs_search", args, |p, a, f| {
             let s = SearchArgs {
@@ -384,17 +416,29 @@ impl SymbiaServer {
         .await
     }
 
-    #[tool(description = "Write a file atomically (temp file then rename). Returns {path, bytes, sha256}.")]
+    #[tool(
+        title = "Write a file",
+        annotations(title = "Write a file", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false),
+        description = "Write a file atomically (temp file then rename). Returns {path, bytes, sha256}."
+    )]
     pub async fn symbia_fs_write(&self, Parameters(args): Parameters<FsWriteArgs>) -> Result<String, String> {
         self.file_tool("symbia_fs_write", args, |p, a, f| crate::files::write(p, &a.path, &a.content, a.create_only.unwrap_or(false), f)).await
     }
 
-    #[tool(description = "Replace one exact occurrence of old with new, atomically. Refuses zero or several matches. Returns {path, line, sha256_before, sha256_after}.")]
+    #[tool(
+        title = "Edit a file",
+        annotations(title = "Edit a file", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        description = "Replace one exact occurrence of old with new, atomically. Refuses zero or several matches. Returns {path, line, sha256_before, sha256_after}."
+    )]
     pub async fn symbia_fs_edit(&self, Parameters(args): Parameters<FsEditArgs>) -> Result<String, String> {
         self.file_tool("symbia_fs_edit", args, |p, a, f| crate::files::edit(p, &a.path, &a.old, &a.new, f)).await
     }
 
-    #[tool(description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path.")]
+    #[tool(
+        title = "Run a command",
+        annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
+        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path."
+    )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
         let started = Instant::now();
         let digest = self.begin(&args)?;
