@@ -24,10 +24,14 @@ getrandom = "=0.4.3"
 hex = "=0.4.3"
 bytes = "=1.12.1"
 futures = "=0.3.34"
+globset = "=0.4.20"
+grep = "=0.4.1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "=0.1.20", features = ["tokio", "service"] }
+ignore = "=0.4.33"
+libc = "=0.2.190"
 rmcp = { version = "=3.5.1", features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 schemars = "=1.2.2"
@@ -35,7 +39,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_jcs = "=0.2.0"
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
-tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal"] }
+tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal", "process", "time", "fs"] }
 
 [dev-dependencies]
 hyper = { version = "=1.11.1", features = ["client", "http1"] }

@@ -40,9 +40,9 @@ pub fn from_env() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// Create `keys/`, `sessions/` and `seals/` under `home`.
+/// Create `keys/`, `sessions/`, `seals/` and `evidence/` under `home`.
 pub fn ensure(home: &Path) -> anyhow::Result<()> {
-    for sub in ["keys", "sessions", "seals"] {
+    for sub in ["keys", "sessions", "seals", "evidence"] {
         let dir = home.join(sub);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -88,7 +88,7 @@ mod tests {
     fn ensure_creates_layout() {
         let t = tempfile::tempdir().unwrap();
         ensure(t.path()).unwrap();
-        for sub in ["keys", "sessions", "seals"] {
+        for sub in ["keys", "sessions", "seals", "evidence"] {
             assert!(t.path().join(sub).is_dir());
         }
     }

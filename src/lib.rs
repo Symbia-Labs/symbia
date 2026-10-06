@@ -1,10 +1,13 @@
 //! symbia: typed records in a signed, hash-chained SQLite ledger, served over MCP.
 
 pub mod canon;
+pub mod exec;
+pub mod files;
 pub mod home;
 pub mod http;
 pub mod keys;
 pub mod mcp;
+pub mod policy;
 pub mod record;
 pub mod seal;
 pub mod store;

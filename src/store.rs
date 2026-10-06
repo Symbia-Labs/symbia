@@ -56,6 +56,14 @@ impl Written {
     }
 }
 
+/// A row of the `evidence` table: a file stored under `evidence/<sha256 hex>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub sha256: [u8; 32],
+    pub bytes: i64,
+    pub media: &'static str,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FindQuery {
     pub query: Option<String>,
@@ -164,6 +172,13 @@ impl Store {
     ///
     /// `started` marks when handling began; `host_ms` and `chars` are measured against the reply.
     pub fn write(&mut self, input: &RecordInput, started: Instant) -> anyhow::Result<Written> {
+        self.write_with(input, started, None, &[])
+    }
+
+    /// As [`Store::write`], for a record that describes another tool's reply: `reply_chars` is
+    /// that reply's length (`None` measures this write's own reply), and `evidence` rows are
+    /// added in the same transaction.
+    pub fn write_with(&mut self, input: &RecordInput, started: Instant, reply_chars: Option<usize>, evidence: &[Evidence]) -> anyhow::Result<Written> {
         input.validate()?;
         let tx = self.conn.transaction()?;
         let version: i64 = tx.query_row("SELECT COALESCE(MAX(version), 0) + 1 FROM records WHERE key = ?1", [&input.key], |r| r.get(0))?;
@@ -232,8 +247,14 @@ impl Store {
             tx.execute("INSERT INTO links (from_id, to_id, rel) VALUES (?1, ?2, ?3)", params![id, to_id, rel])?;
         }
         tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, body_text])?;
+        for e in evidence {
+            tx.execute(
+                "INSERT OR IGNORE INTO evidence (sha256, bytes, media) VALUES (?1, ?2, ?3)",
+                params![e.sha256.as_slice(), e.bytes, e.media],
+            )?;
+        }
         let written = Written { id, version, seq, head: hex_prefix(&hash, 12) };
-        let chars = i64::try_from(written.reply().chars().count())?;
+        let chars = i64::try_from(reply_chars.unwrap_or_else(|| written.reply().chars().count()))?;
         let host_ms = i64::try_from(started.elapsed().as_millis())?;
         tx.execute("UPDATE records SET host_ms = ?1, chars = ?2 WHERE id = ?3", params![host_ms, chars, written.id])?;
         tx.commit()?;
@@ -467,6 +488,16 @@ mod tests {
         assert_eq!(rec["est_chars"], 100);
         assert!(rec["host_ms"].as_i64().unwrap() >= 0);
         assert_eq!(rec["chars"].as_i64().unwrap() as usize, w.reply().chars().count());
+    }
+
+    #[test]
+    fn write_with_measures_the_given_reply_and_adds_evidence() {
+        let (_t, mut s) = store();
+        let ev = Evidence { sha256: [9u8; 32], bytes: 42, media: "text/plain" };
+        let w = s.write_with(&input("tool.x", "tool_call", json!({"tool": "x"})), Instant::now(), Some(777), &[ev.clone(), ev]).unwrap();
+        assert_eq!(s.get(&w.id).unwrap().unwrap()["chars"], 777);
+        let (n, bytes): (i64, i64) = s.conn().query_row("SELECT COUNT(*), MAX(bytes) FROM evidence", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((n, bytes), (1, 42));
     }
 
     #[test]

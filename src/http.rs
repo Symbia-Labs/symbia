@@ -157,7 +157,9 @@ pub async fn serve(home: PathBuf, listener: TcpListener) -> anyhow::Result<()> {
     let sessions = Arc::new(Sessions::default());
     let manager = Arc::new(ExpiringSessions::new(sessions.clone()));
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts(listener.local_addr()?));
-    let service = StreamableHttpService::new(move || Ok(SymbiaServer::for_http(&home, key.clone(), sessions.clone())), manager, config);
+    let policy = Arc::new(crate::policy::Policy::from_env(&home)?);
+    let service =
+        StreamableHttpService::new(move || Ok(SymbiaServer::for_http(&home, key.clone(), sessions.clone(), policy.clone())), manager, config);
     loop {
         let (stream, _) = listener.accept().await?;
         let service = service.clone();
