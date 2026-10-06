@@ -20,7 +20,7 @@ async fn every_tool_has_a_title_and_annotations() {
     let t = tempfile::tempdir().unwrap();
     let client = spawn(t.path()).await;
     let tools: Vec<Value> = client.list_all_tools().await.unwrap().iter().map(|t| serde_json::to_value(t).unwrap()).collect();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
 
     // (name, title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint); null = not set.
     let want = [
@@ -35,6 +35,7 @@ async fn every_tool_has_a_title_and_annotations() {
         ("symbia_fs_write", "Write a file", json!(false), json!(true), json!(true), json!(false)),
         ("symbia_fs_edit", "Edit a file", json!(false), json!(true), json!(false), json!(false)),
         ("symbia_exec", "Run a command", json!(false), json!(true), json!(false), json!(true)),
+        ("symbia_job", "Check a job", json!(false), json!(true), json!(false), json!(false)),
     ];
     for (name, title, ro, destructive, idempotent, open) in want {
         let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("missing {name}"));

@@ -4,13 +4,14 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use base64::Engine;
 use ed25519_dalek::SigningKey;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolRequestParams, CallToolResponse, Extensions, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Extensions, ProtocolVersion};
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -18,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::canon::{canonical, hex_prefix, sha256};
-use crate::files::{Facts, SEARCH_DEADLINE, SearchArgs};
+use crate::files::{Facts, ReadOut, SEARCH_DEADLINE, SearchArgs};
 use crate::http::Sessions;
+use crate::jobs::Jobs;
 use crate::policy::Policy;
 use crate::record::RecordInput;
 use crate::seal;
@@ -28,9 +30,11 @@ use crate::store::{Evidence, FIND_LIMIT_MAX, FindQuery, Store};
 const PREFIX: usize = 12;
 const SESSION_HEADER: &str = "mcp-session-id";
 const NO_SESSION: &str = "no session: initialize an MCP session first (Mcp-Session-Id, protocol 2025-11-25 or earlier)";
-const TOOL_LANE_REASON: &str = "tool output, not verified";
+pub(crate) const TOOL_LANE_REASON: &str = "tool output, not verified";
+/// How long `symbia_job` kill waits for the job to end (its pipes get 2 s to drain).
+const KILL_WAIT: Duration = Duration::from_millis(2_500);
 /// `model` on a `tool_call` record when the client did not name itself.
-const UNKNOWN_CLIENT: &str = "unknown";
+pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
 
 #[derive(Clone)]
 pub struct SymbiaServer {
@@ -43,6 +47,8 @@ pub struct SymbiaServer {
     policy: Arc<Policy>,
     /// The MCP client's name from `initialize`, recorded as `model` on `tool_call` records.
     client: Arc<Mutex<Option<String>>>,
+    /// Commands still running after their `symbia_exec` call returned.
+    jobs: Arc<Jobs>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -56,6 +62,9 @@ pub struct FsReadArgs {
     /// Lines to return; default and cap 2,000. Replies are also capped at 256 KB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// Images: skip the scaling to a 1,568 px long edge (the 8,000 px and 5 MB limits still apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -119,9 +128,51 @@ pub struct ExecArgs {
     pub command: String,
     /// Absolute working directory.
     pub cwd: String,
-    /// Default 120,000; at most 600,000.
+    /// Default 120,000; at most 3,600,000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Return a running job if the command has not ended by then. Default 45,000; at most 50,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_ms: Option<u64>,
+    /// Size of the stdout and stderr tails in replies. Default 8,192; 256 to 65,536.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum JobAction {
+    #[default]
+    Status,
+    Wait,
+    Tail,
+    Kill,
+}
+
+impl JobAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Wait => "wait",
+            Self::Tail => "tail",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct JobArgs {
+    /// Job id from symbia_exec.
+    pub job: String,
+    /// status (default), wait, tail or kill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<JobAction>,
+    /// wait: how long to wait for the end. Default 45,000; at most 50,000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    /// tail: bytes of each stream. Default the job's tail_bytes; 256 to 65,536.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -163,29 +214,25 @@ impl SymbiaServer {
         let key = crate::keys::load_or_create(home)?;
         let policy = Policy::from_env(home)?;
         let store = Store::create(home)?;
-        Ok(Self {
-            home: home.to_path_buf(),
-            key: Arc::new(key),
-            store: Arc::new(Mutex::new(Some(store))),
-            sessions: None,
-            policy: Arc::new(policy),
-            client: Arc::default(),
-            tool_router: Self::tool_router(),
-        })
+        Ok(Self::assemble(home, Arc::new(key), Some(store), None, Arc::new(policy)))
     }
 
     /// A server for one streamable HTTP session. The session file is created when the
     /// first message carrying the `Mcp-Session-Id` arrives.
     pub fn for_http(home: &Path, key: Arc<SigningKey>, sessions: Arc<Sessions>, policy: Arc<Policy>) -> Self {
-        Self {
-            home: home.to_path_buf(),
-            key,
-            store: Arc::new(Mutex::new(None)),
-            sessions: Some(sessions),
-            policy,
-            client: Arc::default(),
-            tool_router: Self::tool_router(),
-        }
+        Self::assemble(home, key, None, Some(sessions), policy)
+    }
+
+    fn assemble(home: &Path, key: Arc<SigningKey>, store: Option<Store>, sessions: Option<Arc<Sessions>>, policy: Arc<Policy>) -> Self {
+        let store = Arc::new(Mutex::new(store));
+        let client: Arc<Mutex<Option<String>>> = Arc::default();
+        let jobs = Arc::new(Jobs::new(store.clone(), key.clone(), client.clone()));
+        Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, tool_router: Self::tool_router() }
+    }
+
+    /// Kill running jobs and record them as killed by shutdown (on exit, before the seal).
+    pub async fn shutdown_jobs(&self) {
+        self.jobs.shutdown().await;
     }
 
     /// Replace the path policy (tests).
@@ -240,13 +287,20 @@ impl SymbiaServer {
 
     /// Write the call's `tool_call` record, then hand back its reply (or error) unchanged.
     fn log(&self, tool: &str, digest: &str, started: Instant, facts: &Facts, result: Result<String, String>, evidence: &[Evidence]) -> Result<String, String> {
+        self.log_sized(tool, digest, started, facts, result, 0, evidence).map(|(text, _)| text)
+    }
+
+    /// As [`Self::log`], where the reply also carries `extra` bytes besides the text (an
+    /// image); a success comes back with the record's id.
+    #[allow(clippy::too_many_arguments)]
+    fn log_sized(&self, tool: &str, digest: &str, started: Instant, facts: &Facts, result: Result<String, String>, extra: usize, evidence: &[Evidence]) -> Result<(String, String), String> {
         let text = match &result {
             Ok(t) | Err(t) => t,
         };
         let mut body = serde_json::to_value(facts).map_err(err)?;
         body["tool"] = tool.into();
         body["args_digest"] = digest.into();
-        body["bytes_returned"] = text.len().into();
+        body["bytes_returned"] = (text.len() + extra).into();
         if let Err(e) = &result {
             body["error"] = e.as_str().into();
         }
@@ -261,12 +315,12 @@ impl SymbiaServer {
             est_chars: None,
             links: None,
         };
-        self.with_store(|s| {
-            s.write_with(&input, started, Some(text.chars().count()), evidence).map_err(err)?;
+        let id = self.with_store(|s| {
+            let w = s.write_with(&input, started, Some(text.chars().count() + extra), evidence).map_err(err)?;
             self.checkpoint(s, &input.kind);
-            Ok(())
+            Ok(w.id)
         })?;
-        result
+        result.map(|t| (t, id))
     }
 
     /// Seal if a checkpoint is due after a write. A failure goes to stderr and never fails the write.
@@ -304,6 +358,7 @@ impl SymbiaServer {
                 let store = Store::create_for_mcp(&self.home, Some(id)).map_err(err)?;
                 sessions.insert(id, store.expires_ms().map_err(err)?.unwrap_or(i64::MAX));
                 sessions.track(&self.store);
+                sessions.track_jobs(&self.jobs);
                 *slot = Some(store);
             }
         }
@@ -316,9 +371,10 @@ impl SymbiaServer {
     #[tool(
         title = "Session status",
         annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
-        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key."
+        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs."
     )]
     pub async fn symbia_status(&self) -> Result<String, String> {
+        let jobs = self.jobs.running();
         self.with_store(|store| {
             let (seq, head) = store.head().map_err(err)?;
             let last = seal::last_seal(store.home(), store.session())
@@ -335,6 +391,7 @@ impl SymbiaServer {
                 "head": hex_prefix(&head, PREFIX),
                 "last_seal": last,
                 "public_key": hex_prefix(&self.key.verifying_key().to_bytes(), PREFIX),
+                "jobs": jobs,
             })
             .to_string())
         })
@@ -409,10 +466,32 @@ impl SymbiaServer {
     #[tool(
         title = "Read a file",
         annotations(title = "Read a file", read_only_hint = true, open_world_hint = false),
-        description = "Read a text file with 1-based line numbers. Caps: 2,000 lines and 256 KB; the reply says which limit cut it and where to continue. Binary files are refused with size and sha256."
+        description = "Read a text file with 1-based line numbers. Caps: 2,000 lines and 256 KB; the reply says which limit cut it and where to continue. PNG, JPEG, GIF, WebP, TIFF and BMP files come back as an image (scaled to a 1,568 px long edge unless full; at most 8,000 px and 5 MB) plus {path, format, width, height, sent_width, sent_height, bytes, sha256} of the image sent. Other binary files (HEIC, audio) are refused with size and sha256."
     )]
-    pub async fn symbia_fs_read(&self, Parameters(args): Parameters<FsReadArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_read", args, |p, a, f| crate::files::read(p, &a.path, a.offset, a.limit, f)).await
+    pub async fn symbia_fs_read(&self, Parameters(args): Parameters<FsReadArgs>) -> Result<CallToolResult, String> {
+        const TOOL: &str = "symbia_fs_read";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let policy = self.policy.clone();
+        let evidence = self.home.join("evidence");
+        let (facts, result) = tokio::task::spawn_blocking(move || {
+            let mut facts = Facts::default();
+            let r = crate::files::read_any(&policy, &evidence, &args.path, args.offset, args.limit, args.full.unwrap_or(false), &mut facts);
+            (facts, r)
+        })
+        .await
+        .map_err(err)?;
+        let text = match result {
+            Ok(ReadOut::Image(img)) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
+                let ev = Evidence { sha256: img.sha256, bytes: i64::try_from(img.bytes.len()).unwrap_or(i64::MAX), media: img.media };
+                let (text, _) = self.log_sized(TOOL, &digest, started, &facts, Ok(img.text), data.len(), &[ev])?;
+                return Ok(CallToolResult::success(vec![ContentBlock::image(data, img.media), ContentBlock::text(text)]));
+            }
+            Ok(ReadOut::Text(t)) => Ok(t),
+            Err(e) => Err(e),
+        };
+        self.log(TOOL, &digest, started, &facts, text, &[]).map(|t| CallToolResult::success(vec![ContentBlock::text(t)]))
     }
 
     #[tool(
@@ -474,17 +553,105 @@ impl SymbiaServer {
     #[tool(
         title = "Run a command",
         annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last 8 KB of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary."
+        description = "Run /bin/zsh -lc <command> in cwd, in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last tail_bytes (default 8 KB) of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. If it is still running after yield_ms (default 45 s), returns {job, running: true, pid, started_ms} and the output so far at once, and the command keeps running: follow it with symbia_job. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary."
     )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
+        const TOOL: &str = "symbia_exec";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
-        let ran = crate::exec::exec(&self.policy, &self.home, &args.command, &args.cwd, args.timeout_ms, &mut facts).await;
-        match ran {
-            Ok(r) => self.log("symbia_exec", &digest, started, &facts, Ok(r.reply), &[r.stdout.evidence(), r.stderr.evidence()]),
-            Err(e) => self.log("symbia_exec", &digest, started, &facts, Err(e), &[]),
+        let yield_ms = args.yield_ms.unwrap_or(crate::exec::YIELD_DEFAULT_MS);
+        let job = if yield_ms > crate::exec::YIELD_MAX_MS {
+            facts.command = Some(args.command.clone());
+            Err(format!("yield_ms must be at most {}", crate::exec::YIELD_MAX_MS))
+        } else {
+            crate::exec::start(&self.policy, &self.home, &args.command, &args.cwd, args.timeout_ms, args.tail_bytes, &mut facts)
+        };
+        let job = match job {
+            Ok(j) => j,
+            Err(e) => return self.log(TOOL, &digest, started, &facts, Err(e), &[]),
+        };
+        if job.wait(Some(Duration::from_millis(yield_ms))).await {
+            return match job.ran(&mut facts) {
+                Ok(r) => self.log(TOOL, &digest, started, &facts, Ok(r.reply), &[r.stdout.evidence(), r.stderr.evidence()]),
+                Err(e) => self.log(TOOL, &digest, started, &facts, Err(e), &[]),
+            };
         }
+        let id = match crate::jobs::new_id() {
+            Ok(id) => id,
+            Err(e) => {
+                job.kill(TOOL);
+                return self.log(TOOL, &digest, started, &facts, Err(e), &[]);
+            }
+        };
+        facts.job = Some(id.clone());
+        facts.running = Some(true);
+        let mut reply = job.status(job.tail_bytes);
+        reply["job"] = id.as_str().into();
+        reply.as_object_mut().map(|o| o.remove("duration_ms"));
+        match self.log_sized(TOOL, &digest, started, &facts, Ok(reply.to_string()), 0, &[]) {
+            Ok((text, start_id)) => {
+                self.jobs.insert(&id, job, start_id);
+                Ok(text)
+            }
+            Err(e) => {
+                // No start record, so no job to follow.
+                job.kill(TOOL);
+                Err(e)
+            }
+        }
+    }
+
+    #[tool(
+        title = "Check a job",
+        annotations(title = "Check a job", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        description = "Follow a command symbia_exec left running. action: status (default), wait (up to wait_ms, default 45,000, at most 50,000), tail (bytes of each stream, 256 to 65,536) or kill (the whole process group). Returns {job, running, pid, started_ms, duration_ms, stdout, stderr}; once it has ended also exit (or \"timeout\" or \"killed\") and evidence paths."
+    )]
+    pub async fn symbia_job(&self, Parameters(args): Parameters<JobArgs>) -> Result<String, String> {
+        const TOOL: &str = "symbia_job";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let action = args.action.unwrap_or_default();
+        let mut facts = Facts { job: Some(args.job.clone()), action: Some(action.as_str()), ..Facts::default() };
+        let result = self.job_action(&args, action, &mut facts).await;
+        self.log(TOOL, &digest, started, &facts, result, &[])
+    }
+}
+
+impl SymbiaServer {
+    async fn job_action(&self, args: &JobArgs, action: JobAction, facts: &mut Facts) -> Result<String, String> {
+        use crate::exec::{TAIL_MAX, TAIL_MIN, YIELD_DEFAULT_MS, YIELD_MAX_MS};
+        let job = self.jobs.get(&args.job).ok_or_else(|| format!("no such job: {}", args.job))?;
+        let mut n = job.tail_bytes;
+        match action {
+            JobAction::Status => {}
+            JobAction::Wait => {
+                let ms = args.wait_ms.unwrap_or(YIELD_DEFAULT_MS);
+                if ms > YIELD_MAX_MS {
+                    return Err(format!("wait_ms must be at most {YIELD_MAX_MS}"));
+                }
+                job.wait(Some(Duration::from_millis(ms))).await;
+            }
+            JobAction::Tail => {
+                n = args.bytes.unwrap_or(n);
+                if !(TAIL_MIN..=TAIL_MAX).contains(&n) {
+                    return Err(format!("bytes must be {TAIL_MIN} to {TAIL_MAX}"));
+                }
+            }
+            JobAction::Kill => {
+                job.kill("symbia_job");
+                job.wait(Some(KILL_WAIT)).await;
+            }
+        }
+        // The end record goes in before this call's own record.
+        self.jobs.settle(&args.job);
+        facts.running = Some(job.running());
+        if let Some(Ok(f)) = job.outcome() {
+            facts.exit = Some(f.exit.clone());
+        }
+        let mut reply = job.status(n);
+        reply["job"] = args.job.as_str().into();
+        Ok(reply.to_string())
     }
 }
 
@@ -548,6 +715,300 @@ mod tests {
         .unwrap()
     }
 
+    fn exec_args(command: &str, cwd: &Path) -> ExecArgs {
+        ExecArgs { command: command.into(), cwd: cwd.display().to_string(), timeout_ms: None, yield_ms: None, tail_bytes: None }
+    }
+
+    /// A server whose only root is a fresh temp dir outside its `SYMBIA_HOME`.
+    fn rooted() -> (tempfile::TempDir, tempfile::TempDir, SymbiaServer) {
+        let (t, s) = server();
+        let w = tempfile::tempdir().unwrap();
+        let s = s.with_policy(Policy::new(&[w.path().to_path_buf()], t.path(), t.path()).unwrap());
+        (t, w, s)
+    }
+
+    fn all_records(s: &SymbiaServer) -> Vec<Value> {
+        s.with_store(|st| {
+            let ids: Vec<String> =
+                st.conn().prepare("SELECT record_id FROM chain ORDER BY seq").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            Ok(ids.iter().map(|id| st.get(id).unwrap().unwrap()).collect())
+        })
+        .unwrap()
+    }
+
+    fn job_call(s: &SymbiaServer, job: &str, action: JobAction) -> impl Future<Output = Result<String, String>> {
+        s.symbia_job(Parameters(JobArgs { job: job.into(), action: Some(action), wait_ms: None, bytes: None }))
+    }
+
+    fn alive(pid: i64) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) == 0 }
+    }
+
+    mod images {
+        use super::*;
+        use ::image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+        use base64::Engine;
+
+        fn encode(w: u32, h: u32, f: ImageFormat) -> Vec<u8> {
+            let img = ImageBuffer::from_fn(w, h, |x, y| Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(img).write_to(&mut out, f).unwrap();
+            out.into_inner()
+        }
+
+        async fn read(s: &SymbiaServer, path: &Path, full: Option<bool>) -> Result<CallToolResult, String> {
+            s.symbia_fs_read(Parameters(FsReadArgs { path: path.display().to_string(), offset: None, limit: None, full })).await
+        }
+
+        /// The image block's media type and bytes, and the text block as JSON.
+        fn parts(r: &CallToolResult) -> (String, Vec<u8>, Value) {
+            assert_eq!(r.content.len(), 2);
+            let img = r.content[0].as_image().expect("an image block first");
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&img.data).unwrap();
+            let text: Value = serde_json::from_str(&r.content[1].as_text().expect("then text").text).unwrap();
+            (img.mime_type.clone(), bytes, text)
+        }
+
+        #[tokio::test]
+        async fn images_come_back_as_image_content_scaled_to_fit() {
+            let (t, w, s) = rooted();
+            let cases = [
+                ("small.png", encode(40, 30, ImageFormat::Png), "image/png", (40, 30)),
+                ("photo.jpg", encode(4000, 3000, ImageFormat::Jpeg), "image/jpeg", (1568, 1176)),
+                ("anim.gif", encode(64, 48, ImageFormat::Gif), "image/gif", (64, 48)),
+                ("wide.bmp", encode(2000, 1000, ImageFormat::Bmp), "image/png", (1568, 784)),
+                // The name says text; the bytes say PNG.
+                ("misnamed.txt", encode(10, 10, ImageFormat::Png), "image/png", (10, 10)),
+            ];
+            for (name, data, media, sent) in &cases {
+                let f = w.path().join(name);
+                std::fs::write(&f, data).unwrap();
+                let r = read(&s, &f, None).await.unwrap();
+                let (mime, bytes, text) = parts(&r);
+                assert_eq!(mime, *media, "{name}");
+                assert_eq!((text["sent_width"].as_u64().unwrap(), text["sent_height"].as_u64().unwrap()), (u64::from(sent.0), u64::from(sent.1)), "{name}");
+                assert_eq!(text["bytes"], bytes.len());
+                let sha = hex::encode(sha256(&bytes));
+                assert_eq!(text["sha256"], sha);
+                assert_eq!(text["path"], std::fs::canonicalize(&f).unwrap().display().to_string());
+                // The image as sent is evidence, so a seal covers what the model saw.
+                assert_eq!(std::fs::read(t.path().join("evidence").join(&sha)).unwrap(), bytes, "{name}");
+                let decoded = ::image::load_from_memory(&bytes).unwrap();
+                assert_eq!((decoded.width(), decoded.height()), *sent, "{name}");
+                if !name.ends_with(".bmp") && !name.ends_with(".jpg") {
+                    assert_eq!(&bytes, data, "{name} fits, so it goes out unchanged");
+                }
+            }
+            let recs = tool_calls(&s);
+            let jpg = &recs[1]["body"];
+            assert_eq!(jpg["sha256_before"], hex::encode(sha256(&cases[1].1)));
+            assert_eq!(jpg["image"]["format"], "jpeg");
+            assert_eq!((jpg["image"]["width"].clone(), jpg["image"]["height"].clone()), (json!(4000), json!(3000)));
+            assert_eq!((jpg["image"]["sent_width"].clone(), jpg["image"]["sent_height"].clone()), (json!(1568), json!(1176)));
+            let sent_sha = jpg["image"]["sent_sha256"].as_str().unwrap();
+            assert_eq!(recs[3]["body"]["image"]["format"], "bmp");
+            let media: String = s
+                .with_store(|st| Ok(st.conn().query_row("SELECT media FROM evidence WHERE sha256 = ?1", [hex::decode(sent_sha).unwrap()], |r| r.get(0)).unwrap()))
+                .unwrap();
+            assert_eq!(media, "image/jpeg");
+        }
+
+        #[tokio::test]
+        async fn full_skips_the_resize() {
+            let (_t, w, s) = rooted();
+            let f = w.path().join("photo.jpg");
+            let data = encode(4000, 3000, ImageFormat::Jpeg);
+            std::fs::write(&f, &data).unwrap();
+            let (mime, bytes, text) = parts(&read(&s, &f, Some(true)).await.unwrap());
+            assert_eq!(mime, "image/jpeg");
+            assert_eq!((text["sent_width"].clone(), text["sent_height"].clone()), (json!(4000), json!(3000)));
+            assert_eq!(bytes, data);
+            // Past 8,000 px on an edge, even full is scaled down.
+            let f = w.path().join("tall.png");
+            std::fs::write(&f, encode(100, 9000, ImageFormat::Png)).unwrap();
+            let (mime, _, text) = parts(&read(&s, &f, Some(true)).await.unwrap());
+            assert_eq!(mime, "image/png");
+            assert_eq!((text["sent_width"].clone(), text["sent_height"].clone()), (json!(89), json!(8000)));
+        }
+
+        #[tokio::test]
+        async fn other_binaries_are_still_refused() {
+            let (_t, w, s) = rooted();
+            let f = w.path().join("blob.bin");
+            let bytes = [0u8, 1, 2, 3, 0xff, 0xfe];
+            std::fs::write(&f, bytes).unwrap();
+            let e = read(&s, &f, None).await.unwrap_err();
+            assert_eq!(e, format!("binary file refused: 6 bytes, sha256 {}", hex::encode(sha256(&bytes))));
+            let f = w.path().join("photo.heic");
+            std::fs::write(&f, b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic\x00\x00").unwrap();
+            let e = read(&s, &f, None).await.unwrap_err();
+            assert!(e.starts_with("binary file refused") && e.contains("HEIC images are not supported"), "{e}");
+            // Text is unchanged: one text block.
+            std::fs::write(w.path().join("a.txt"), "hi\n").unwrap();
+            let r = read(&s, &w.path().join("a.txt"), None).await.unwrap();
+            assert_eq!(r.content.len(), 1);
+            assert_eq!(r.content[0].as_text().unwrap().text, "     1\thi\n");
+            let recs = tool_calls(&s);
+            assert!(recs.iter().all(|r| r["body"].get("image").is_none()));
+            // The path policy applies as for any read.
+            let e = read(&s, Path::new("/etc/hosts"), None).await.unwrap_err();
+            assert!(e.starts_with("denied"), "{e}");
+        }
+    }
+
+    mod jobs {
+        use super::*;
+
+        async fn exec(s: &SymbiaServer, cmd: &str, cwd: &Path, yield_ms: u64, timeout_ms: Option<u64>) -> Value {
+            let a = ExecArgs { yield_ms: Some(yield_ms), timeout_ms, ..exec_args(cmd, cwd) };
+            serde_json::from_str(&s.symbia_exec(Parameters(a)).await.unwrap()).unwrap()
+        }
+
+        fn parse(r: Result<String, String>) -> Value {
+            serde_json::from_str(&r.unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_slow_command_becomes_a_job_and_wait_returns_its_end() {
+            let (_t, w, s) = rooted();
+            let r = exec(&s, "echo started; sleep 2; echo done", w.path(), 500, None).await;
+            let id = r["job"].as_str().unwrap().to_string();
+            assert_eq!(r["running"], true);
+            assert!(r["pid"].as_i64().is_some() && r["started_ms"].as_i64().unwrap() <= crate::now_ms());
+            assert_eq!(r["stdout"]["tail"], "started\n");
+            assert!(r.get("exit").is_none());
+            let status: Value = serde_json::from_str(&s.symbia_status().await.unwrap()).unwrap();
+            assert_eq!(status["jobs"][0]["job"], id.as_str());
+            let st = parse(job_call(&s, &id, JobAction::Status).await);
+            assert_eq!(st["running"], true);
+            let done = parse(job_call(&s, &id, JobAction::Wait).await);
+            assert_eq!((done["running"].clone(), done["exit"].clone()), (json!(false), json!(0)), "{done}");
+            assert_eq!(done["stdout"]["tail"], "started\ndone\n");
+            assert!(done["duration_ms"].as_u64().unwrap() >= 2000);
+            let ev = done["stdout"]["evidence"].as_str().unwrap();
+            assert_eq!(std::fs::read_to_string(ev).unwrap(), "started\ndone\n");
+            let status: Value = serde_json::from_str(&s.symbia_status().await.unwrap()).unwrap();
+            assert_eq!(status["jobs"], json!([]));
+
+            // Records: the start, the end (revising the start), then the job calls.
+            let recs = all_records(&s);
+            let keys: Vec<&str> = recs.iter().map(|r| r["key"].as_str().unwrap()).collect();
+            let end_key = format!("job.{id}");
+            assert_eq!(keys, ["tool.symbia_exec", "tool.symbia_job", end_key.as_str(), "tool.symbia_job"]);
+            let (start, end) = (&recs[0], &recs[2]);
+            assert_eq!((start["body"]["job"].as_str(), start["body"]["running"].clone()), (Some(id.as_str()), json!(true)));
+            assert!(start["body"].get("exit").is_none());
+            assert_eq!(end["kind"], "tool_call");
+            assert_eq!(end["body"]["exit"], 0);
+            assert_eq!(end["body"]["stdout_sha256"], hex::encode(sha256(b"started\ndone\n")));
+            assert!(end["body"]["duration_ms"].as_u64().unwrap() >= 2000);
+            assert_eq!(end["links"], json!([{"to_id": start["id"], "rel": "revises", "to_session": null}]));
+            let n: i64 = s
+                .with_store(|st| Ok(st.conn().query_row("SELECT COUNT(*) FROM evidence WHERE sha256 = ?1", [sha256(b"started\ndone\n").to_vec()], |r| r.get(0)).unwrap()))
+                .unwrap();
+            assert_eq!(n, 1);
+            let last = &recs[3]["body"];
+            assert_eq!((last["action"].as_str(), last["running"].clone(), last["exit"].clone()), (Some("wait"), json!(false), json!(0)));
+            assert_eq!(job_call(&s, "nope", JobAction::Status).await.unwrap_err(), "no such job: nope");
+        }
+
+        #[tokio::test]
+        async fn a_short_command_answers_in_one_call() {
+            let (_t, w, s) = rooted();
+            let r = exec(&s, "echo hi", w.path(), 10_000, None).await;
+            assert_eq!(r, json!({"exit": 0, "duration_ms": r["duration_ms"], "stdout": r["stdout"]}));
+            assert_eq!(r["stdout"]["tail"], "hi\n");
+            let recs = all_records(&s);
+            assert_eq!(recs.len(), 1);
+            assert!(recs[0]["body"].get("job").is_none());
+            // The limits.
+            let e = s.symbia_exec(Parameters(ExecArgs { yield_ms: Some(50_001), ..exec_args("true", w.path()) })).await.unwrap_err();
+            assert_eq!(e, "yield_ms must be at most 50000");
+            let e = s.symbia_exec(Parameters(ExecArgs { timeout_ms: Some(3_600_001), ..exec_args("true", w.path()) })).await.unwrap_err();
+            assert!(e.starts_with("timeout_ms must be"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn a_job_past_its_timeout_is_killed_and_recorded() {
+            let (_t, w, s) = rooted();
+            let r = exec(&s, "echo up; sleep 30", w.path(), 200, Some(1_000)).await;
+            let id = r["job"].as_str().unwrap().to_string();
+            let pid = r["pid"].as_i64().unwrap();
+            let done = parse(job_call(&s, &id, JobAction::Wait).await);
+            assert_eq!(done["exit"], "timeout", "{done}");
+            assert!(done.get("killed").is_none());
+            assert!(!alive(pid));
+            let end = all_records(&s).into_iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
+            assert_eq!(end["body"]["exit"], "timeout");
+            assert_eq!(end["body"]["stdout_sha256"], hex::encode(sha256(b"up\n")));
+        }
+
+        #[tokio::test]
+        async fn kill_ends_the_whole_group() {
+            let (_t, w, s) = rooted();
+            let pidfile = w.path().join("child.pid");
+            let r = exec(&s, &format!("sleep 60 & echo $! > {}; wait", pidfile.display()), w.path(), 300, None).await;
+            let id = r["job"].as_str().unwrap().to_string();
+            let child: i64 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+            let k = parse(job_call(&s, &id, JobAction::Kill).await);
+            assert_eq!((k["running"].clone(), k["exit"].clone(), k["killed"].clone()), (json!(false), json!("killed"), json!("symbia_job")), "{k}");
+            let gone = (0..50).any(|_| {
+                std::thread::sleep(Duration::from_millis(100));
+                !alive(child)
+            });
+            assert!(gone, "background child {child} still running");
+            let end = all_records(&s).into_iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
+            assert_eq!((end["body"]["exit"].clone(), end["body"]["killed"].clone()), (json!("killed"), json!("symbia_job")));
+            // Killing an ended job changes nothing.
+            let again = parse(job_call(&s, &id, JobAction::Kill).await);
+            assert_eq!(again["killed"], "symbia_job");
+            assert_eq!(all_records(&s).iter().filter(|r| r["key"] == format!("job.{id}")).count(), 1);
+        }
+
+        #[tokio::test]
+        async fn tail_bytes_trims_the_tails() {
+            let (_t, w, s) = rooted();
+            let cmd = "for i in $(seq 1 500); do printf '%04d\\n' $i; done";
+            let a = ExecArgs { tail_bytes: Some(300), ..exec_args(cmd, w.path()) };
+            let r: Value = serde_json::from_str(&s.symbia_exec(Parameters(a)).await.unwrap()).unwrap();
+            let tail = r["stdout"]["tail"].as_str().unwrap();
+            assert_eq!((tail.len(), r["stdout"]["cut"].clone(), r["stdout"]["bytes"].clone()), (300, json!(true), json!(2500)));
+            assert!(tail.ends_with("0500\n"));
+            for bad in [255, 65_537] {
+                let a = ExecArgs { tail_bytes: Some(bad), ..exec_args("true", w.path()) };
+                assert_eq!(s.symbia_exec(Parameters(a)).await.unwrap_err(), "tail_bytes must be 256 to 65536");
+            }
+            // A job's tail action takes its own size.
+            let r = exec(&s, &format!("{cmd}; sleep 30"), w.path(), 300, None).await;
+            let id = r["job"].as_str().unwrap();
+            assert_eq!(r["stdout"]["tail"].as_str().unwrap().len(), 2500, "all 2,500 bytes fit the default 8 KB tail");
+            let t = parse(s.symbia_job(Parameters(JobArgs { job: id.into(), action: Some(JobAction::Tail), wait_ms: None, bytes: Some(256) })).await);
+            assert_eq!(t["stdout"]["tail"].as_str().unwrap().len(), 256);
+            assert_eq!(t["running"], true);
+            job_call(&s, id, JobAction::Kill).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_kills_running_jobs_records_them_and_seals() {
+            let (t, w, s) = rooted();
+            let r = exec(&s, "sleep 60", w.path(), 200, None).await;
+            let id = r["job"].as_str().unwrap().to_string();
+            let pid = r["pid"].as_i64().unwrap();
+            let t0 = std::time::Instant::now();
+            s.shutdown_jobs().await;
+            let sealed = s.seal_pending().unwrap().expect("a seal");
+            assert!(t0.elapsed() < Duration::from_secs(1));
+            assert!(!alive(pid));
+            assert!(seal::verify(&sealed.path).is_ok());
+            let c = rusqlite::Connection::open_with_flags(&sealed.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let body: String = c.query_row("SELECT json(body) FROM records WHERE key = ?1", [format!("job.{id}")], |r| r.get(0)).unwrap();
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!((body["exit"].clone(), body["killed"].clone()), (json!("killed"), json!("shutdown")), "{body}");
+            assert_eq!(seal_seqs(t.path()), [2]);
+        }
+    }
+
     #[test]
     fn every_transport_lists_the_b3_tools() {
         let t = tempfile::tempdir().unwrap();
@@ -556,10 +1017,23 @@ mod tests {
         let (_t, stdio) = server();
         for s in [http, stdio] {
             let names: Vec<String> = s.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
-            for n in ["symbia_fs_read", "symbia_fs_list", "symbia_fs_search", "symbia_fs_write", "symbia_fs_edit", "symbia_exec"] {
+            for n in ["symbia_fs_read", "symbia_fs_list", "symbia_fs_search", "symbia_fs_write", "symbia_fs_edit", "symbia_exec", "symbia_job"] {
                 assert!(names.iter().any(|x| x == n), "missing {n}");
             }
+            assert_eq!(names.len(), 12);
         }
+    }
+
+    #[test]
+    fn job_tool_annotations() {
+        let (_t, s) = server();
+        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_job").unwrap();
+        let a = tool.annotations.unwrap();
+        assert_eq!(a.title.as_deref(), Some("Check a job"));
+        assert_eq!(
+            (a.read_only_hint, a.destructive_hint, a.idempotent_hint, a.open_world_hint),
+            (Some(false), Some(true), Some(false), Some(false))
+        );
     }
 
     #[tokio::test]
@@ -571,7 +1045,7 @@ mod tests {
         std::fs::create_dir_all(w.path().join("root")).unwrap();
         let f = w.path().join("root/a.txt").display().to_string();
         let reply = s.symbia_fs_write(Parameters(FsWriteArgs { path: f.clone(), content: "secret body".into(), create_only: None, append: None })).await.unwrap();
-        let e = s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None })).await.unwrap_err();
+        let e = s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None, full: None })).await.unwrap_err();
         assert!(e.starts_with("denied"));
         let recs = tool_calls(&s);
         assert_eq!(recs.len(), 2);
@@ -598,7 +1072,7 @@ mod tests {
         let (t, s) = server();
         let w = tempfile::tempdir().unwrap();
         let s = s.with_policy(Policy::new(&[w.path().to_path_buf()], t.path(), t.path()).unwrap());
-        let reply = s.symbia_exec(Parameters(ExecArgs { command: "echo hi; exit 3".into(), cwd: w.path().display().to_string(), timeout_ms: None })).await.unwrap();
+        let reply = s.symbia_exec(Parameters(exec_args("echo hi; exit 3", w.path()))).await.unwrap();
         let v: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["exit"], 3);
         let rec = &tool_calls(&s)[0];
@@ -765,7 +1239,7 @@ mod tests {
         assert!(seal::verify(&path).is_ok());
         // Refused calls are records too and count toward the next one.
         for _ in 0..50 {
-            s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None })).await.unwrap_err();
+            s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None, full: None })).await.unwrap_err();
         }
         assert_eq!(seal_seqs(t.path()), [50, 100]);
     }

@@ -45,19 +45,20 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 
 | Tool | What it does |
 | --- | --- |
-| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key. |
+| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs. |
 | `symbia_record` | Writes a typed record to the ledger and returns its id, version, seq and head. |
 | `symbia_find` | Finds records by full-text query, kind, lane or key prefix. |
 | `symbia_get` | Returns one full record with its links, by id or by key and version. |
 | `symbia_seal` | Seals the session into a signed, verified copy under `seals/`. |
-| `symbia_fs_read` | Reads a text file with line numbers, up to 2,000 lines and 256 KB per call. |
+| `symbia_fs_read` | Reads a text file with line numbers, up to 2,000 lines and 256 KB per call. PNG, JPEG, GIF, WebP, TIFF and BMP files (detected by their bytes) come back as an image: scaled to a 1,568 px long edge unless `full: true`, never over 8,000 px or 5 MB, TIFF and BMP as PNG. The image as sent is kept as evidence. Other binary files, HEIC and audio included, are refused. |
 | `symbia_fs_list` | Lists a folder to depth 1–5, up to 1,000 entries. |
 | `symbia_fs_search` | Searches files for a regex or literal, respecting `.gitignore`. |
 | `symbia_fs_write` | Writes a file atomically (temp file, then rename). |
 | `symbia_fs_edit` | Replaces one exact occurrence of a string in a file, atomically. |
-| `symbia_exec` | Runs a shell command with a timeout and saves its full output as evidence. |
+| `symbia_exec` | Runs a shell command with a timeout (up to 1 hour) and saves its full output as evidence. A command still running after `yield_ms` (default 45 s) becomes a job: the call returns its id and output so far, and the command keeps running. `tail_bytes` sizes the output tails. |
+| `symbia_job` | Follows a job: `status`, `wait` (up to 50 s), `tail` or `kill` (the whole process group). Once it ends, gives the exit and evidence paths. |
 
-Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents.
+That is 12 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
 
 ## Data and safety
 
@@ -69,7 +70,7 @@ Every call to a file or shell tool writes a `tool_call` record on the `apocrypha
 | `keys/trusted.json` | Pinned public keys. |
 | `sessions/` | Live session files, one SQLite file per session. |
 | `seals/` | Sealed copies and their signed `.seal.json` sidecars. |
-| `evidence/` | Full stdout and stderr of `symbia_exec` runs, named by sha256. |
+| `evidence/` | Full stdout and stderr of `symbia_exec` runs and images as sent by `symbia_fs_read`, named by sha256. |
 | `config.json` | Optional. `{"roots": [...]}` sets the folders the file and shell tools may use. |
 
 **Path policy.** The file and shell tools accept only absolute paths inside the configured roots (default: your home folder). A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Files are opened with `O_NOFOLLOW`, and a write re-checks its folder just before the rename. These are always refused, even inside a root:

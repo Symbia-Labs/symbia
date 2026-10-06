@@ -1,6 +1,7 @@
 //! `symbia_exec`: run `/bin/zsh -lc <command>` in its own process group, keep the full
 //! output as evidence and reply with its tail. On macOS the shell runs under
-//! `sandbox-exec` with a profile built from the path policy.
+//! `sandbox-exec` with a profile built from the path policy. A command is a [`Job`]: a task
+//! owns the child until it ends, so a call can return while the command keeps running.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,14 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// `sandbox` in the facts: what confined the command.
 pub const SANDBOX: &str = if cfg!(target_os = "macos") { "seatbelt" } else { "none" };
 pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
-pub const TIMEOUT_MAX_MS: u64 = 600_000;
+pub const TIMEOUT_MAX_MS: u64 = 3_600_000;
+/// How long a call waits before it returns a running job instead.
+pub const YIELD_DEFAULT_MS: u64 = 45_000;
+pub const YIELD_MAX_MS: u64 = 50_000;
+/// Stream tail sizes in replies: default and bounds.
 pub const TAIL_BYTES: usize = 8 * 1024;
+pub const TAIL_MIN: usize = 256;
+pub const TAIL_MAX: usize = 64 * 1024;
 /// After the shell exits, how long to wait for its pipes to close (a background child may hold them).
 const PIPE_GRACE: Duration = Duration::from_secs(2);
 pub const MEDIA: &str = "text/plain";
@@ -54,13 +61,13 @@ impl Capture {
         self.hasher.update(chunk);
         self.bytes += chunk.len() as u64;
         self.tail.extend_from_slice(chunk);
-        if self.tail.len() > 2 * TAIL_BYTES {
-            self.tail.drain(..self.tail.len() - TAIL_BYTES);
+        if self.tail.len() > 2 * TAIL_MAX {
+            self.tail.drain(..self.tail.len() - TAIL_MAX);
         }
     }
 
-    /// Move the temp file to `evidence/<sha256>` and describe it.
-    fn finish(self, dir: &Path) -> Result<Stream, String> {
+    /// Move the temp file to `evidence/<sha256>` and describe it, with a tail of `n` bytes.
+    fn finish(self, dir: &Path, n: usize) -> Result<Stream, String> {
         if let Some(e) = self.error {
             let _ = std::fs::remove_file(&self.tmp);
             return Err(format!("evidence write failed: {e}"));
@@ -73,26 +80,36 @@ impl Capture {
         } else {
             std::fs::rename(&self.tmp, &path).map_err(|e| format!("evidence rename failed: {e}"))?;
         }
-        let cut = self.bytes > TAIL_BYTES as u64;
-        let mut tail = &self.tail[self.tail.len().saturating_sub(TAIL_BYTES)..];
-        if cut {
-            // Do not start in the middle of a UTF-8 sequence.
-            while tail.first().is_some_and(|b| b & 0xC0 == 0x80) {
-                tail = &tail[1..];
-            }
-        }
-        let tail = String::from_utf8_lossy(tail).into_owned();
-        Ok(Stream { sha256, bytes: self.bytes, path, tail, cut })
+        let last = self.tail[self.tail.len().saturating_sub(TAIL_MAX)..].to_vec();
+        let (tail, cut) = tail_of(&last, self.bytes, n);
+        Ok(Stream { sha256, bytes: self.bytes, path, tail, cut, last })
     }
 }
 
+/// The last `n` bytes of a stream whose final bytes are `last` and whose length is `total`,
+/// not starting in the middle of a UTF-8 sequence, and whether that cut anything.
+fn tail_of(last: &[u8], total: u64, n: usize) -> (String, bool) {
+    let cut = total > n as u64;
+    let mut tail = &last[last.len().saturating_sub(n)..];
+    if cut {
+        while tail.first().is_some_and(|b| b & 0xC0 == 0x80) {
+            tail = &tail[1..];
+        }
+    }
+    (String::from_utf8_lossy(tail).into_owned(), cut)
+}
+
 /// One captured stream after the command ends.
+#[derive(Clone)]
 pub struct Stream {
     pub sha256: [u8; 32],
     pub bytes: u64,
     pub path: PathBuf,
+    /// The tail at the size asked for when the command started.
     pub tail: String,
     pub cut: bool,
+    /// Up to [`TAIL_MAX`] final bytes, for tails of other sizes.
+    last: Vec<u8>,
 }
 
 impl Stream {
@@ -100,8 +117,9 @@ impl Stream {
         Evidence { sha256: self.sha256, bytes: i64::try_from(self.bytes).unwrap_or(i64::MAX), media: MEDIA }
     }
 
-    fn reply(&self) -> Value {
-        json!({"tail": self.tail, "bytes": self.bytes, "cut": self.cut, "evidence": self.path.display().to_string()})
+    fn reply(&self, n: usize) -> Value {
+        let (tail, cut) = tail_of(&self.last, self.bytes, n);
+        json!({"tail": tail, "bytes": self.bytes, "cut": cut, "evidence": self.path.display().to_string()})
     }
 }
 
@@ -123,9 +141,25 @@ async fn pump(mut r: impl AsyncRead + Unpin, cap: Shared) {
     }
 }
 
-fn take(cap: &Shared, dir: &Path) -> Result<Stream, String> {
+fn take(cap: &Shared, dir: &Path, n: usize) -> Result<Stream, String> {
     let c = cap.lock().map_err(|_| "capture lock poisoned")?.take().ok_or("capture already taken")?;
-    c.finish(dir)
+    c.finish(dir, n)
+}
+
+/// A running stream's tail of `n` bytes and its length so far; `None` once it has been taken.
+fn snapshot(cap: &Shared, n: usize) -> Option<(String, u64)> {
+    let g = cap.lock().ok()?;
+    let c = g.as_ref()?;
+    Some((tail_of(&c.tail, c.bytes, n).0, c.bytes))
+}
+
+/// Drop a capture that will not become evidence, with its temp file.
+fn discard(cap: &Shared) {
+    if let Ok(mut g) = cap.lock()
+        && let Some(c) = g.take()
+    {
+        let _ = std::fs::remove_file(&c.tmp);
+    }
 }
 
 fn kill_group(pgid: i32) {
@@ -207,15 +241,222 @@ pub struct Ran {
     pub stderr: Stream,
 }
 
-/// Run `command` in `cwd`. On timeout the whole process group is killed and what was
-/// captured so far is returned.
+/// How a command ended.
+pub struct Finished {
+    /// The exit code, `"signal N"`, `"timeout"` or `"killed"`.
+    pub exit: Value,
+    pub duration_ms: u64,
+    pub stdout: Stream,
+    pub stderr: Stream,
+    /// Who killed it: `"symbia_job"` or `"shutdown"`.
+    pub killed: Option<&'static str>,
+}
+
+impl Finished {
+    pub fn evidence(&self) -> [Evidence; 2] {
+        [self.stdout.evidence(), self.stderr.evidence()]
+    }
+
+    /// Note the outcome in a `tool_call` record's facts.
+    pub fn fill(&self, facts: &mut Facts) {
+        facts.exit = Some(self.exit.clone());
+        facts.stdout_sha256 = Some(hex::encode(self.stdout.sha256));
+        facts.stderr_sha256 = Some(hex::encode(self.stderr.sha256));
+        facts.truncated = self.stdout.cut || self.stderr.cut;
+    }
+
+    /// `{exit, duration_ms, stdout, stderr}` with tails of `n` bytes. An empty stream is left
+    /// out of the reply; its evidence and digest are still kept.
+    fn reply(&self, n: usize) -> Value {
+        let mut reply = json!({"exit": self.exit, "duration_ms": self.duration_ms});
+        for (name, s) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            if s.bytes > 0 {
+                reply[name] = s.reply(n);
+            }
+        }
+        reply
+    }
+}
+
+type Outcome = Result<Arc<Finished>, String>;
+
+/// A started command. A task owns the child and calls [`Job::finish`] when it ends.
+pub struct Job {
+    pub pid: i32,
+    pub started_ms: i64,
+    pub command: String,
+    pub tail_bytes: usize,
+    started: Instant,
+    evidence: PathBuf,
+    out: Shared,
+    err: Shared,
+    /// Notes from loading command rules, shown in the reply's `policy`.
+    notes: Vec<String>,
+    killed: Mutex<Option<&'static str>>,
+    outcome: Mutex<Option<Outcome>>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Job {
+    /// How it ended, once it has.
+    pub fn outcome(&self) -> Option<Outcome> {
+        self.outcome.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn running(&self) -> bool {
+        !*self.done.borrow()
+    }
+
+    /// Wait for the end, at most `limit`; true if it has ended.
+    pub async fn wait(&self, limit: Option<Duration>) -> bool {
+        let mut rx = self.done.subscribe();
+        let end = rx.wait_for(|d| *d);
+        match limit {
+            None => end.await.is_ok(),
+            Some(d) => matches!(tokio::time::timeout(d, end).await, Ok(Ok(_))),
+        }
+    }
+
+    /// Kill the process group, noting who did; the owning task then finishes the job as
+    /// `"killed"`. Does nothing once it has ended.
+    pub fn kill(&self, by: &'static str) {
+        if !self.running() {
+            return;
+        }
+        self.killed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(by);
+        kill_group(self.pid);
+    }
+
+    /// Kill it and, if its task has not finished it within `grace`, finish it with what was
+    /// captured so far (shutdown, when the runtime is about to stop).
+    pub async fn kill_and_finish(&self, by: &'static str, grace: Duration) {
+        self.kill(by);
+        if !self.wait(Some(grace)).await {
+            self.finish(Ok(json!("killed")));
+        }
+    }
+
+    /// Settle the outcome once: the first call wins, later ones do nothing.
+    fn finish(&self, exit: Result<Value, String>) {
+        let mut slot = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let killed = *self.killed.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = exit.and_then(|exit| {
+            let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let stdout = take(&self.out, &self.evidence, self.tail_bytes)?;
+            let stderr = take(&self.err, &self.evidence, self.tail_bytes)?;
+            Ok(Arc::new(Finished { exit, duration_ms, stdout, stderr, killed }))
+        });
+        discard(&self.out);
+        discard(&self.err);
+        *slot = Some(outcome);
+        drop(slot);
+        self.done.send_replace(true);
+    }
+
+    /// The reply for a call that waited for the end: as before jobs existed.
+    pub fn ran(&self, facts: &mut Facts) -> Result<Ran, String> {
+        let f = self.outcome().ok_or("the command is still running")??;
+        f.fill(facts);
+        let mut reply = f.reply(self.tail_bytes);
+        if !self.notes.is_empty() {
+            reply["policy"] = self.notes.clone().into();
+        }
+        Ok(Ran { reply: reply.to_string(), stdout: f.stdout.clone(), stderr: f.stderr.clone() })
+    }
+
+    /// `{running, pid, started_ms, duration_ms, ...}` with tails of `n` bytes: the streams so far
+    /// while it runs; exit, evidence paths and who killed it once it has ended.
+    pub fn status(&self, n: usize) -> Value {
+        let mut v = match self.outcome() {
+            None => {
+                let mut v = json!({"running": true, "duration_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)});
+                for (name, cap) in [("stdout", &self.out), ("stderr", &self.err)] {
+                    if let Some((tail, bytes)) = snapshot(cap, n)
+                        && bytes > 0
+                    {
+                        v[name] = json!({"tail": tail, "bytes": bytes});
+                    }
+                }
+                v
+            }
+            Some(Ok(f)) => {
+                let mut v = f.reply(n);
+                v["running"] = false.into();
+                if let Some(k) = f.killed {
+                    v["killed"] = k.into();
+                }
+                v
+            }
+            Some(Err(e)) => json!({"running": false, "error": e}),
+        };
+        v["pid"] = self.pid.into();
+        v["started_ms"] = self.started_ms.into();
+        v
+    }
+}
+
+fn exit_value(status: std::process::ExitStatus) -> Value {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(c), _) => json!(c),
+        (None, Some(s)) => json!(format!("signal {s}")),
+        (None, None) => json!(null),
+    }
+}
+
+/// Own the child until it exits, is killed or times out (then the whole group is killed),
+/// let the pipes drain, and finish the job.
+async fn drive(job: Arc<Job>, mut child: tokio::process::Child, mut pumps: Vec<tokio::task::JoinHandle<()>>, timeout: Duration) {
+    let exit = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let killed = job.killed.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            Ok(if killed { json!("killed") } else { exit_value(status) })
+        }
+        Ok(Err(e)) => {
+            kill_group(job.pid);
+            Err(format!("wait: {e}"))
+        }
+        Err(_) => {
+            kill_group(job.pid);
+            let _ = child.wait().await;
+            Ok(json!("timeout"))
+        }
+    };
+    let _ = tokio::time::timeout(PIPE_GRACE, async {
+        for p in &mut pumps {
+            let _ = p.await;
+        }
+    })
+    .await;
+    for p in &pumps {
+        p.abort();
+    }
+    job.finish(exit);
+}
+
+/// Run `command` in `cwd` and wait for it to end. On timeout the whole process group is
+/// killed and what was captured so far is returned.
 pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms: Option<u64>, facts: &mut Facts) -> Result<Ran, String> {
+    let job = start(policy, home, command, cwd, timeout_ms, None, facts)?;
+    job.wait(None).await;
+    job.ran(facts)
+}
+
+/// Check and start `command` in `cwd`; replies show tails of `tail_bytes` (default 8 KB).
+pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms: Option<u64>, tail_bytes: Option<usize>, facts: &mut Facts) -> Result<Arc<Job>, String> {
     facts.command = Some(command.to_string());
     facts.sandbox = Some(SANDBOX);
     facts.network = Some(policy.network().as_str());
     let timeout_ms = timeout_ms.unwrap_or(TIMEOUT_DEFAULT_MS);
     if !(1..=TIMEOUT_MAX_MS).contains(&timeout_ms) {
         return Err(format!("timeout_ms must be 1 to {TIMEOUT_MAX_MS}"));
+    }
+    let tail_bytes = tail_bytes.unwrap_or(TAIL_BYTES);
+    if !(TAIL_MIN..=TAIL_MAX).contains(&tail_bytes) {
+        return Err(format!("tail_bytes must be {TAIL_MIN} to {TAIL_MAX}"));
     }
     let dir = crate::files::checked(policy, cwd, Access::Write, &mut facts.cwd)?;
     if !dir.is_dir() {
@@ -230,17 +471,20 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     let err: Shared = Arc::new(Mutex::new(Some(Capture::new(&evidence, "stderr").map_err(|e| e.to_string())?)));
 
     let started = Instant::now();
+    let started_ms = crate::now_ms();
     // sandbox-exec applies the profile and execs the shell in place, so the group is the shell's.
-    let mut child = shell
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn shell: {e}"))?;
-    let pgid = child.id().and_then(|id| i32::try_from(id).ok()).ok_or("child has no pid")?;
+    let spawned = shell.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).kill_on_drop(true).spawn();
+    let (mut child, pid) = match spawned.map_err(|e| format!("spawn shell: {e}")).and_then(|c| {
+        let pid = c.id().and_then(|id| i32::try_from(id).ok()).ok_or("child has no pid")?;
+        Ok((c, pid))
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            discard(&out);
+            discard(&err);
+            return Err(e);
+        }
+    };
     let mut pumps = Vec::new();
     if let Some(o) = child.stdout.take() {
         pumps.push(tokio::spawn(pump(o, out.clone())));
@@ -248,53 +492,22 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     if let Some(e) = child.stderr.take() {
         pumps.push(tokio::spawn(pump(e, err.clone())));
     }
-
-    let exit = match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(Ok(status)) => {
-            use std::os::unix::process::ExitStatusExt;
-            match (status.code(), status.signal()) {
-                (Some(c), _) => json!(c),
-                (None, Some(s)) => json!(format!("signal {s}")),
-                (None, None) => json!(null),
-            }
-        }
-        Ok(Err(e)) => {
-            kill_group(pgid);
-            return Err(format!("wait: {e}"));
-        }
-        Err(_) => {
-            kill_group(pgid);
-            let _ = child.wait().await;
-            json!("timeout")
-        }
-    };
-    let _ = tokio::time::timeout(PIPE_GRACE, async {
-        for p in &mut pumps {
-            let _ = p.await;
-        }
-    })
-    .await;
-    for p in &pumps {
-        p.abort();
-    }
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let stdout = take(&out, &evidence)?;
-    let stderr = take(&err, &evidence)?;
-    facts.exit = Some(exit.clone());
-    facts.stdout_sha256 = Some(hex::encode(stdout.sha256));
-    facts.stderr_sha256 = Some(hex::encode(stderr.sha256));
-    facts.truncated = stdout.cut || stderr.cut;
-    let mut reply = json!({"exit": exit, "duration_ms": duration_ms});
-    // An empty stream is left out of the reply; its evidence and digest are still kept.
-    for (name, s) in [("stdout", &stdout), ("stderr", &stderr)] {
-        if s.bytes > 0 {
-            reply[name] = s.reply();
-        }
-    }
-    if !rules.notes.is_empty() {
-        reply["policy"] = rules.notes.into();
-    }
-    Ok(Ran { reply: reply.to_string(), stdout, stderr })
+    let job = Arc::new(Job {
+        pid,
+        started_ms,
+        command: command.to_string(),
+        tail_bytes,
+        started,
+        evidence,
+        out,
+        err,
+        notes: rules.notes,
+        killed: Mutex::new(None),
+        outcome: Mutex::new(None),
+        done: tokio::sync::watch::Sender::new(false),
+    });
+    tokio::spawn(drive(job.clone(), child, pumps, Duration::from_millis(timeout_ms)));
+    Ok(job)
 }
 
 #[cfg(test)]
@@ -388,7 +601,7 @@ mod tests {
         let e = exec(&p, &sym, "true", &sym.join("keys").display().to_string(), None, &mut facts).await.err().unwrap();
         assert!(e.starts_with("denied"), "{e}");
         let r = root.display().to_string();
-        assert!(exec(&p, &sym, "true", &r, Some(600_001), &mut facts).await.is_err());
+        assert!(exec(&p, &sym, "true", &r, Some(TIMEOUT_MAX_MS + 1), &mut facts).await.is_err());
         assert!(exec(&p, &sym, "true", &r, Some(0), &mut facts).await.is_err());
     }
 

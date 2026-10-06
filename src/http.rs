@@ -25,6 +25,7 @@ use rmcp::transport::streamable_http_server::session::{ServerSseMessage, Session
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 
+use crate::jobs::Jobs;
 use crate::mcp::SymbiaServer;
 use crate::now_ms;
 use crate::store::{DEFAULT_TTL_MS, Store};
@@ -40,9 +41,25 @@ pub type Slot = Arc<Mutex<Option<Store>>>;
 pub struct Sessions {
     expires: Mutex<HashMap<String, i64>>,
     stores: Mutex<Vec<Weak<Mutex<Option<Store>>>>>,
+    jobs: Mutex<Vec<Weak<Jobs>>>,
 }
 
 impl Sessions {
+    /// Remember a bound session's jobs so shutdown can kill and record them.
+    pub fn track_jobs(&self, jobs: &Arc<Jobs>) {
+        let mut all = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(jobs));
+    }
+
+    /// Kill every live session's running jobs and record them as killed by shutdown.
+    pub async fn shutdown_jobs(&self) {
+        let all: Vec<Arc<Jobs>> = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+        for j in all {
+            j.shutdown().await;
+        }
+    }
+
     /// Remember a bound session's store so shutdown can seal it while it is alive.
     pub fn track(&self, slot: &Slot) {
         let mut stores = self.stores.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,8 +194,9 @@ fn not_found() -> Response<BoxBody<Bytes, Infallible>> {
     r
 }
 
-/// Serve MCP over streamable HTTP on `listener` until `shutdown` completes, then seal every
-/// live session that has unsealed records. Seal failures go to stderr.
+/// Serve MCP over streamable HTTP on `listener` until `shutdown` completes, then kill and
+/// record running jobs and seal every live session that has unsealed records. Seal failures
+/// go to stderr.
 pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     crate::home::ensure(&home)?;
     let key = Arc::new(crate::keys::load_or_create(&home)?);
@@ -212,6 +230,7 @@ pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<O
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), handler).await;
         });
     };
+    sessions.shutdown_jobs().await;
     for e in sessions.seal_all(&key) {
         eprintln!("symbia serve: seal on exit failed: {e}");
     }

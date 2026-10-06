@@ -52,6 +52,16 @@ pub struct Facts {
     pub stdout_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_sha256: Option<String>,
+    /// An image read: `{format, width, height, sent_width, sent_height, sent_sha256}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    /// `symbia_job`'s action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<bool>,
     pub truncated: bool,
 }
 
@@ -140,6 +150,95 @@ pub fn atomic_write(policy: &Policy, path: &Path, bytes: &[u8], create_only: boo
 pub fn read(policy: &Policy, path: &str, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
     let real = checked(policy, path, Access::Read, &mut facts.path)?;
     read_at(&real, offset, limit, facts)
+}
+
+/// What `symbia_fs_read` sends back.
+pub enum ReadOut {
+    Text(String),
+    Image(SentImage),
+}
+
+/// An image as sent, stored in `evidence/` under `sha256`, and the text block that goes with it.
+pub struct SentImage {
+    pub bytes: Vec<u8>,
+    pub media: &'static str,
+    pub sha256: [u8; 32],
+    pub text: String,
+}
+
+/// Store `bytes` as `evidence/<sha256>` (temp file, then rename) unless it is there already.
+pub fn store_evidence(dir: &Path, bytes: &[u8]) -> Result<[u8; 32], String> {
+    let sha256 = crate::canon::sha256(bytes);
+    let path = dir.join(hex::encode(sha256));
+    if path.exists() {
+        return Ok(sha256);
+    }
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).map_err(io)?;
+    let tmp = dir.join(format!(".image-{}.tmp", hex::encode(r)));
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("evidence write failed: {e}"));
+    }
+    Ok(sha256)
+}
+
+/// [`read`], except that a PNG, JPEG, GIF, WebP, TIFF or BMP file (by its magic bytes) comes
+/// back as an image, scaled per [`crate::images::prepare`] and stored in `evidence` as sent.
+pub fn read_any(policy: &Policy, evidence: &Path, path: &str, offset: Option<u64>, limit: Option<u64>, full: bool, facts: &mut Facts) -> Result<ReadOut, String> {
+    use crate::images::{SNIFF_BYTES, Sniff, sniff};
+    let real = checked(policy, path, Access::Read, &mut facts.path)?;
+    let mut file = open_nofollow(&real).map_err(|e| open_error(&real, &e))?;
+    if file.metadata().map_err(io)?.is_dir() {
+        return Err(format!("{} is a directory; use symbia_fs_list", real.display()));
+    }
+    let mut head = Vec::with_capacity(SNIFF_BYTES);
+    (&mut file).take(SNIFF_BYTES as u64).read_to_end(&mut head).map_err(io)?;
+    match sniff(&head) {
+        Sniff::Image(format) => {
+            let mut data = head;
+            file.read_to_end(&mut data).map_err(io)?;
+            image_at(&real, &data, format, full, evidence, facts).map(ReadOut::Image)
+        }
+        Sniff::Heic => read_at(&real, offset, limit, facts)
+            .map(ReadOut::Text)
+            .map_err(|e| if e.starts_with("binary") { format!("{e}; HEIC images are not supported, convert to PNG or JPEG") } else { e }),
+        Sniff::Other => read_at(&real, offset, limit, facts).map(ReadOut::Text),
+    }
+}
+
+fn image_at(real: &Path, data: &[u8], format: crate::images::Format, full: bool, evidence: &Path, facts: &mut Facts) -> Result<SentImage, String> {
+    facts.sha256_before = Some(hex::encode(crate::canon::sha256(data)));
+    let s = crate::images::prepare(data, format, full)?;
+    let sha256 = store_evidence(evidence, &s.bytes)?;
+    facts.truncated = (s.sent_width, s.sent_height) != (s.width, s.height);
+    facts.image = Some(json!({
+        "format": format.name(),
+        "width": s.width,
+        "height": s.height,
+        "sent_width": s.sent_width,
+        "sent_height": s.sent_height,
+        "sent_sha256": hex::encode(sha256),
+    }));
+    let text = json!({
+        "path": show(real),
+        "format": format.name(),
+        "width": s.width,
+        "height": s.height,
+        "sent_width": s.sent_width,
+        "sent_height": s.sent_height,
+        "bytes": s.bytes.len(),
+        "sha256": hex::encode(sha256),
+    })
+    .to_string();
+    Ok(SentImage { bytes: s.bytes, media: s.sent_format.media(), sha256, text })
 }
 
 /// [`read`] after the policy check, on its realpath.

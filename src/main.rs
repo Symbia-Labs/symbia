@@ -117,9 +117,9 @@ fn seal_on_exit(server: &symbia::mcp::SymbiaServer) {
     }
 }
 
-/// Serve over stdio until the transport closes or a signal arrives. Seal the session at once,
-/// since a client may kill the process soon after, then drain in-flight tool calls and seal
-/// again if any of them wrote.
+/// Serve over stdio until the transport closes or a signal arrives. Kill running jobs and
+/// record them, then seal the session at once, since a client may kill the process soon
+/// after, then drain in-flight tool calls and seal again if any of them wrote.
 fn run_mcp() -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let server = symbia::mcp::SymbiaServer::new(&home)?;
@@ -131,6 +131,7 @@ fn run_mcp() -> anyhow::Result<()> {
             r = running.waiting() => r.map(|_| ()).map_err(anyhow::Error::from),
             () = shutdown_signal() => Ok(()),
         };
+        handle.shutdown_jobs().await;
         seal_on_exit(&handle);
         r
     });

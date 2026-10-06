@@ -5,6 +5,8 @@ pub mod exec;
 pub mod files;
 pub mod home;
 pub mod http;
+pub mod images;
+pub mod jobs;
 pub mod keys;
 pub mod mcp;
 pub mod policy;
