@@ -200,7 +200,7 @@ pub fn profile(policy: &Policy) -> Result<String, String> {
         p.push_str(&sbpl_rule("allow file-read-metadata", "literal", &meta)?);
         p.push_str(&sbpl_rule("allow file-read*", "subpath", &policy.exec_read_paths())?);
     }
-    for d in policy.deny_paths() {
+    for d in policy.exec_deny_paths() {
         p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(d)?));
     }
     for o in policy.own_paths() {
@@ -450,6 +450,9 @@ pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms:
     facts.command = Some(command.to_string());
     facts.sandbox = Some(SANDBOX);
     facts.network = Some(policy.network().as_str());
+    if !policy.exec_unlock().is_empty() {
+        facts.unlocked = Some(policy.exec_unlock().to_vec());
+    }
     let timeout_ms = timeout_ms.unwrap_or(TIMEOUT_DEFAULT_MS);
     if !(1..=TIMEOUT_MAX_MS).contains(&timeout_ms) {
         return Err(format!("timeout_ms must be 1 to {TIMEOUT_MAX_MS}"));
@@ -913,6 +916,26 @@ mod tests {
             // The credential folders stay refused in every mode.
             let (r, ran, _) = run(&p, &sym, &format!("cat {}", quote(&user.join(".config/gh/hosts.yml"))), &root, None).await;
             refused(&r, &ran);
+        }
+
+        #[tokio::test]
+        async fn exec_unlock_reopens_one_entry_for_exec_in_both_read_modes() {
+            for mode in ["home", "deny_list"] {
+                let (_t, user, root, sym, p) = home_setup(json!({"exec_read": mode, "exec_unlock": [".config/gh"]}));
+                std::fs::create_dir_all(user.join(".ssh")).unwrap();
+                std::fs::write(user.join(".ssh/id_test"), SECRET).unwrap();
+                let (r, _, facts) = run(&p, &sym, &format!("cat {}", quote(&user.join(".config/gh/hosts.yml"))), &root, None).await;
+                assert!(r["stdout"]["tail"].as_str().unwrap().contains(SECRET), "{mode}: {r}");
+                assert_eq!(facts.unlocked, Some(vec![".config/gh".to_string()]), "{mode}");
+                // Every other deny-list entry stays closed.
+                let (r, ran, _) = run(&p, &sym, &format!("cat {}", quote(&user.join(".ssh/id_test"))), &root, None).await;
+                refused(&r, &ran);
+            }
+            // Without the key the entry is refused, and the record carries no `unlocked`.
+            let (_t, user, root, sym, p) = home_setup(json!({}));
+            let (r, ran, facts) = run(&p, &sym, &format!("cat {}", quote(&user.join(".config/gh/hosts.yml"))), &root, None).await;
+            refused(&r, &ran);
+            assert_eq!(facts.unlocked, None);
         }
 
         #[tokio::test]

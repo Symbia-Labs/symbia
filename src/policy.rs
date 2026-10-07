@@ -108,6 +108,8 @@ pub struct Config {
     pub exec_import_claude_rules: bool,
     /// Read-only roots for the file tools.
     pub read_roots: Vec<String>,
+    /// Deny-list entries re-opened for exec only (a logged stopgap, e.g. `".config/gh"`).
+    pub exec_unlock: Vec<String>,
 }
 
 impl Default for Config {
@@ -120,6 +122,7 @@ impl Default for Config {
             exec_deny: Vec::new(),
             exec_import_claude_rules: true,
             read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            exec_unlock: Vec::new(),
         }
     }
 }
@@ -140,6 +143,9 @@ pub struct Policy {
     exec_read_allow: Vec<Spelled>,
     exec_deny: Vec<String>,
     import_claude_rules: bool,
+    /// `exec_unlock` entries as configured, and the deny-list paths they re-open for exec.
+    exec_unlock: Vec<String>,
+    unlocked: Vec<Spelled>,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -213,6 +219,10 @@ impl Policy {
             .chain([symbia_home.join("keys")])
             .map(|d| Spelled::new(&d))
             .collect::<anyhow::Result<_>>()?;
+        if let Some(bad) = c.exec_unlock.iter().find(|u| !DENY_IN_HOME.contains(&u.as_str())) {
+            anyhow::bail!("exec_unlock: {bad:?} is not a deny-list entry; allowed: {}", DENY_IN_HOME.join(", "));
+        }
+        let unlocked = c.exec_unlock.iter().map(|u| Spelled::new(&user_home.join(u))).collect::<anyhow::Result<_>>()?;
         Ok(Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
@@ -225,6 +235,8 @@ impl Policy {
             exec_read_allow: spell(&c.exec_read_allow)?,
             exec_deny: c.exec_deny.clone(),
             import_claude_rules: c.exec_import_claude_rules,
+            exec_unlock: c.exec_unlock.clone(),
+            unlocked,
         })
     }
 
@@ -260,6 +272,17 @@ impl Policy {
         self.deny.iter().flat_map(Spelled::both).collect()
     }
 
+    /// `exec_unlock` entries as configured (empty unless the stopgap is on).
+    pub fn exec_unlock(&self) -> &[String] {
+        &self.exec_unlock
+    }
+
+    /// The deny list as the exec sandbox applies it: every entry except those in `exec_unlock`.
+    /// The file tools keep using the full list through [`Policy::denied`].
+    pub fn exec_deny_paths(&self) -> Vec<&Path> {
+        self.deny.iter().filter(|d| !self.unlocked.iter().any(|u| u.lex == d.lex)).flat_map(Spelled::both).collect()
+    }
+
     /// `$SYMBIA_HOME`, as spelled and as its realpath when that differs.
     pub fn own_paths(&self) -> Vec<&Path> {
         self.own.both().collect()
@@ -273,7 +296,7 @@ impl Policy {
     /// What exec may read under the home with `exec_read: "home"`: the roots, the read
     /// allowances and the evidence folder, both spellings.
     pub fn exec_read_paths(&self) -> Vec<&Path> {
-        self.roots.iter().chain(&self.exec_read_allow).chain([&self.evidence]).flat_map(Spelled::both).collect()
+        self.roots.iter().chain(&self.exec_read_allow).chain(&self.unlocked).chain([&self.evidence]).flat_map(Spelled::both).collect()
     }
 
     /// Folders strictly between the home and each root or read allowance inside it, both
@@ -281,7 +304,7 @@ impl Policy {
     pub fn exec_ancestor_paths(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         let homes: Vec<&Path> = self.home_paths();
-        for p in self.roots.iter().chain(&self.exec_read_allow).flat_map(Spelled::both) {
+        for p in self.roots.iter().chain(&self.exec_read_allow).chain(&self.unlocked).flat_map(Spelled::both) {
             let Some(home) = homes.iter().copied().find(|h| p.starts_with(h) && p != *h) else { continue };
             for a in p.ancestors().skip(1).take_while(|a| *a != home) {
                 if !out.iter().any(|o| o == a) {
@@ -565,5 +588,34 @@ mod tests {
         let real_user = std::fs::canonicalize(&user).unwrap();
         assert!(anc.contains(&real_user.join("work/a")), "realpath spelling too");
         assert!(p.home_paths().contains(&real_user.as_path()));
+    }
+
+    #[test]
+    fn exec_unlock_takes_only_deny_list_entries() {
+        let (_t, user, sym, p) = setup();
+        assert!(p.exec_unlock().is_empty());
+        for bad in [r#"["Documents"]"#, r#"["/etc"]"#, r#"["keys"]"#, r#"["../.ssh"]"#, r#"[".config"]"#] {
+            std::fs::write(sym.join("config.json"), format!(r#"{{"exec_unlock": {bad}}}"#)).unwrap();
+            assert!(Policy::load(&sym, &user).is_err(), "{bad} accepted");
+        }
+        std::fs::write(sym.join("config.json"), r#"{"exec_unlock": [".config/gh"]}"#).unwrap();
+        assert_eq!(Policy::load(&sym, &user).unwrap().exec_unlock(), &[".config/gh".to_string()][..]);
+    }
+
+    #[test]
+    fn exec_unlock_reopens_for_exec_only() {
+        let (_t, user, sym, _p) = setup();
+        std::fs::write(sym.join("config.json"), r#"{"exec_unlock": [".config/gh"]}"#).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        let gh = user.join(".config/gh");
+        // Exec: out of the sandbox deny rules, into the read allowances (with its ancestors).
+        assert!(!p.exec_deny_paths().contains(&gh.as_path()));
+        assert!(p.exec_deny_paths().contains(&user.join(".ssh").as_path()));
+        assert!(p.exec_deny_paths().contains(&sym.join("keys").as_path()));
+        assert!(p.exec_read_paths().contains(&gh.as_path()));
+        assert!(p.exec_ancestor_paths().contains(&user.join(".config")));
+        // File tools: still denied.
+        assert!(p.denied(&gh.join("hosts.yml")));
+        assert!(p.check(&s(&gh.join("hosts.yml")), Access::Read).unwrap_err().contains("deny list"));
     }
 }

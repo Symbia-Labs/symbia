@@ -71,15 +71,20 @@ That is 12 tools. Every call to a file or shell tool writes a `tool_call` record
 | `sessions/` | Live session files, one SQLite file per session. |
 | `seals/` | Sealed copies and their signed `.seal.json` sidecars. |
 | `evidence/` | Full stdout and stderr of `symbia_exec` runs and images as sent by `symbia_fs_read`, named by sha256. |
-| `config.json` | Optional. `{"roots": [...]}` sets the folders the file and shell tools may use. |
+| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock` and `read_roots` tune the shell sandbox and the file tools. |
 
 **Path policy.** The file and shell tools accept only absolute paths inside the configured roots (default: your home folder). A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Files are opened with `O_NOFOLLOW`, and a write re-checks its folder just before the rename. These are always refused, even inside a root:
 
-- `~/.ssh`, `~/.gnupg`, `~/.aws`
-- `~/Library/Keychains`, `~/Library/Application Support/Claude`
+- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`
+- `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`
+- `~/Library/Keychains`, `~/Library/Cookies`, `~/Library/Application Support/Claude`
 - `$SYMBIA_HOME/keys`
 
-**Read-only data directory.** The tools never write under `SYMBIA_HOME`: `symbia_fs_write`, `symbia_fs_edit` and a `symbia_exec` working directory there are refused. `evidence/` can be read with `symbia_fs_read`. A command run through `symbia_exec` runs with your own rights, so it is not confined to the roots.
+**Read-only data directory.** The tools never write under `SYMBIA_HOME`: `symbia_fs_write`, `symbia_fs_edit` and a `symbia_exec` working directory there are refused. `evidence/` can be read with `symbia_fs_read`.
+
+**Shell sandbox (macOS).** `symbia_exec` runs each command under the macOS sandbox. The deny list above is unreadable and unwritable, `SYMBIA_HOME` is unwritable, and by default (`"exec_read": "home"`) nothing in your home folder is readable except the roots, a few shell and toolchain files, and `evidence/`. `"exec_network": "deny"` also blocks outbound network. A command cannot start a sandbox of its own inside this one. On Linux there is no sandbox yet.
+
+**`exec_unlock` (a stopgap).** `{"exec_unlock": [".config/gh"]}` re-opens named deny-list entries to commands run through `symbia_exec`, so a tool such as `gh` can use its own login. Only deny-list entries are accepted, and `keys/` can never be unlocked. The file tools still refuse those paths. It re-opens the entry to every command, not just one tool, so any command could read what it holds. Each exec record made while it is set carries `unlocked`, `symbia_status` shows it, and the server notes it on stderr at start.
 
 **Key pinning.** The device key is pinned in `keys/trusted.json` when it is created. `symbia verify` accepts only seals signed by a pinned key. Add others with `symbia trust add`, or for one run with `--trust`.
 

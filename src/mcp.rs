@@ -213,6 +213,9 @@ impl SymbiaServer {
         crate::home::ensure(home)?;
         let key = crate::keys::load_or_create(home)?;
         let policy = Policy::from_env(home)?;
+        if !policy.exec_unlock().is_empty() {
+            eprintln!("symbia: exec_unlock is on; exec may use {}", policy.exec_unlock().join(", "));
+        }
         let store = Store::create(home)?;
         Ok(Self::assemble(home, Arc::new(key), Some(store), None, Arc::new(policy)))
     }
@@ -392,6 +395,7 @@ impl SymbiaServer {
                 "last_seal": last,
                 "public_key": hex_prefix(&self.key.verifying_key().to_bytes(), PREFIX),
                 "jobs": jobs,
+                "exec_unlock": self.policy.exec_unlock(),
             })
             .to_string())
         })

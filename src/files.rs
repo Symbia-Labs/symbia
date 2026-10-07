@@ -42,6 +42,9 @@ pub struct Facts {
     pub sandbox: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<&'static str>,
+    /// Deny-list entries `exec_unlock` re-opened for this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlocked: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
