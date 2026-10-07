@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::canon::{canonical, hex_prefix};
 use crate::now_ms;
 use crate::record::{FORMAT, GENESIS, IdFields, Link, RecordInput, RowFields, chain_hash_v2, record_id, row_digest};
+use crate::session::Lock;
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const FIND_LIMIT_MAX: u32 = 50;
@@ -38,6 +39,8 @@ pub struct Store {
     session: String,
     path: PathBuf,
     started_ms: i64,
+    /// The stdio session lock; last, so it is released after the connection closes.
+    lock: Option<Lock>,
 }
 
 /// Reference returned for a write.
@@ -158,7 +161,25 @@ impl Store {
             "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('session', ?1, NULL, ?2, ?3)",
             params![expires_ms, FORMAT, mcp_session_id],
         )?;
-        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms() })
+        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms(), lock: None })
+    }
+
+    /// Reopen an existing session file to continue its chain. The session id is the file
+    /// name; the start time is the id's millisecond prefix.
+    pub fn open(home: &Path, path: &Path) -> anyhow::Result<Self> {
+        let session = path.file_stem().and_then(|s| s.to_str()).context("session file name is not UTF-8")?.to_string();
+        let started_ms = session.split('-').next().and_then(|ms| ms.parse().ok()).unwrap_or_else(now_ms);
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).with_context(|| format!("open {}", path.display()))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            bail!("could not enable WAL (got {mode})");
+        }
+        Ok(Self { conn, home: home.to_path_buf(), session, path: path.to_path_buf(), started_ms, lock: None })
+    }
+
+    /// Keep `lock` for as long as this store is open.
+    pub fn hold(&mut self, lock: Lock) {
+        self.lock = Some(lock);
     }
 
     /// When this session file was created.

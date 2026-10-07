@@ -62,6 +62,8 @@ async fn fifty_records_and_a_prediction_make_checkpoint_seals() {
 #[tokio::test]
 async fn a_result_links_to_a_prediction_from_before_the_restart() {
     let t = tempfile::tempdir().unwrap();
+    // Resume off, so the restart opens a new session (R6).
+    std::fs::write(t.path().join("config.json"), r#"{"resume_window_ms": 0}"#).unwrap();
     let mut a = Mcp::start(t.path()).await;
     let pred = a.tool(1, "symbia_record", record("map.p", "prediction")).await.unwrap();
     let a_status = a.tool(2, "symbia_status", json!({})).await.unwrap();

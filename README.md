@@ -14,7 +14,7 @@ The binary is `target/release/symbia`.
 
 | Command | What it does |
 | --- | --- |
-| `symbia mcp` | MCP over stdio. One process is one session. |
+| `symbia mcp` | MCP over stdio. The session opens on the first tool call: it resumes the previous session if that one is free, unexpired and written within `resume_window_ms` (default 4 h; `0` turns resume off), otherwise a new one. The first reply says which. |
 | `symbia serve [--listen ip:port] [--allow-remote]` | MCP over streamable HTTP at `/mcp`, default `127.0.0.1:7341`. Each MCP session gets its own session file. |
 | `symbia verify <sealed.sqlite> [--trust <hex>]...` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>`, or exit 1 and the reason. |
 | `symbia trust add <hex> <label>` / `symbia trust list` | Pin a public key, or list pinned keys. |
@@ -45,7 +45,7 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 
 | Tool | What it does |
 | --- | --- |
-| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs. |
+| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes, and the previous session when it was not resumed. |
 | `symbia_record` | Writes a typed record to the ledger and returns its id, version, seq and head. |
 | `symbia_find` | Finds records by full-text query, kind, lane or key prefix. |
 | `symbia_get` | Returns one full record with its links, by id or by key and version. |
@@ -68,10 +68,10 @@ That is 12 tools. Every call to a file or shell tool writes a `tool_call` record
 | --- | --- |
 | `keys/device.ed25519` | The device signing key (mode 0600, directory 0700). |
 | `keys/trusted.json` | Pinned public keys. |
-| `sessions/` | Live session files, one SQLite file per session. |
+| `sessions/` | Live session files, one SQLite file per session, and a `.lock` beside each one a `symbia mcp` process holds. |
 | `seals/` | Sealed copies and their signed `.seal.json` sidecars. |
 | `evidence/` | Full stdout and stderr of `symbia_exec` runs and images as sent by `symbia_fs_read`, named by sha256. |
-| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock` and `read_roots` tune the shell sandbox and the file tools. |
+| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock` and `read_roots` tune the shell sandbox and the file tools; `resume_window_ms` sets how `symbia mcp` resumes sessions. |
 
 **Path policy.** The file and shell tools accept only absolute paths inside the configured roots (default: your home folder). A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Files are opened with `O_NOFOLLOW`, and a write re-checks its folder just before the rename. These are always refused, even inside a root:
 

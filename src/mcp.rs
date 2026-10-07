@@ -49,7 +49,22 @@ pub struct SymbiaServer {
     client: Arc<Mutex<Option<String>>>,
     /// Commands still running after their `symbia_exec` call returned.
     jobs: Arc<Jobs>,
+    /// Set over stdio, where the session is opened on the first tool call that needs it.
+    stdio: Option<Arc<Mutex<Stdio>>>,
     tool_router: ToolRouter<Self>,
+}
+
+/// The stdio process's session state.
+#[derive(Debug, Default)]
+struct Stdio {
+    /// When this process started.
+    started_ms: i64,
+    /// A session was opened (or the server released); never open another.
+    opened: bool,
+    /// For the first tool reply after the session opened.
+    notice: Option<String>,
+    /// The session not resumed when a new one was opened.
+    previous: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -208,7 +223,9 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 impl SymbiaServer {
-    /// Open a new session under `home`, creating the layout and device key as needed (stdio).
+    /// A stdio server under `home`, creating the layout and device key as needed and removing
+    /// empty session files nobody holds. The session is opened (resumed or new) on the first
+    /// tool call that needs it.
     pub fn new(home: &Path) -> anyhow::Result<Self> {
         crate::home::ensure(home)?;
         let key = crate::keys::load_or_create(home)?;
@@ -216,21 +233,60 @@ impl SymbiaServer {
         if !policy.exec_unlock().is_empty() {
             eprintln!("symbia: exec_unlock is on; exec may use {}", policy.exec_unlock().join(", "));
         }
-        let store = Store::create(home)?;
-        Ok(Self::assemble(home, Arc::new(key), Some(store), None, Arc::new(policy)))
+        crate::session::clean_empty(home);
+        let stdio = Stdio { started_ms: crate::now_ms(), ..Stdio::default() };
+        Ok(Self::assemble(home, Arc::new(key), None, Some(Arc::new(Mutex::new(stdio))), Arc::new(policy)))
     }
 
     /// A server for one streamable HTTP session. The session file is created when the
     /// first message carrying the `Mcp-Session-Id` arrives.
     pub fn for_http(home: &Path, key: Arc<SigningKey>, sessions: Arc<Sessions>, policy: Arc<Policy>) -> Self {
-        Self::assemble(home, key, None, Some(sessions), policy)
+        Self::assemble(home, key, Some(sessions), None, policy)
     }
 
-    fn assemble(home: &Path, key: Arc<SigningKey>, store: Option<Store>, sessions: Option<Arc<Sessions>>, policy: Arc<Policy>) -> Self {
-        let store = Arc::new(Mutex::new(store));
+    fn assemble(home: &Path, key: Arc<SigningKey>, sessions: Option<Arc<Sessions>>, stdio: Option<Arc<Mutex<Stdio>>>, policy: Arc<Policy>) -> Self {
+        let store = Arc::new(Mutex::new(None));
         let client: Arc<Mutex<Option<String>>> = Arc::default();
         let jobs = Arc::new(Jobs::new(store.clone(), key.clone(), client.clone()));
-        Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, tool_router: Self::tool_router() }
+        Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, stdio, tool_router: Self::tool_router() }
+    }
+
+    /// Close the stdio session on exit: drop its store, which releases and deletes its lock.
+    /// No session is opened after this.
+    pub fn release(&self) {
+        let Ok(mut slot) = self.lock() else { return };
+        if let Some(stdio) = &self.stdio
+            && let Ok(mut st) = stdio.lock()
+        {
+            st.opened = true;
+        }
+        drop(slot.take());
+    }
+
+    /// The store slot, opening the stdio session first if this process has none yet.
+    fn slot(&self) -> Result<MutexGuard<'_, Option<Store>>, String> {
+        let mut slot = self.lock()?;
+        if let (None, Some(stdio)) = (slot.as_ref(), &self.stdio) {
+            let mut st = stdio.lock().map_err(|_| "state lock poisoned")?;
+            if !st.opened {
+                let me = crate::session::Holder::this_process(st.started_ms);
+                let (store, opened) = crate::session::open(&self.home, self.policy.resume_window_ms(), me).map_err(err)?;
+                st.opened = true;
+                st.notice = Some(opened.notice(store.session()));
+                st.previous = opened.previous_session().map(String::from);
+                *slot = Some(store);
+            }
+        }
+        Ok(slot)
+    }
+
+    /// The session notice, once: for the first tool reply after the session opened.
+    fn take_notice(&self) -> Option<String> {
+        self.stdio.as_ref()?.lock().ok()?.notice.take()
+    }
+
+    fn previous_session(&self) -> Option<String> {
+        self.stdio.as_ref()?.lock().ok()?.previous.clone()
     }
 
     /// Kill running jobs and record them as killed by shutdown (on exit, before the seal).
@@ -282,7 +338,7 @@ impl SymbiaServer {
 
     /// Refuse before doing any work if there is no session to record the call in; return the args digest.
     fn begin(&self, args: &impl Serialize) -> Result<String, String> {
-        if self.lock()?.is_none() {
+        if self.slot()?.is_none() {
             return Err(NO_SESSION.into());
         }
         Ok(hex::encode(sha256(canonical(args).map_err(err)?.as_bytes())))
@@ -334,7 +390,7 @@ impl SymbiaServer {
     }
 
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
-        let mut slot = self.lock()?;
+        let mut slot = self.slot()?;
         let store = slot.as_mut().ok_or(NO_SESSION)?;
         f(store)
     }
@@ -374,7 +430,7 @@ impl SymbiaServer {
     #[tool(
         title = "Session status",
         annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
-        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs."
+        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes after server restarts, and the previous session when it was not resumed."
     )]
     pub async fn symbia_status(&self) -> Result<String, String> {
         let jobs = self.jobs.running();
@@ -396,6 +452,8 @@ impl SymbiaServer {
                 "public_key": hex_prefix(&self.key.verifying_key().to_bytes(), PREFIX),
                 "jobs": jobs,
                 "exec_unlock": self.policy.exec_unlock(),
+                "resumes": crate::session::resumes(store).map_err(err)?,
+                "previous_session": self.previous_session(),
             })
             .to_string())
         })
@@ -659,6 +717,20 @@ impl SymbiaServer {
     }
 }
 
+/// Add `notice` to the reply's JSON object, or as a text block of its own when the reply has none.
+fn add_notice(res: &mut CallToolResult, notice: String) {
+    for block in &mut res.content {
+        if let ContentBlock::Text(t) = block
+            && let Ok(serde_json::Value::Object(mut o)) = serde_json::from_str::<serde_json::Value>(&t.text)
+        {
+            o.insert("notice".into(), notice.into());
+            t.text = serde_json::Value::Object(o).to_string();
+            return;
+        }
+    }
+    res.content.push(ContentBlock::text(json!({"notice": notice}).to_string()));
+}
+
 #[tool_handler(router = self.tool_router, name = "symbia")]
 impl ServerHandler for SymbiaServer {
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
@@ -670,7 +742,16 @@ impl ServerHandler for SymbiaServer {
         {
             *c = Some(info.client_info.name.clone());
         }
-        self.tool_router.call(ToolCallContext::new(self, request, context)).await
+        let r = self.tool_router.call(ToolCallContext::new(self, request, context)).await;
+        match r {
+            Ok(CallToolResponse::Complete(mut res)) => {
+                if let Some(n) = self.take_notice() {
+                    add_notice(&mut res, n);
+                }
+                Ok(CallToolResponse::Complete(res))
+            }
+            other => other,
+        }
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {

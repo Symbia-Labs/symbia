@@ -13,6 +13,7 @@ pub mod policy;
 pub mod record;
 pub mod rules;
 pub mod seal;
+pub mod session;
 pub mod store;
 pub mod trust;
 

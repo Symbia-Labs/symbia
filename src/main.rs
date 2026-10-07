@@ -137,6 +137,7 @@ fn run_mcp() -> anyhow::Result<()> {
     });
     rt.shutdown_timeout(DRAIN);
     seal_on_exit(&handle);
+    handle.release();
     r
 }
 

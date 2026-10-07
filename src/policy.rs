@@ -110,6 +110,8 @@ pub struct Config {
     pub read_roots: Vec<String>,
     /// Deny-list entries re-opened for exec only (a logged stopgap, e.g. `".config/gh"`).
     pub exec_unlock: Vec<String>,
+    /// How recent the last write must be for `symbia mcp` to resume a session; 0 turns resume off.
+    pub resume_window_ms: i64,
 }
 
 impl Default for Config {
@@ -123,6 +125,7 @@ impl Default for Config {
             exec_import_claude_rules: true,
             read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
             exec_unlock: Vec::new(),
+            resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
         }
     }
 }
@@ -146,6 +149,7 @@ pub struct Policy {
     /// `exec_unlock` entries as configured, and the deny-list paths they re-open for exec.
     exec_unlock: Vec<String>,
     unlocked: Vec<Spelled>,
+    resume_window_ms: i64,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -222,6 +226,9 @@ impl Policy {
         if let Some(bad) = c.exec_unlock.iter().find(|u| !DENY_IN_HOME.contains(&u.as_str())) {
             anyhow::bail!("exec_unlock: {bad:?} is not a deny-list entry; allowed: {}", DENY_IN_HOME.join(", "));
         }
+        if c.resume_window_ms < 0 {
+            anyhow::bail!("resume_window_ms must be 0 or more, got {}", c.resume_window_ms);
+        }
         let unlocked = c.exec_unlock.iter().map(|u| Spelled::new(&user_home.join(u))).collect::<anyhow::Result<_>>()?;
         Ok(Self {
             roots,
@@ -237,7 +244,13 @@ impl Policy {
             import_claude_rules: c.exec_import_claude_rules,
             exec_unlock: c.exec_unlock.clone(),
             unlocked,
+            resume_window_ms: c.resume_window_ms,
         })
+    }
+
+    /// `resume_window_ms` from config.json.
+    pub fn resume_window_ms(&self) -> i64 {
+        self.resume_window_ms
     }
 
     pub fn with_network(mut self, network: Network) -> Self {
@@ -617,5 +630,15 @@ mod tests {
         // File tools: still denied.
         assert!(p.denied(&gh.join("hosts.yml")));
         assert!(p.check(&s(&gh.join("hosts.yml")), Access::Read).unwrap_err().contains("deny list"));
+    }
+
+    #[test]
+    fn resume_window_defaults_to_four_hours_and_refuses_negatives() {
+        let (_t, user, sym, p) = setup();
+        assert_eq!(p.resume_window_ms(), 14_400_000);
+        std::fs::write(sym.join("config.json"), r#"{"resume_window_ms": 0}"#).unwrap();
+        assert_eq!(Policy::load(&sym, &user).unwrap().resume_window_ms(), 0);
+        std::fs::write(sym.join("config.json"), r#"{"resume_window_ms": -1}"#).unwrap();
+        assert!(Policy::load(&sym, &user).is_err());
     }
 }
