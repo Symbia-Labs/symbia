@@ -10,7 +10,7 @@ macOS on Apple silicon, with Homebrew:
 brew install symbia-labs/tap/symbia
 ```
 
-Or download a binary from [Releases](https://github.com/Symbia-Labs/symbia/releases): `symbia-<version>-aarch64-apple-darwin.zip` (signed with a Developer ID and notarized by Apple) or `symbia-<version>-x86_64-unknown-linux-gnu.tar.gz`. Each has a `.sha256` file beside it.
+Or download a binary from [Releases](https://github.com/Symbia-Labs/symbia/releases): `symbia-<version>-aarch64-apple-darwin.zip` (signed with a Developer ID and notarized by Apple) or `symbia-<version>-x86_64-unknown-linux-musl.tar.gz` (a static Linux binary). Each has a `.sha256` file beside it.
 
 On Linux there is no shell sandbox yet: `symbia_exec` runs commands with your own rights, and `exec_network: "deny"` is refused rather than ignored.
 
