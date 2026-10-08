@@ -125,6 +125,7 @@ pub fn chain_hash(prev_hash: &[u8; 32], record_id: &str, at_ms: i64) -> [u8; 32]
 pub const GENESIS: [u8; 32] = [0u8; 32];
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
 pub struct LinkInput {
     /// Id of the record this one links to.
     pub to_id: String,

@@ -298,6 +298,8 @@ pub struct Job {
     err: Shared,
     /// Notes from loading command rules, shown in the reply's `policy`.
     notes: Vec<String>,
+    /// Run under an `exec_unsandboxed` rule; replies say `sandbox: "none"`.
+    pub unsandboxed: bool,
     killed: Mutex<Option<&'static str>>,
     outcome: Mutex<Option<Outcome>>,
     done: tokio::sync::watch::Sender<bool>,
@@ -370,6 +372,9 @@ impl Job {
         if !self.notes.is_empty() {
             reply["policy"] = self.notes.clone().into();
         }
+        if self.unsandboxed {
+            reply["sandbox"] = "none".into();
+        }
         Ok(Ran { reply: reply.to_string(), stdout: f.stdout.clone(), stderr: f.stderr.clone() })
     }
 
@@ -400,6 +405,9 @@ impl Job {
         };
         v["pid"] = self.pid.into();
         v["started_ms"] = self.started_ms.into();
+        if self.unsandboxed {
+            v["sandbox"] = "none".into();
+        }
         v
     }
 }
@@ -451,13 +459,44 @@ pub async fn exec(policy: &Policy, home: &Path, command: &str, cwd: &str, timeou
     job.ran(facts)
 }
 
-/// Check and start `command` in `cwd`; replies show tails of `tail_bytes` (default 8 KB).
+/// Check and start `command` in `cwd`, sandboxed; replies show tails of `tail_bytes` (default 8 KB).
 pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms: Option<u64>, tail_bytes: Option<usize>, facts: &mut Facts) -> Result<Arc<Job>, String> {
+    start_request(policy, home, &Request { command, cwd, unsandboxed: false }, timeout_ms, tail_bytes, facts)
+}
+
+/// One `symbia_exec` call's command.
+pub struct Request<'a> {
+    pub command: &'a str,
+    pub cwd: &'a str,
+    /// Run under a matching `exec_unsandboxed` rule instead of the sandbox.
+    pub unsandboxed: bool,
+}
+
+/// The process for an unsandboxed command: the matching rule's program by its absolute path,
+/// the other words as argv, a fixed `PATH`, no shell. Notes the rule in `facts`.
+fn unsandboxed(policy: &Policy, command: &str, dir: &Path, facts: &mut Facts) -> Result<tokio::process::Command, String> {
+    let words = crate::unsandboxed::split(command)?;
+    let rules = policy.exec_unsandboxed();
+    let (i, rule) = crate::unsandboxed::find(rules, command, &words, dir)?;
+    facts.unsandboxed = Some(json!({"rule": i, "program": rule.program.display().to_string(), "argv": words}));
+    let mut c = tokio::process::Command::new(&rule.program);
+    c.args(&words[1..]).env("PATH", crate::unsandboxed::path_env(rules));
+    Ok(c)
+}
+
+/// Check and start a [`Request`]; replies show tails of `tail_bytes` (default 8 KB).
+pub fn start_request(policy: &Policy, home: &Path, req: &Request, timeout_ms: Option<u64>, tail_bytes: Option<usize>, facts: &mut Facts) -> Result<Arc<Job>, String> {
+    let (command, cwd) = (req.command, req.cwd);
     facts.command = Some(command.to_string());
-    facts.sandbox = Some(SANDBOX);
-    facts.network = Some(policy.network().as_str());
-    if !policy.exec_unlock().is_empty() {
-        facts.unlocked = Some(policy.exec_unlock().to_vec());
+    if req.unsandboxed {
+        facts.sandbox = Some("none");
+        facts.network = Some("unrestricted");
+    } else {
+        facts.sandbox = Some(SANDBOX);
+        facts.network = Some(policy.network().as_str());
+        if !policy.exec_unlock().is_empty() {
+            facts.unlocked = Some(policy.exec_unlock().to_vec());
+        }
     }
     let timeout_ms = timeout_ms.unwrap_or(TIMEOUT_DEFAULT_MS);
     if !(1..=TIMEOUT_MAX_MS).contains(&timeout_ms) {
@@ -473,7 +512,7 @@ pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms:
     }
     let rules = crate::rules::load(policy, &dir);
     crate::rules::check(&rules.rules, command)?;
-    let mut shell = shell(policy, Path::new(SANDBOX_EXEC), command)?;
+    let mut shell = if req.unsandboxed { unsandboxed(policy, command, &dir, facts)? } else { shell(policy, Path::new(SANDBOX_EXEC), command)? };
     let evidence = home.join("evidence");
     std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
     let out: Shared = Arc::new(Mutex::new(Some(Capture::new(&evidence, "stdout").map_err(|e| e.to_string())?)));
@@ -511,6 +550,7 @@ pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms:
         out,
         err,
         notes: rules.notes,
+        unsandboxed: req.unsandboxed,
         killed: Mutex::new(None),
         outcome: Mutex::new(None),
         done: tokio::sync::watch::Sender::new(false),
@@ -542,6 +582,93 @@ mod tests {
     fn alive(pid: i32) -> bool {
         // SAFETY: signal 0 only checks that the process exists.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// An executable script at `dir/name`.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// `setup()` with these `exec_unsandboxed` rules (and `exec_deny`).
+    fn unsandboxed_setup(rules: Value, deny: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf, Policy) {
+        let (t, root, sym, _) = setup();
+        let c = crate::policy::Config {
+            exec_unsandboxed: serde_json::from_value(rules).unwrap(),
+            exec_deny: deny.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let p = Policy::with_config(std::slice::from_ref(&root), &sym, t.path(), &c).unwrap();
+        (t, root, sym, p)
+    }
+
+    async fn run_req(p: &Policy, sym: &Path, cmd: &str, cwd: &Path, unsandboxed: bool) -> Result<(Value, Facts), String> {
+        let mut facts = Facts::default();
+        let cwd = cwd.display().to_string();
+        let job = start_request(p, sym, &Request { command: cmd, cwd: &cwd, unsandboxed }, None, None, &mut facts)?;
+        job.wait(None).await;
+        let ran = job.ran(&mut facts)?;
+        Ok((serde_json::from_str(&ran.reply).unwrap(), facts))
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_runs_the_rules_program_without_a_shell() {
+        let t0 = tempfile::tempdir().unwrap();
+        let tool = script(&t0.path().join("bin"), "tool", r#"echo "real $# $1|$2"; echo "PATH=$PATH""#);
+        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": tool, "args": ["*"]}]), &[]);
+        let (r, facts) = run_req(&p, &sym, r#"tool 'a b' "c""#, &root, true).await.unwrap();
+        let out = r["stdout"]["tail"].as_str().unwrap();
+        assert!(out.starts_with("real 2 a b|c\n"), "{r}");
+        // PATH is the fixed one, not the server's.
+        let path = crate::unsandboxed::path_env(p.exec_unsandboxed());
+        assert!(out.contains(&format!("PATH={}\n", path.to_str().unwrap())), "{r}");
+        assert_eq!(r["sandbox"], "none");
+        assert_eq!((facts.sandbox, facts.network), (Some("none"), Some("unrestricted")));
+        assert_eq!(facts.unsandboxed, Some(json!({"rule": 0, "program": tool.display().to_string(), "argv": ["tool", "a b", "c"]})));
+        assert_eq!(facts.unlocked, None);
+        // The same command without the flag goes through the sandboxed shell, which has no `tool`.
+        let (r, facts) = run_req(&p, &sym, "tool x", &root, false).await.unwrap();
+        assert_eq!(r["exit"], 127, "{r}");
+        assert!(r.get("sandbox").is_none(), "{r}");
+        assert_eq!((facts.sandbox, facts.unsandboxed), (Some(SANDBOX), None));
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_refusals() {
+        let t0 = tempfile::tempdir().unwrap();
+        let tool = script(&t0.path().join("bin"), "tool", "echo ran");
+        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": tool, "args": ["push", "*"]}]), &["tool push --force:*"]);
+        let e = run_req(&p, &sym, "tool pull", &root, true).await.unwrap_err();
+        assert!(e.starts_with("refused: no exec_unsandboxed rule matches \"tool pull\"; rules:"), "{e}");
+        assert!(e.contains(&format!("{} push *", tool.display())), "{e}");
+        assert_eq!(run_req(&p, &sym, "tool push; id", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
+        assert_eq!(run_req(&p, &sym, "tool push $(id)", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
+        // exec_deny is checked first and still refuses.
+        let e = run_req(&p, &sym, "tool push --force origin", &root, true).await.unwrap_err();
+        assert!(e.contains("matches exec rule"), "{e}");
+        // A cwd outside the roots is refused as always.
+        assert!(run_req(&p, &sym, "tool push", t0.path(), true).await.is_err());
+        let (r, _) = run_req(&p, &sym, "tool push origin", &root, true).await.unwrap();
+        assert_eq!(r["stdout"]["tail"], "ran\n");
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_job_can_be_killed_with_its_group() {
+        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": "/bin/sleep", "args": ["*"]}]), &[]);
+        let mut facts = Facts::default();
+        let cwd = root.display().to_string();
+        let job = start_request(&p, &sym, &Request { command: "sleep 30", cwd: &cwd, unsandboxed: true }, None, None, &mut facts).unwrap();
+        assert!(!job.wait(Some(Duration::from_millis(200))).await);
+        let st = job.status(job.tail_bytes);
+        assert_eq!((st["running"].clone(), st["sandbox"].clone()), (json!(true), json!("none")), "{st}");
+        job.kill("symbia_job");
+        assert!(job.wait(Some(Duration::from_secs(5))).await);
+        assert_eq!(job.status(job.tail_bytes)["exit"], "killed");
+        assert!(!alive(job.pid));
     }
 
     #[tokio::test]
@@ -974,6 +1101,18 @@ mod tests {
             let p = Policy::new(std::slice::from_ref(&root), &sym, &home).unwrap();
             let (r, _, _) = run(&p, &sym, "cargo --version && git --version", &root, None).await;
             assert_eq!(r["exit"], 0, "{r}");
+        }
+
+        #[tokio::test]
+        async fn unsandboxed_reaches_what_the_sandbox_refuses() {
+            let (_t, user, root, sym, p) = home_setup(json!({"exec_unsandboxed": [{"program": "/bin/cat", "args": ["*"]}]}));
+            let hosts = quote(&user.join(".config/gh/hosts.yml"));
+            let (r, ran, _) = run(&p, &sym, &format!("cat {hosts}"), &root, None).await;
+            refused(&r, &ran);
+            let (r, facts) = run_req(&p, &sym, &format!("cat {hosts}"), &root, true).await.unwrap();
+            assert!(r["stdout"]["tail"].as_str().unwrap().contains(SECRET), "{r}");
+            assert_eq!((r["sandbox"].clone(), facts.sandbox), (json!("none"), Some("none")));
+            assert_eq!(facts.unsandboxed.unwrap()["program"], "/bin/cat");
         }
 
         #[test]

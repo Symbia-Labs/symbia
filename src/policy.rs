@@ -53,6 +53,18 @@ impl Spelled {
         Ok(Self { lex, real })
     }
 
+    /// As [`Spelled::new`], but a path that can't be resolved for lack of permission keeps its
+    /// lexical spelling as its realpath. For deny-list entries: inside the exec sandbox `~/.ssh`
+    /// can't be resolved, and that must not stop the policy from loading.
+    fn lenient(p: &Path) -> anyhow::Result<Self> {
+        let lex = lexical(p);
+        match real(&lex) {
+            Ok(real) => Ok(Self { lex, real }),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(Self { real: lex.clone(), lex }),
+            Err(e) => Err(e).with_context(|| format!("resolve {}", p.display())),
+        }
+    }
+
     fn holds(&self, p: &Path) -> bool {
         p.starts_with(&self.lex) || p.starts_with(&self.real)
     }
@@ -112,6 +124,8 @@ pub struct Config {
     pub exec_unlock: Vec<String>,
     /// How recent the last write must be for `symbia mcp` to resume a session; 0 turns resume off.
     pub resume_window_ms: i64,
+    /// Programs `symbia_exec` may run outside the sandbox when a call asks (`unsandboxed: true`).
+    pub exec_unsandboxed: Vec<crate::unsandboxed::RuleConfig>,
 }
 
 impl Default for Config {
@@ -126,6 +140,7 @@ impl Default for Config {
             read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
             exec_unlock: Vec::new(),
             resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
+            exec_unsandboxed: Vec::new(),
         }
     }
 }
@@ -150,6 +165,7 @@ pub struct Policy {
     exec_unlock: Vec<String>,
     unlocked: Vec<Spelled>,
     resume_window_ms: i64,
+    unsandboxed: Vec<crate::unsandboxed::Rule>,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -221,7 +237,7 @@ impl Policy {
             .iter()
             .map(|d| user_home.join(d))
             .chain([symbia_home.join("keys")])
-            .map(|d| Spelled::new(&d))
+            .map(|d| Spelled::lenient(&d))
             .collect::<anyhow::Result<_>>()?;
         if let Some(bad) = c.exec_unlock.iter().find(|u| !DENY_IN_HOME.contains(&u.as_str())) {
             anyhow::bail!("exec_unlock: {bad:?} is not a deny-list entry; allowed: {}", DENY_IN_HOME.join(", "));
@@ -229,7 +245,12 @@ impl Policy {
         if c.resume_window_ms < 0 {
             anyhow::bail!("resume_window_ms must be 0 or more, got {}", c.resume_window_ms);
         }
-        let unlocked = c.exec_unlock.iter().map(|u| Spelled::new(&user_home.join(u))).collect::<anyhow::Result<_>>()?;
+        let unlocked = c.exec_unlock.iter().map(|u| Spelled::lenient(&user_home.join(u))).collect::<anyhow::Result<_>>()?;
+        let unsandboxed = c
+            .exec_unsandboxed
+            .iter()
+            .map(|r| crate::unsandboxed::Rule::load(r, |p| expand(p, user_home)))
+            .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
@@ -245,7 +266,13 @@ impl Policy {
             exec_unlock: c.exec_unlock.clone(),
             unlocked,
             resume_window_ms: c.resume_window_ms,
+            unsandboxed,
         })
+    }
+
+    /// `exec_unsandboxed` rules, checked at load.
+    pub fn exec_unsandboxed(&self) -> &[crate::unsandboxed::Rule] {
+        &self.unsandboxed
     }
 
     /// `resume_window_ms` from config.json.
@@ -640,5 +667,55 @@ mod tests {
         assert_eq!(Policy::load(&sym, &user).unwrap().resume_window_ms(), 0);
         std::fs::write(sym.join("config.json"), r#"{"resume_window_ms": -1}"#).unwrap();
         assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_loads_exec_unsandboxed_rules() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, user, sym, p) = setup();
+        assert!(p.exec_unsandboxed().is_empty());
+        let tool = user.join("bin/tool");
+        std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = serde_json::json!({"exec_unsandboxed": [{"program": "~/bin/tool", "args": ["push", "*"], "cwd": "~/work"}]});
+        std::fs::write(sym.join("config.json"), cfg.to_string()).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        let rules = p.exec_unsandboxed();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].program, tool);
+        assert_eq!(rules[0].cwd.as_deref(), Some(std::fs::canonicalize(user.join("work")).unwrap().as_path()));
+        for bad in [
+            serde_json::json!([{"program": "bin/tool", "args": []}]),
+            serde_json::json!([{"program": "~/bin/missing", "args": []}]),
+            serde_json::json!([{"program": "~/work", "args": []}]),
+            serde_json::json!([{"program": "~/bin/tool"}]),
+        ] {
+            std::fs::write(sym.join("config.json"), serde_json::json!({"exec_unsandboxed": bad}).to_string()).unwrap();
+            assert!(Policy::load(&sym, &user).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_entries_that_cannot_be_resolved_still_load() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions. Root searches any folder, so the error never comes.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (t, user, sym, _p) = setup();
+        let locked = t.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        std::os::unix::fs::symlink(locked.join("inner"), user.join(".ssh")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unresolvable = real(&user.join(".ssh")).unwrap_err().kind();
+        let p = Policy::load(&sym, &user);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(unresolvable, std::io::ErrorKind::PermissionDenied);
+        let p = p.unwrap();
+        assert!(p.deny_paths().contains(&user.join(".ssh").as_path()));
+        assert!(p.check(&s(&user.join(".ssh/id")), Access::Read).unwrap_err().contains("deny list"));
     }
 }

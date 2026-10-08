@@ -152,10 +152,15 @@ pub struct ExecArgs {
     /// Size of the stdout and stderr tails in replies. Default 8,192; 256 to 65,536.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_bytes: Option<usize>,
+    /// Run outside the sandbox under a matching exec_unsandboxed rule: no shell, the rule's program by its absolute path, logged with sandbox "none". Refused when no rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsandboxed: Option<bool>,
 }
 
+/// Inlined in the schema: some clients send a `$ref`'d enum value as a bare word.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(inline)]
 pub enum JobAction {
     #[default]
     Status,
@@ -232,6 +237,10 @@ impl SymbiaServer {
         let policy = Policy::from_env(home)?;
         if !policy.exec_unlock().is_empty() {
             eprintln!("symbia: exec_unlock is on; exec may use {}", policy.exec_unlock().join(", "));
+        }
+        if !policy.exec_unsandboxed().is_empty() {
+            let programs: Vec<String> = policy.exec_unsandboxed().iter().map(|r| r.program.display().to_string()).collect();
+            eprintln!("symbia: exec_unsandboxed is on; exec may run without the sandbox: {}", programs.join(", "));
         }
         crate::session::clean_empty(home);
         let stdio = Stdio { started_ms: crate::now_ms(), ..Stdio::default() };
@@ -452,6 +461,7 @@ impl SymbiaServer {
                 "public_key": hex_prefix(&self.key.verifying_key().to_bytes(), PREFIX),
                 "jobs": jobs,
                 "exec_unlock": self.policy.exec_unlock(),
+                "exec_unsandboxed": self.policy.exec_unsandboxed().iter().map(|r| r.describe()).collect::<Vec<_>>(),
                 "resumes": crate::session::resumes(store).map_err(err)?,
                 "previous_session": self.previous_session(),
             })
@@ -615,7 +625,7 @@ impl SymbiaServer {
     #[tool(
         title = "Run a command",
         annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        description = "Run /bin/zsh -lc <command> in cwd (off macOS: zsh, else bash, else sh), in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last tail_bytes (default 8 KB) of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. If it is still running after yield_ms (default 45 s), returns {job, running: true, pid, started_ms} and the output so far at once, and the command keeps running: follow it with symbia_job. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary."
+        description = "Run /bin/zsh -lc <command> in cwd (off macOS: zsh, else bash, else sh), in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last tail_bytes (default 8 KB) of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. If it is still running after yield_ms (default 45 s), returns {job, running: true, pid, started_ms} and the output so far at once, and the command keeps running: follow it with symbia_job. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary. With unsandboxed: true, a command matching an exec_unsandboxed rule runs outside the sandbox: no shell (no pipes, redirects, variables, ~ or globs), the rule's program by its absolute path, recorded with sandbox \"none\". That is a short logged list, not containment: a rule for a program that can run arbitrary code grants exactly that."
     )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
         const TOOL: &str = "symbia_exec";
@@ -627,7 +637,8 @@ impl SymbiaServer {
             facts.command = Some(args.command.clone());
             Err(format!("yield_ms must be at most {}", crate::exec::YIELD_MAX_MS))
         } else {
-            crate::exec::start(&self.policy, &self.home, &args.command, &args.cwd, args.timeout_ms, args.tail_bytes, &mut facts)
+            let req = crate::exec::Request { command: &args.command, cwd: &args.cwd, unsandboxed: args.unsandboxed.unwrap_or(false) };
+            crate::exec::start_request(&self.policy, &self.home, &req, args.timeout_ms, args.tail_bytes, &mut facts)
         };
         let job = match job {
             Ok(j) => j,
@@ -801,7 +812,7 @@ mod tests {
     }
 
     fn exec_args(command: &str, cwd: &Path) -> ExecArgs {
-        ExecArgs { command: command.into(), cwd: cwd.display().to_string(), timeout_ms: None, yield_ms: None, tail_bytes: None }
+        ExecArgs { command: command.into(), cwd: cwd.display().to_string(), timeout_ms: None, yield_ms: None, tail_bytes: None, unsandboxed: None }
     }
 
     /// A server whose only root is a fresh temp dir outside its `SYMBIA_HOME`.
@@ -1119,6 +1130,22 @@ mod tests {
             (a.read_only_hint, a.destructive_hint, a.idempotent_hint, a.open_world_hint),
             (Some(false), Some(true), Some(false), Some(false))
         );
+    }
+
+    #[test]
+    fn tool_schemas_inline_everything() {
+        let (_t, s) = server();
+        for tool in s.tool_router.list_all() {
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(!schema.contains("$ref"), "{}: {schema}", tool.name);
+        }
+        let job = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_job").unwrap();
+        let action = serde_json::to_string(&job.input_schema["properties"]["action"]).unwrap();
+        for v in ["status", "wait", "tail", "kill"] {
+            assert!(action.contains(&format!("\"{v}\"")), "{action}");
+        }
+        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_exec").unwrap();
+        assert!(exec.input_schema["properties"].get("unsandboxed").is_some());
     }
 
     #[tokio::test]
