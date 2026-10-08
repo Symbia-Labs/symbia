@@ -53,7 +53,7 @@ async fn threads_over_stdio() {
     m.send(json!({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})).await;
     let l = m.reply(12).await;
     let tools = l["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 15);
     for tool in tools {
         assert!(tool["inputSchema"]["properties"]["thread"].is_object(), "{}", tool["name"]);
     }

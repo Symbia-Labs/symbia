@@ -19,6 +19,7 @@ pub mod session;
 pub mod store;
 pub mod trust;
 pub mod unsandboxed;
+pub mod witness;
 
 /// Current UTC time in integer milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {

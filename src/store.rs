@@ -13,6 +13,8 @@ use crate::record::{FORMAT, GENESIS, IdFields, Link, MAIN_THREAD, RecordInput, R
 use crate::session::Lock;
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// The ledger file's session id.
+pub const LEDGER: &str = "ledger";
 pub const FIND_LIMIT_MAX: u32 = 50;
 const FIND_LIMIT_DEFAULT: u32 = 20;
 
@@ -41,6 +43,8 @@ pub struct Store {
     session: String,
     path: PathBuf,
     started_ms: i64,
+    /// Where each seal of this file is also written down (config `witness`).
+    witness: Option<PathBuf>,
     /// The stdio session lock; last, so it is released after the connection closes.
     lock: Option<Lock>,
 }
@@ -174,7 +178,32 @@ impl Store {
             "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('session', ?1, NULL, ?2, ?3)",
             params![expires_ms, FORMAT, mcp_session_id],
         )?;
-        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms(), lock: None })
+        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms(), witness: None, lock: None })
+    }
+
+    /// `home/ledger/ledger.sqlite`: the long-lived ledger, opened or created. Its records are
+    /// promotions; it has no expiry and lives outside `sessions/`, so it is never resumed.
+    pub fn ledger(home: &Path) -> anyhow::Result<Self> {
+        let dir = home.join("ledger");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("ledger.sqlite");
+        if path.exists() {
+            return Self::open(home, &path);
+        }
+        let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute("INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('ledger', NULL, NULL, ?1, NULL)", [FORMAT])?;
+        Ok(Self { conn, home: home.to_path_buf(), session: LEDGER.to_string(), path, started_ms: now_ms(), witness: None, lock: None })
+    }
+
+    /// Also write each seal of this file to the witness folder.
+    pub fn set_witness(&mut self, dir: Option<PathBuf>) {
+        self.witness = dir;
+    }
+
+    pub fn witness(&self) -> Option<&Path> {
+        self.witness.as_deref()
     }
 
     /// Reopen an existing session file to continue its chain. The session id is the file
@@ -187,7 +216,7 @@ impl Store {
         if !mode.eq_ignore_ascii_case("wal") {
             bail!("could not enable WAL (got {mode})");
         }
-        Ok(Self { conn, home: home.to_path_buf(), session, path: path.to_path_buf(), started_ms, lock: None })
+        Ok(Self { conn, home: home.to_path_buf(), session, path: path.to_path_buf(), started_ms, witness: None, lock: None })
     }
 
     /// Keep `lock` for as long as this store is open.
@@ -394,12 +423,25 @@ impl Store {
 
     /// The full record with its links, or `None`.
     pub fn get(&self, id: &str) -> anyhow::Result<Option<Value>> {
-        let rec = self
-            .conn
+        get_in(&self.conn, id)
+    }
+}
+
+/// The full record `id` in any session or sealed file, with its links; older formats have no
+/// thread column, and their records read as `main`.
+pub fn get_in(conn: &Connection, id: &str) -> anyhow::Result<Option<Value>> {
+    let has_thread: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('chain') WHERE name = 'thread'", [], |r| r.get(0))?;
+    let thread = if has_thread > 0 { "c.thread" } else { "'main'" };
+    let has_to_session: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('links') WHERE name = 'to_session'", [], |r| r.get(0))?;
+    let to_session = if has_to_session > 0 { "to_session" } else { "NULL" };
+    {
+        let rec = conn
             .query_row(
-                "SELECT r.id, r.key, r.version, r.kind, r.lane, r.lane_reason, json(r.body), r.model, r.session, r.at_ms, r.expires_ms,
-                        r.est_host_ms, r.est_chars, r.host_ms, r.chars, c.seq, c.thread
-                 FROM records r LEFT JOIN chain c ON c.record_id = r.id WHERE r.id = ?1",
+                &format!(
+                    "SELECT r.id, r.key, r.version, r.kind, r.lane, r.lane_reason, json(r.body), r.model, r.session, r.at_ms, r.expires_ms,
+                            r.est_host_ms, r.est_chars, r.host_ms, r.chars, c.seq, {thread}
+                     FROM records r LEFT JOIN chain c ON c.record_id = r.id WHERE r.id = ?1"
+                ),
                 [id],
                 |r| {
                     let body: String = r.get(6)?;
@@ -429,13 +471,13 @@ impl Store {
             .optional()?;
         let Some((mut rec, body)) = rec else { return Ok(None) };
         rec["body"] = serde_json::from_str(&body)?;
-        let mut stmt = self.conn.prepare("SELECT to_id, rel, to_session FROM links WHERE from_id = ?1 ORDER BY rowid")?;
+        let mut stmt = conn.prepare(&format!("SELECT to_id, rel, {to_session} FROM links WHERE from_id = ?1 ORDER BY rowid"))?;
         let links: Vec<Value> = stmt
             .query_map([id], |r| {
                 Ok(json!({"to_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?, "to_session": r.get::<_, Option<String>>(2)?}))
             })?
             .collect::<Result<_, _>>()?;
-        let mut stmt = self.conn.prepare("SELECT from_id, rel FROM links WHERE to_id = ?1 ORDER BY rowid")?;
+        let mut stmt = conn.prepare("SELECT from_id, rel FROM links WHERE to_id = ?1 ORDER BY rowid")?;
         let linked_from: Vec<Value> = stmt
             .query_map([id], |r| Ok(json!({"from_id": r.get::<_, String>(0)?, "rel": r.get::<_, String>(1)?})))?
             .collect::<Result<_, _>>()?;

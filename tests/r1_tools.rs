@@ -20,7 +20,7 @@ async fn every_tool_has_a_title_and_annotations() {
     let t = tempfile::tempdir().unwrap();
     let client = spawn(t.path()).await;
     let tools: Vec<Value> = client.list_all_tools().await.unwrap().iter().map(|t| serde_json::to_value(t).unwrap()).collect();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 15);
 
     // (name, title, readOnlyHint, destructiveHint, idempotentHint, openWorldHint); null = not set.
     let want = [
@@ -28,6 +28,8 @@ async fn every_tool_has_a_title_and_annotations() {
         ("symbia_find", "Find records", json!(true), Value::Null, Value::Null, json!(false)),
         ("symbia_get", "Get a record", json!(true), Value::Null, Value::Null, json!(false)),
         ("symbia_report", "Report", json!(true), Value::Null, Value::Null, json!(false)),
+        ("symbia_open", "Open a seal", json!(true), Value::Null, Value::Null, json!(false)),
+        ("symbia_promote", "Promote a seal", json!(false), json!(false), json!(true), json!(false)),
         ("symbia_fs_read", "Read a file", json!(true), Value::Null, Value::Null, json!(false)),
         ("symbia_fs_list", "List a folder", json!(true), Value::Null, Value::Null, json!(false)),
         ("symbia_fs_search", "Search files", json!(true), Value::Null, Value::Null, json!(false)),

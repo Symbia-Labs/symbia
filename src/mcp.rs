@@ -243,6 +243,28 @@ pub struct ReportArgs {
     pub by: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OpenArgs {
+    /// A sealed copy: under the data folder's seals/ or ledger/, or anywhere the file tools may read.
+    pub path: String,
+    /// Return this record in full instead of the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Newest records listed; default 20, at most 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PromoteArgs {
+    /// A sealed copy to promote; default: seal the open session now and promote that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<String>,
+    /// Do it. Without confirm this is a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SealArgs {
     /// Seal only this thread: other threads' records are withheld, leaving their chain rows and digests.
@@ -349,7 +371,8 @@ impl SymbiaServer {
             let mut st = stdio.lock().map_err(|_| "state lock poisoned")?;
             if !st.opened {
                 let me = crate::session::Holder::this_process(st.started_ms);
-                let (store, opened) = crate::session::open(&self.home, self.policy.resume_window_ms(), me).map_err(err)?;
+                let (mut store, opened) = crate::session::open(&self.home, self.policy.resume_window_ms(), me).map_err(err)?;
+                store.set_witness(self.policy.witness().map(Path::to_path_buf));
                 st.opened = true;
                 st.notice = Some(opened.notice(store.session()));
                 st.previous = opened.previous_session().map(String::from);
@@ -494,6 +517,184 @@ impl SymbiaServer {
             }
         }
         facts.retrieval = Some(retrieval);
+        Ok(reply.to_string())
+    }
+
+    /// A sealed copy the audit tools may read: under `$SYMBIA_HOME/seals` or `ledger`, or
+    /// anywhere the file tools may read.
+    fn sealed_path(&self, path: &str, facts: &mut Facts) -> Result<PathBuf, String> {
+        facts.path = Some(path.to_string());
+        let lex = self.policy.lexical_path(path)?;
+        if self.policy.in_own("seals", &lex) || self.policy.in_own("ledger", &lex) {
+            return Ok(lex);
+        }
+        self.policy.check(path, crate::policy::Access::Read)
+    }
+
+    /// Verify `path` against the pinned keys and, when one is configured, the witness.
+    fn verify_audited(&self, path: &Path) -> Result<(seal::Verified, Option<String>), String> {
+        let trusted: Vec<String> = crate::trust::load(&self.home).map_err(err)?.into_iter().map(|t| t.public_key).collect();
+        let v = seal::verify_trusted(path, &trusted)?;
+        let w = match self.policy.witness() {
+            Some(dir) => {
+                let entries = crate::witness::read(&crate::witness::file_of(dir)).map_err(err)?;
+                Some(crate::witness::check(path, &v.session, v.chain_seq, &entries)?.describe())
+            }
+            None => None,
+        };
+        Ok((v, w))
+    }
+
+    fn open_seal(&self, args: &OpenArgs, facts: &mut Facts) -> Result<String, String> {
+        let path = self.sealed_path(&args.path, facts)?;
+        let limit = args.limit.unwrap_or(20);
+        if limit > FIND_LIMIT_MAX {
+            return Err(format!("limit must be at most {FIND_LIMIT_MAX}"));
+        }
+        let (v, witness) = match self.verify_audited(&path) {
+            Ok(x) => x,
+            Err(reason) => {
+                facts.retrieval = Some(json!({"verified": false, "reason": reason}));
+                return Ok(json!({"verified": false, "reason": reason}).to_string());
+            }
+        };
+        let mut reply = json!({
+            "verified": true,
+            "session": v.session,
+            "chain_seq": v.chain_seq,
+            "head": &v.chain_head[..PREFIX],
+            "thread": v.thread,
+            "records": v.records,
+            "withheld": v.withheld,
+            "external_links": v.external.len(),
+        });
+        if let Some(w) = &witness {
+            reply["witness"] = w.as_str().into();
+        }
+        let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+        let mut retrieval = json!({"verified": true, "session": reply["session"], "chain_seq": v.chain_seq});
+        if let Some(id) = &args.id {
+            let rec = crate::store::get_in(&conn, id).map_err(err)?.ok_or("no such record in this seal")?;
+            retrieval["hits"] = json!([id]);
+            reply["record"] = rec;
+        } else {
+            let has_thread: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('chain') WHERE name = 'thread'", [], |r| r.get(0)).map_err(err)?;
+            let thread = if has_thread > 0 { "c.thread" } else { "'main'" };
+            let sql = format!(
+                "SELECT r.id, r.key, r.version, r.kind, r.lane, {thread}, c.seq FROM chain c JOIN records r ON r.id = c.record_id ORDER BY c.seq DESC LIMIT ?1"
+            );
+            let list: Vec<serde_json::Value> = conn
+                .prepare(&sql)
+                .map_err(err)?
+                .query_map([limit], |r| {
+                    Ok(json!({"id": r.get::<_, String>(0)?, "key": r.get::<_, String>(1)?, "version": r.get::<_, i64>(2)?, "kind": r.get::<_, String>(3)?,
+                              "lane": r.get::<_, String>(4)?, "thread": r.get::<_, Option<String>>(5)?, "seq": r.get::<_, i64>(6)?}))
+                })
+                .map_err(err)?
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            retrieval["hits"] = list.iter().map(|x| x["id"].clone()).collect::<Vec<_>>().into();
+            reply["list"] = list.into();
+        }
+        facts.retrieval = Some(retrieval);
+        Ok(reply.to_string())
+    }
+
+    fn promote(&self, args: &PromoteArgs, facts: &mut Facts) -> Result<String, String> {
+        let path = match &args.seal {
+            Some(p) => self.sealed_path(p, facts)?,
+            None => self.with_store(|s| seal::seal(s, &self.key).map(|x| x.path).map_err(err))?,
+        };
+        facts.path = Some(path.display().to_string());
+        let (v, witness) = self.verify_audited(&path)?;
+        if v.session == crate::store::LEDGER {
+            return Err("a seal of the ledger itself is not promoted".into());
+        }
+        let sc = seal::read_sidecar(&path).map_err(err)?;
+        let confirm = args.confirm.unwrap_or(false);
+        // A dry run only reads the ledger, and leaves it uncreated when there is none yet.
+        let exists = self.home.join("ledger").join("ledger.sqlite").exists();
+        let mut ledger = if confirm || exists { Some(Store::ledger(&self.home).map_err(err)?) } else { None };
+        if let Some(l) = ledger.as_mut() {
+            l.set_witness(self.policy.witness().map(Path::to_path_buf));
+        }
+        let key = format!("promotion.{}", v.session);
+        let (already, previous, previous_seq) = match &ledger {
+            Some(l) => {
+                let already: i64 = l
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM records WHERE kind = 'promotion' AND json_extract(json(body), '$.file_sha256') = ?1",
+                        [&sc.file_sha256],
+                        |r| r.get(0),
+                    )
+                    .map_err(err)?;
+                let previous = l.id_for_key(&key, None).map_err(err)?;
+                let previous_seq = match &previous {
+                    Some(id) => l.get(id).map_err(err)?.and_then(|r| r["body"]["chain_seq"].as_i64()),
+                    None => None,
+                };
+                (already, previous, previous_seq)
+            }
+            None => (0, None, None),
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or("seal file name is not UTF-8")?.to_string();
+        let mut reply = json!({
+            "seal": path.display().to_string(),
+            "session": v.session,
+            "chain_seq": v.chain_seq,
+            "records": v.records,
+            "withheld": v.withheld,
+            "already_promoted": already > 0,
+        });
+        if let Some(t) = &v.thread {
+            reply["thread"] = t.as_str().into();
+        }
+        if let Some(s) = previous_seq {
+            reply["supersedes"] = s.into();
+        }
+        if let Some(w) = &witness {
+            reply["witness"] = w.as_str().into();
+        }
+        let Some(mut ledger) = ledger.filter(|_| confirm && already == 0) else {
+            reply["promoted"] = false.into();
+            return Ok(reply.to_string());
+        };
+        let dest = self.home.join("ledger").join(&name);
+        if !dest.exists() {
+            std::fs::copy(&path, &dest).map_err(err)?;
+            std::fs::copy(seal::sidecar_path(&path), seal::sidecar_path(&dest)).map_err(err)?;
+        }
+        let mut body = json!({
+            "session": v.session,
+            "chain_seq": v.chain_seq,
+            "chain_head": sc.chain_head,
+            "file_sha256": sc.file_sha256,
+            "public_key": sc.public_key,
+            "records": v.records,
+            "withheld": v.withheld,
+            "file": format!("ledger/{name}"),
+        });
+        if let Some(t) = &v.thread {
+            body["thread"] = t.as_str().into();
+        }
+        let input = RecordInput {
+            key,
+            kind: "promotion".into(),
+            lane: "canonical".into(),
+            lane_reason: "a seal that verified against a pinned key, copied into the ledger".into(),
+            body,
+            model: self.model(),
+            est_host_ms: None,
+            est_chars: None,
+            links: previous.map(|to_id| vec![crate::record::LinkInput { to_id, rel: "supersedes".into() }]),
+        };
+        let w = ledger.write_in(&current_thread(), &input, Instant::now(), None, &[]).map_err(err)?;
+        let sealed = seal::seal_for(&ledger, &self.key, seal::Reason::Ledger).map_err(err)?;
+        reply["promoted"] = true.into();
+        reply["ledger_seq"] = w.seq.into();
+        reply["ledger_seal_verified"] = sealed.verified.into();
+        facts.retrieval = Some(json!({"promoted": true, "file_sha256": &sc.file_sha256[..PREFIX], "ledger_seq": w.seq}));
         Ok(reply.to_string())
     }
 
@@ -661,7 +862,8 @@ impl SymbiaServer {
                 }
             }
             None => {
-                let store = Store::create_for_mcp(&self.home, Some(id)).map_err(err)?;
+                let mut store = Store::create_for_mcp(&self.home, Some(id)).map_err(err)?;
+                store.set_witness(self.policy.witness().map(Path::to_path_buf));
                 sessions.insert(id, store.expires_ms().map_err(err)?.unwrap_or(i64::MAX));
                 sessions.track(&self.store);
                 sessions.track_jobs(&self.jobs);
@@ -750,6 +952,34 @@ impl SymbiaServer {
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
         let result = self.report(&args, &mut facts).await;
+        self.log(TOOL, &digest, started, &facts, result, &[])
+    }
+
+    #[tool(
+        title = "Open a seal",
+        annotations(title = "Open a seal", read_only_hint = true, open_world_hint = false),
+        description = "Open a sealed copy read-only: verify it against the pinned keys (and the witness, when one is configured), then list its newest records, or return one in full with id. Paths: the data folder's seals/ and ledger/, or anywhere the file tools may read. Returns {verified, reason?, session, chain_seq, head, thread, records, withheld, external_links, witness?, list | record}."
+    )]
+    pub async fn symbia_open(&self, Parameters(args): Parameters<OpenArgs>) -> Result<String, String> {
+        const TOOL: &str = "symbia_open";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let mut facts = Facts::default();
+        let result = self.open_seal(&args, &mut facts);
+        self.log(TOOL, &digest, started, &facts, result, &[])
+    }
+
+    #[tool(
+        title = "Promote a seal",
+        annotations(title = "Promote a seal", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        description = "Promote a verified seal into the long-lived ledger (ledger/ledger.sqlite): copy it to ledger/, write a promotion record that supersedes the session's earlier promotion, and seal the ledger. Default seal: seal the open session now. Dry run unless confirm is true. A file already promoted is left alone (already_promoted). Returns {seal, session, chain_seq, records, withheld, thread?, supersedes?, witness?, already_promoted, promoted, ledger_seq?}."
+    )]
+    pub async fn symbia_promote(&self, Parameters(args): Parameters<PromoteArgs>) -> Result<String, String> {
+        const TOOL: &str = "symbia_promote";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let mut facts = Facts::default();
+        let result = self.promote(&args, &mut facts);
         self.log(TOOL, &digest, started, &facts, result, &[])
     }
 
@@ -1437,8 +1667,10 @@ mod tests {
             for n in ["symbia_fs_read", "symbia_fs_list", "symbia_fs_search", "symbia_fs_write", "symbia_fs_edit", "symbia_exec", "symbia_job"] {
                 assert!(names.iter().any(|x| x == n), "missing {n}");
             }
-            assert_eq!(names.len(), 13);
-            assert!(names.iter().any(|x| x == "symbia_report"));
+            assert_eq!(names.len(), 15);
+            for n in ["symbia_report", "symbia_open", "symbia_promote"] {
+                assert!(names.iter().any(|x| x == n), "missing {n}");
+            }
         }
     }
 
@@ -1458,7 +1690,7 @@ mod tests {
     fn every_tool_takes_a_thread() {
         let (_t, s) = server();
         let tools = s.tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 15);
         for t in &tools {
             assert_eq!(t.input_schema["properties"]["thread"]["description"], THREAD_DOC, "{}", t.name);
         }
@@ -1601,6 +1833,101 @@ mod tests {
         assert_eq!(thread["records"], 1);
         let e = s.symbia_report(Parameters(ReportArgs { by: Some("week".into()), ..Default::default() })).await.unwrap_err();
         assert!(e.starts_with("by must be"), "{e}");
+    }
+
+    /// A stdio server in a fresh home with a witness folder beside it.
+    fn audited() -> (tempfile::TempDir, PathBuf, SymbiaServer) {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("sym");
+        let wdir = t.path().join("witness");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.json"), json!({"witness": wdir}).to_string()).unwrap();
+        let s = SymbiaServer::new(&home).unwrap();
+        (t, wdir, s)
+    }
+
+    #[tokio::test]
+    async fn open_reads_a_seal_and_checks_it() {
+        let (t, wdir, s) = audited();
+        let w: Value = serde_json::from_str(&s.symbia_record(Parameters(rec("a"))).await.unwrap()).unwrap();
+        CALL.scope(in_thread("chat"), s.symbia_record(Parameters(rec("b")))).await.unwrap();
+        let sealed: Value = serde_json::from_str(&s.symbia_seal(Parameters(SealArgs::default())).await.unwrap()).unwrap();
+        let path = sealed["path"].as_str().unwrap().to_string();
+        let open = |a: OpenArgs| s.symbia_open(Parameters(a));
+        let r: Value = serde_json::from_str(&open(OpenArgs { path: path.clone(), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!((r["verified"].as_bool(), r["chain_seq"].as_i64(), r["records"].as_i64()), (Some(true), Some(2), Some(2)), "{r}");
+        assert_eq!(r["witness"], "ok (1 entries)");
+        assert_eq!((r["list"][0]["key"].as_str(), r["list"][0]["thread"].as_str()), (Some("b"), Some("chat")));
+        let one: Value = serde_json::from_str(&open(OpenArgs { path: path.clone(), id: w["id"].as_str().map(String::from), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!(one["record"]["key"], "a");
+        // A thread seal opens too.
+        let ts: Value = serde_json::from_str(&s.symbia_seal(Parameters(SealArgs { in_thread: Some("chat".into()) })).await.unwrap()).unwrap();
+        let r: Value = serde_json::from_str(&open(OpenArgs { path: ts["path"].as_str().unwrap().into(), ..Default::default() }).await.unwrap()).unwrap();
+        // Withheld: record a and the two opens before it, which went in main.
+        assert_eq!((r["thread"].as_str(), r["records"].as_i64(), r["withheld"].as_i64()), (Some("chat"), Some(1), Some(3)), "{r}");
+        // Tampered: verified false with the reason, no records.
+        let bad = t.path().join("sym/seals/tampered.sqlite");
+        std::fs::copy(&path, &bad).unwrap();
+        std::fs::copy(seal::sidecar_path(Path::new(&path)), seal::sidecar_path(&bad)).unwrap();
+        rusqlite::Connection::open(&bad).unwrap().execute("UPDATE records SET lane = 'canonical'", []).unwrap();
+        let r: Value = serde_json::from_str(&open(OpenArgs { path: bad.display().to_string(), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!(r, json!({"verified": false, "reason": "file sha256 mismatch"}));
+        // Outside the seals and ledger folders and outside the roots: refused, and recorded.
+        let outside = tempfile::tempdir().unwrap();
+        let e = open(OpenArgs { path: outside.path().join("x.sqlite").display().to_string(), ..Default::default() }).await.unwrap_err();
+        assert!(e.contains("outside the allowed roots"), "{e}");
+        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|c| c["body"]["tool"] == "symbia_open").collect();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0]["body"]["retrieval"]["verified"], true);
+        assert!(wdir.join("witness.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn promote_copies_records_and_seals_the_ledger_once() {
+        let (t, wdir, s) = audited();
+        let home = t.path().join("sym");
+        s.symbia_record(Parameters(rec("a"))).await.unwrap();
+        let promote = |a: PromoteArgs| s.symbia_promote(Parameters(a));
+        let dry: Value = serde_json::from_str(&promote(PromoteArgs::default()).await.unwrap()).unwrap();
+        assert_eq!((dry["promoted"].as_bool(), dry["already_promoted"].as_bool(), dry["chain_seq"].as_i64()), (Some(false), Some(false), Some(1)), "{dry}");
+        assert!(!home.join("ledger/ledger.sqlite").exists(), "a dry run leaves no ledger file");
+        let seal_path = dry["seal"].as_str().unwrap().to_string();
+        let done: Value = serde_json::from_str(&promote(PromoteArgs { seal: Some(seal_path.clone()), confirm: Some(true) }).await.unwrap()).unwrap();
+        assert_eq!((done["promoted"].as_bool(), done["ledger_seq"].as_i64(), done["ledger_seal_verified"].as_bool()), (Some(true), Some(1), Some(true)), "{done}");
+        let name = Path::new(&seal_path).file_name().unwrap().to_owned();
+        assert!(home.join("ledger").join(&name).exists());
+        let ledger_seal = home.join("seals/ledger-1.sqlite");
+        assert!(seal::verify(&ledger_seal).is_ok());
+        let again: Value = serde_json::from_str(&promote(PromoteArgs { seal: Some(seal_path.clone()), confirm: Some(true) }).await.unwrap()).unwrap();
+        assert_eq!((again["promoted"].as_bool(), again["already_promoted"].as_bool()), (Some(false), Some(true)));
+        // A later seal of the same session supersedes the first promotion.
+        s.symbia_record(Parameters(rec("b"))).await.unwrap();
+        let later: Value = serde_json::from_str(&promote(PromoteArgs { confirm: Some(true), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!((later["supersedes"].as_i64(), later["ledger_seq"].as_i64()), (Some(1), Some(2)), "{later}");
+        let ledger = Store::ledger(&home).unwrap();
+        assert_eq!(ledger.retention().unwrap(), "ledger");
+        let rec2 = ledger.get(&ledger.id_for_key(&format!("promotion.{}", s.session_id().unwrap()), None).unwrap().unwrap()).unwrap().unwrap();
+        assert_eq!((rec2["version"].as_i64(), rec2["links"][0]["rel"].as_str(), rec2["kind"].as_str()), (Some(2), Some("supersedes"), Some("promotion")));
+        // The ledger's own seals are refused, and witnessed like any other.
+        let e = promote(PromoteArgs { seal: Some(ledger_seal.display().to_string()), confirm: Some(true) }).await.unwrap_err();
+        assert_eq!(e, "a seal of the ledger itself is not promoted");
+        let lines = crate::witness::read(&wdir.join("witness.jsonl")).unwrap();
+        assert!(lines.iter().any(|l| l.session == "ledger" && l.reason.as_deref() == Some("ledger")));
+        // The ledger is not a session: a new stdio server does not resume it.
+        let s2 = SymbiaServer::new(&home).unwrap();
+        assert_ne!(s2.session_id().unwrap(), "ledger");
+        // The promoted copy stays searchable after the original seals are gone.
+        for f in std::fs::read_dir(home.join("seals")).unwrap().flatten() {
+            if !f.file_name().to_string_lossy().starts_with("ledger") {
+                std::fs::remove_file(f.path()).unwrap();
+            }
+        }
+        std::fs::remove_file(home.join("sessions").join(format!("{}.sqlite", s.session_id().unwrap()))).ok();
+        let _ = std::fs::remove_file(home.join("index.sqlite"));
+        let mut ix = Index::open(&home).unwrap();
+        ix.refresh(crate::index::REFRESH_BUDGET).unwrap();
+        let n: i64 = ix.conn().query_row("SELECT COUNT(*) FROM docs WHERE key = 'a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -1843,7 +2170,8 @@ mod tests {
         for _ in 0..50 {
             s.symbia_fs_read(Parameters(FsReadArgs { path: "/etc/hosts".into(), offset: None, limit: None, full: None })).await.unwrap_err();
         }
-        assert_eq!(seal_seqs(t.path()), [50, 100]);
+        // The checkpoint at 100 holds everything the one at 50 did, which is pruned.
+        assert_eq!(seal_seqs(t.path()), [100]);
     }
 
     #[tokio::test]

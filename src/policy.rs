@@ -128,6 +128,8 @@ pub struct Config {
     pub exec_unsandboxed: Vec<crate::unsandboxed::RuleConfig>,
     /// Where vector search gets its embeddings.
     pub embed: Option<crate::embed::EmbedConfig>,
+    /// A folder outside the data directory where every seal is also written down.
+    pub witness: Option<String>,
 }
 
 impl Default for Config {
@@ -144,6 +146,7 @@ impl Default for Config {
             resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
             exec_unsandboxed: Vec::new(),
             embed: None,
+            witness: None,
         }
     }
 }
@@ -170,6 +173,7 @@ pub struct Policy {
     resume_window_ms: i64,
     unsandboxed: Vec<crate::unsandboxed::Rule>,
     embed: Option<crate::embed::EmbedSpec>,
+    witness: Option<PathBuf>,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -256,12 +260,24 @@ impl Policy {
             .map(|r| crate::unsandboxed::Rule::load(r, |p| expand(p, user_home)))
             .collect::<anyhow::Result<_>>()?;
         let embed = c.embed.as_ref().map(|e| crate::embed::EmbedSpec::load(e, |p| expand(p, user_home))).transpose()?;
+        let own = Spelled::new(symbia_home)?;
+        let witness = match &c.witness {
+            Some(w) => {
+                let lex = lexical(&expand(w, user_home)?);
+                let resolved = real(&lex).with_context(|| format!("resolve witness {w:?}"))?;
+                if own.holds(&lex) || own.holds(&resolved) || resolved.starts_with(&own.real) {
+                    anyhow::bail!("witness {w:?} is inside the data directory; it must live somewhere else");
+                }
+                Some(lex)
+            }
+            None => None,
+        };
         Ok(Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
             read_roots: spell(&c.read_roots)?,
             deny,
-            own: Spelled::new(symbia_home)?,
+            own,
             user_home: Spelled::new(user_home)?,
             network: c.exec_network,
             exec_read: c.exec_read,
@@ -273,7 +289,24 @@ impl Policy {
             resume_window_ms: c.resume_window_ms,
             unsandboxed,
             embed,
+            witness,
         })
+    }
+
+    /// The witness folder, if configured.
+    pub fn witness(&self) -> Option<&Path> {
+        self.witness.as_deref()
+    }
+
+    /// `p` with a leading `~` expanded and `.`/`..` resolved; it must be absolute.
+    pub fn lexical_path(&self, p: &str) -> Result<PathBuf, String> {
+        Ok(lexical(&expand(p, &self.user_home.lex).map_err(|e| e.to_string())?))
+    }
+
+    /// Whether `p` is inside `$SYMBIA_HOME/<sub>` (either spelling).
+    pub fn in_own(&self, sub: &str, p: &Path) -> bool {
+        let lex = lexical(p);
+        self.own.both().any(|o| lex.starts_with(o.join(sub)))
     }
 
     /// Where vector search gets its embeddings, if configured.
@@ -678,6 +711,25 @@ mod tests {
         assert_eq!(Policy::load(&sym, &user).unwrap().resume_window_ms(), 0);
         std::fs::write(sym.join("config.json"), r#"{"resume_window_ms": -1}"#).unwrap();
         assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[test]
+    fn witness_must_live_outside_the_data_directory() {
+        let (t, user, sym, p) = setup();
+        assert!(p.witness().is_none());
+        std::fs::write(sym.join("config.json"), r#"{"witness": "~/Witness"}"#).unwrap();
+        assert_eq!(Policy::load(&sym, &user).unwrap().witness(), Some(user.join("Witness").as_path()));
+        for bad in [sym.display().to_string(), sym.join("w").display().to_string()] {
+            std::fs::write(sym.join("config.json"), serde_json::json!({"witness": bad}).to_string()).unwrap();
+            assert!(Policy::load(&sym, &user).unwrap_err().to_string().contains("inside the data directory"), "{bad}");
+        }
+        // Through a symlink into the data directory is refused too.
+        std::os::unix::fs::symlink(&sym, t.path().join("link")).unwrap();
+        std::fs::write(sym.join("config.json"), serde_json::json!({"witness": t.path().join("link/w")}).to_string()).unwrap();
+        assert!(Policy::load(&sym, &user).is_err());
+        assert!(p.in_own("seals", &sym.join("seals/x.sqlite")));
+        assert!(!p.in_own("seals", &sym.join("sessions/x.sqlite")));
+        assert!(!p.in_own("seals", &sym.join("seals/../keys/x")));
     }
 
     #[cfg(unix)]

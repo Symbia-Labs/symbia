@@ -200,10 +200,11 @@ pub struct Index {
     home: PathBuf,
 }
 
-/// Session files and full seals under `home`; thread seals are subsets and are skipped.
+/// Session files, full seals and the ledger (its file and promoted copies) under `home`;
+/// thread seals are subsets and are skipped.
 fn source_files(home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in ["sessions", "seals"] {
+    for dir in ["sessions", "seals", "ledger"] {
         let Ok(entries) = std::fs::read_dir(home.join(dir)) else { continue };
         let mut files: Vec<PathBuf> = entries
             .flatten()

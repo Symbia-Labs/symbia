@@ -73,7 +73,7 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 | `symbia_exec` | Runs a shell command with a timeout (up to 1 hour) and saves its full output as evidence. A command still running after `yield_ms` (default 45 s) becomes a job: the call returns its id and output so far, and the command keeps running. `tail_bytes` sizes the output tails. |
 | `symbia_job` | Follows a job: `status`, `wait` (up to 50 s), `tail` or `kill` (the whole process group). Once it ends, gives the exit and evidence paths. |
 
-That is 13 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
+`symbia_open` and `symbia_promote` are described under Auditing. That is 15 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
 
 ## Threads
 
@@ -95,6 +95,16 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 ## Report
 
 `symbia_report` sums the open session, or with `scope: "all"` everything indexed, grouped by thread, tool, kind, model or UTC day. Each group gives the record and tool-call counts, the characters returned to the model, host time, errors, refusals, and how actual cost compared with the estimate where one was given. It also counts predictions: how many have a linked result, how many are still open, and the verdicts results gave. A result states its verdict as `"held": true|false`, or as a `"verdicts"` map of `"held"` and `"broke"`.
+
+## Auditing
+
+**Opening a seal.** `symbia_open` reads a sealed copy without changing it. It verifies the copy against your pinned keys and lists its newest records, or returns one in full. It reads seals in the data folder's `seals/` and `ledger/`, and anywhere else the file tools may read. A copy that fails verification comes back as `verified: false` with the reason, and no records.
+
+**The witness.** A seal proves what a session held when it was signed. On its own it can't show that a later part of the session was deleted, or that an older seal is being passed off as the latest. Set `{"witness": "~/Documents/Symbia Witness"}` and every seal also appends one line to `witness.jsonl` in that folder: the session, chain position, chain head, file hash, key and signature. The folder must be outside the data folder. It's most useful somewhere that leaves the machine, such as iCloud Drive or a git repository you push. `symbia verify <file> --witness <folder>` then checks that the file's chain matches every head the witness saw. A mismatch fails. A file older than the newest witnessed seal reports `behind`. `symbia_open` runs the same check when a witness is set.
+
+**The ledger.** `symbia_promote` copies a verified seal into `ledger/` and writes a `promotion` record into `ledger/ledger.sqlite`, a long-lived file with no expiry. The ledger is then sealed, so the ledger's own chain fixes which seals were promoted and in what order. It runs as a dry run unless `confirm` is true. Promoting the same file twice does nothing, and a newer seal of the same session supersedes the earlier promotion. Search reads `ledger/` too, so promoted records stay findable after their original seals are gone.
+
+**Pruning.** Each seal records why it was made: `explicit`, `prediction`, `checkpoint`, `exit` or `ledger`. Once a newer full seal of a session verifies, older `checkpoint` and `exit` seals of that session are deleted, because the newer one holds every record they did. Explicit, prediction and thread seals, and seals from builds that didn't record a reason, are kept. With a witness set, the deleted seals' heads and signatures remain in the witness file. The reason isn't covered by the signature: editing it can change what gets pruned, but not what a seal proves.
 
 ## Data and safety
 

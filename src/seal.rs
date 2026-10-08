@@ -26,7 +26,36 @@ pub struct Sidecar {
     /// Set on a thread seal only, so full-seal sidecars are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Why the seal was made: explicit, prediction, checkpoint, exit or ledger. Absent on seals
+    /// from builds before R10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+/// Why a seal is made. Checkpoint and exit seals are pruned once a newer full seal covers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    Explicit,
+    Prediction,
+    Checkpoint,
+    Exit,
+    Ledger,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Prediction => "prediction",
+            Self::Checkpoint => "checkpoint",
+            Self::Exit => "exit",
+            Self::Ledger => "ledger",
+        }
+    }
+}
+
+/// Reasons whose seals a newer full seal of the same session replaces.
+const PRUNABLE: [&str; 2] = ["checkpoint", "exit"];
 
 #[derive(Debug, Clone)]
 pub struct Sealed {
@@ -92,12 +121,23 @@ pub fn read_sidecar(sealed: &Path) -> anyhow::Result<Sidecar> {
 ///
 /// Sealing again at an unchanged chain seq returns the existing seal.
 pub fn seal(store: &Store, key: &SigningKey) -> anyhow::Result<Sealed> {
+    seal_for(store, key, Reason::Explicit)
+}
+
+/// As [`seal`], noting why. A new seal is written to the witness (when the store has one), and
+/// once it verifies, older checkpoint and exit seals of the same session are removed.
+pub fn seal_for(store: &Store, key: &SigningKey, reason: Reason) -> anyhow::Result<Sealed> {
     let conn = store.conn();
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     let (seq, _) = chain_head(conn)?;
     let path = store.home().join("seals").join(format!("{}-{seq}.sqlite", store.session()));
     if path.exists() {
-        if let Ok(sidecar) = read_sidecar(&path) {
+        if let Ok(mut sidecar) = read_sidecar(&path) {
+            // A seal asked for on purpose at the head of a checkpoint or exit seal keeps it from pruning.
+            if matches!(reason, Reason::Explicit | Reason::Prediction) && sidecar.reason.as_deref().is_some_and(|r| PRUNABLE.contains(&r)) {
+                sidecar.reason = Some(reason.as_str().into());
+                std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
+            }
             let verified = verify(&path).is_ok();
             return Ok(Sealed { path, sidecar, verified });
         }
@@ -127,10 +167,46 @@ pub fn seal(store: &Store, key: &SigningKey) -> anyhow::Result<Sealed> {
         signature: hex::encode(signature.to_bytes()),
         at_ms: now_ms(),
         thread: None,
+        reason: Some(reason.as_str().into()),
     };
     std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
     let verified = verify(&path).is_ok();
+    witness(store, &sidecar);
+    if verified {
+        prune_superseded(store.home(), store.session(), seq);
+    }
     Ok(Sealed { path, sidecar, verified })
+}
+
+/// Write a new seal to the store's witness folder; a failure goes to stderr.
+fn witness(store: &Store, sidecar: &Sidecar) {
+    if let Some(dir) = store.witness()
+        && let Err(e) = crate::witness::append(dir, &crate::witness::Entry::from_sidecar(sidecar))
+    {
+        eprintln!("symbia: witness write to {} failed: {e:#}", dir.display());
+    }
+}
+
+/// Remove full seals of `session` older than `seq` whose reason is checkpoint or exit. Explicit,
+/// prediction, thread and reason-less seals stay. Returns the files removed.
+pub fn prune_superseded(home: &Path, session: &str, seq: i64) -> Vec<PathBuf> {
+    let prefix = format!("{session}-");
+    let Ok(entries) = std::fs::read_dir(home.join("seals")) else { return Vec::new() };
+    let mut removed = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(n) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".sqlite")).and_then(|r| r.parse::<i64>().ok()) else { continue };
+        if n >= seq {
+            continue;
+        }
+        let prunable = read_sidecar(&path).ok().and_then(|s| s.reason).is_some_and(|r| PRUNABLE.contains(&r.as_str()));
+        if prunable && std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(sidecar_path(&path));
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 /// The format 2 row digest of record `rid`, read from `conn`, with `at_ms` from its chain row.
@@ -231,9 +307,11 @@ pub fn seal_thread(store: &Store, key: &SigningKey, thread: &str) -> anyhow::Res
         signature: hex::encode(signature.to_bytes()),
         at_ms: now_ms(),
         thread: Some(thread.to_string()),
+        reason: Some(Reason::Explicit.as_str().into()),
     };
     std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
     let verified = verify(&path).is_ok();
+    witness(store, &sidecar);
     Ok(ThreadSealed { sealed: Sealed { path, sidecar, verified }, records, withheld })
 }
 
@@ -244,7 +322,7 @@ pub fn seal_pending(store: &Store, key: &SigningKey) -> anyhow::Result<Option<Se
     if seq == 0 || last_seal(store.home(), store.session()).is_some_and(|(_, s)| s.chain_seq >= seq) {
         return Ok(None);
     }
-    seal(store, key).map(Some)
+    seal_for(store, key, Reason::Exit).map(Some)
 }
 
 /// Records written since the last seal that trigger a checkpoint seal.
@@ -257,7 +335,8 @@ pub fn checkpoint(store: &Store, key: &SigningKey, kind: &str) -> anyhow::Result
     let (seq, _) = store.head()?;
     let sealed = last_seal(store.home(), store.session()).map_or(0, |(_, s)| s.chain_seq);
     if seq > sealed && (kind == "prediction" || seq - sealed >= CHECKPOINT_RECORDS) {
-        return seal(store, key).map(Some);
+        let reason = if kind == "prediction" { Reason::Prediction } else { Reason::Checkpoint };
+        return seal_for(store, key, reason).map(Some);
     }
     Ok(None)
 }
@@ -996,6 +1075,123 @@ mod tests {
             resign(&copy, &key);
             assert_eq!(verify(&copy).unwrap_err(), "chain hash mismatch at seq 2", "{sql}");
         }
+    }
+
+    fn seal_files(home: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(home.join("seals"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".sqlite"))
+            .collect();
+        v.sort_by_key(|n| n.split('-').nth(2).and_then(|x| x.split('.').next()).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0));
+        v
+    }
+
+    #[test]
+    fn checkpoint_and_exit_seals_are_pruned_and_the_rest_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let sid = s.session().to_string();
+        let w = |s: &mut Store, k: &str| {
+            s.write(&input(k, json!(1)), Instant::now()).unwrap();
+        };
+        w(&mut s, "a");
+        let e1 = seal_for(&s, &key, Reason::Exit).unwrap();
+        assert_eq!(e1.sidecar.reason.as_deref(), Some("exit"));
+        w(&mut s, "b");
+        seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        // The checkpoint at seq 2 replaced the exit seal at seq 1.
+        assert_eq!(seal_files(t.path()), [format!("{sid}-2.sqlite")]);
+        w(&mut s, "c");
+        seal_for(&s, &key, Reason::Prediction).unwrap();
+        w(&mut s, "d");
+        seal(&s, &key).unwrap();
+        w(&mut s, "e");
+        seal_thread(&s, &key, "main").unwrap();
+        // A pre-R10 seal (no reason) is never pruned.
+        w(&mut s, "f");
+        let old = seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        let mut sc = old.sidecar.clone();
+        sc.reason = None;
+        std::fs::write(sidecar_path(&old.path), canonical(&sc).unwrap()).unwrap();
+        w(&mut s, "g");
+        let last = seal_for(&s, &key, Reason::Exit).unwrap();
+        assert!(last.verified);
+        let tag = &hex::encode(thread_sha256("main"))[..8];
+        assert_eq!(
+            seal_files(t.path()),
+            [format!("{sid}-3.sqlite"), format!("{sid}-4.sqlite"), format!("{sid}-5.thread-{tag}.sqlite"), format!("{sid}-6.sqlite"), format!("{sid}-7.sqlite")]
+        );
+        // Sidecars went with their files, and what remains verifies.
+        assert!(!sidecar_path(&e1.path).exists());
+        for f in seal_files(t.path()) {
+            assert!(verify(&t.path().join("seals").join(&f)).is_ok(), "{f}");
+        }
+        // Sealing explicitly at the head of an exit seal keeps it from later pruning.
+        let again = seal(&s, &key).unwrap();
+        assert_eq!((again.sidecar.chain_seq, again.sidecar.reason.as_deref()), (7, Some("explicit")));
+        assert!(verify(&again.path).is_ok(), "the reason is not signed, so rewriting it keeps the seal valid");
+    }
+
+    #[test]
+    fn every_seal_is_witnessed_and_checked() {
+        let t = tempfile::tempdir().unwrap();
+        let wdir = t.path().join("elsewhere/witness");
+        let home = t.path().join("sym");
+        let mut s = Store::create(&home).unwrap();
+        s.set_witness(Some(wdir.clone()));
+        let key = crate::keys::load_or_create(&home).unwrap();
+        s.write(&input("a", json!(1)), Instant::now()).unwrap();
+        let first = seal(&s, &key).unwrap();
+        s.write_in("chat", &input("b", json!(2)), Instant::now(), None, &[]).unwrap();
+        let ts = seal_thread(&s, &key, "chat").unwrap();
+        s.write(&input("c", json!(3)), Instant::now()).unwrap();
+        let second = seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        let entries = crate::witness::read(&wdir.join(crate::witness::FILE)).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], crate::witness::Entry::from_sidecar(&first.sidecar));
+        assert_eq!((entries[1].thread.as_deref(), entries[2].reason.as_deref()), (Some("chat"), Some("checkpoint")));
+        use crate::witness::{Check, check};
+        let sid = s.session().to_string();
+        assert_eq!(check(&second.path, &sid, 3, &entries), Ok(Check::Ok { entries: 3 }));
+        // The earlier seal is behind what the witness saw: a rollback, if offered as the latest.
+        assert_eq!(check(&first.path, &sid, 1, &entries), Ok(Check::Behind { entries: 1, seen_seq: 3 }));
+        assert_eq!(check(&ts.sealed.path, &sid, 2, &entries), Ok(Check::Behind { entries: 2, seen_seq: 3 }));
+        assert_eq!(check(&second.path, "other", 3, &entries), Ok(Check::NotWitnessed));
+        // Rewrite a record and its chain from there on, then re-sign: the file is consistent and
+        // verifies on its own, but the witness remembers the old heads.
+        let copy = t.path().join("rewritten.sqlite");
+        std::fs::copy(&second.path, &copy).unwrap();
+        std::fs::copy(sidecar_path(&second.path), sidecar_path(&copy)).unwrap();
+        {
+            let c = Connection::open(&copy).unwrap();
+            c.execute("UPDATE records SET lane_reason = 'rewritten' WHERE key = 'a'", []).unwrap();
+            let rows: Vec<(i64, String, i64, Option<String>)> =
+                c.prepare("SELECT seq, record_id, at_ms, thread FROM chain ORDER BY seq").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_, _>>().unwrap();
+            let mut prev = GENESIS;
+            for (seq, rid, at_ms, thread) in rows {
+                let d = stored_row_digest(&c, &rid, at_ms).unwrap();
+                let h = chain_hash_v3(&prev, &d, at_ms, &thread_sha256(thread.as_deref().unwrap()));
+                c.execute("UPDATE chain SET prev_hash = ?1, hash = ?2 WHERE seq = ?3", rusqlite::params![prev.as_slice(), h.as_slice(), seq]).unwrap();
+                prev = h;
+            }
+            let mut sc = read_sidecar(&copy).unwrap();
+            sc.chain_head = hex::encode(prev);
+            std::fs::write(sidecar_path(&copy), canonical(&sc).unwrap()).unwrap();
+        }
+        resign(&copy, &key);
+        assert!(verify(&copy).is_ok(), "re-signed with the device key, the rewrite is self-consistent");
+        assert_eq!(check(&copy, &sid, 3, &entries), Err("witness mismatch at seq 1".into()));
+    }
+
+    #[test]
+    fn old_sidecars_without_reason_still_parse() {
+        let (_t, path) = fixture("format2");
+        let sc = read_sidecar(&path).unwrap();
+        assert_eq!((sc.reason, sc.thread), (None, None));
+        assert!(verify(&path).is_ok());
     }
 
     #[test]

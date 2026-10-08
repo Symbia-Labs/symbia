@@ -51,12 +51,14 @@ async fn fifty_records_and_a_prediction_make_checkpoint_seals() {
     }
     assert_eq!(seals(t.path()).len(), 1);
     m.tool(51, "symbia_record", record("p", "prediction")).await.unwrap();
+    // The prediction's seal holds everything the checkpoint at 50 did, which is pruned (R10).
     let s = seals(t.path());
-    assert_eq!(s.len(), 2);
-    assert!(s.iter().all(|p| cli_verify(t.path(), p).0));
+    assert_eq!(s.len(), 1, "{s:?}");
+    assert!(s[0].to_string_lossy().ends_with("-51.sqlite"), "{s:?}");
+    assert!(cli_verify(t.path(), &s[0]).0);
     // Sealed at its head: EOF adds no seal.
     m.close().await;
-    assert_eq!(seals(t.path()).len(), 2);
+    assert_eq!(seals(t.path()).len(), 1);
 }
 
 #[tokio::test]

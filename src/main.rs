@@ -7,7 +7,7 @@ use rmcp::ServiceExt;
 
 const USAGE: &str = "usage: symbia mcp
        symbia serve [--listen 127.0.0.1:7341] [--allow-remote]
-       symbia verify <sealed.sqlite> [--trust <hex>]...
+       symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder or witness.jsonl>]
        symbia trust add <hex> <label>
        symbia trust list
        symbia --version";
@@ -22,7 +22,7 @@ fn main() -> ExitCode {
             None => usage(),
         },
         ["verify", rest @ ..] => match parse_verify(rest) {
-            Some((path, extra)) => run_verify(Path::new(path), &extra),
+            Some(v) => run_verify(Path::new(v.path), &v.trust, v.witness.map(Path::new)),
             None => usage(),
         },
         ["trust", "add", key, label] => report("symbia trust", trust_add(key, label)),
@@ -70,15 +70,26 @@ fn parse_serve(mut rest: &[&str]) -> Option<(String, bool)> {
     }
 }
 
-/// `<path>` plus any number of `--trust <hex>`, in any order.
-fn parse_verify<'a>(mut rest: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
+struct VerifyArgs<'a> {
+    path: &'a str,
+    trust: Vec<&'a str>,
+    witness: Option<&'a str>,
+}
+
+/// `<path>` plus any number of `--trust <hex>` and at most one `--witness <path>`, in any order.
+fn parse_verify<'a>(mut rest: &[&'a str]) -> Option<VerifyArgs<'a>> {
     let mut path = None;
-    let mut extra = Vec::new();
+    let mut trust = Vec::new();
+    let mut witness = None;
     loop {
         match rest {
-            [] => return path.map(|p| (p, extra)),
+            [] => return path.map(|path| VerifyArgs { path, trust, witness }),
             ["--trust", key, tail @ ..] => {
-                extra.push(*key);
+                trust.push(*key);
+                rest = tail;
+            }
+            ["--witness", w, tail @ ..] if witness.is_none() => {
+                witness = Some(*w);
                 rest = tail;
             }
             [p, tail @ ..] if path.is_none() && !p.starts_with("--") => {
@@ -155,8 +166,9 @@ fn run_serve(listen: String, remote: bool) -> anyhow::Result<()> {
     r
 }
 
-/// Exit 0 with `ok ...`, 1 with a one-line reason, or 2 for a bad `--trust` key.
-fn run_verify(path: &Path, extra: &[&str]) -> ExitCode {
+/// Exit 0 with `ok ...`, 1 with a one-line reason (a witness mismatch included), or 2 for a
+/// bad `--trust` key.
+fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
     let mut trusted = match symbia::home::from_env().and_then(|h| symbia::trust::load(&h)) {
         Ok(list) => list.into_iter().map(|t| t.public_key).collect::<Vec<_>>(),
         Err(e) => {
@@ -181,6 +193,22 @@ fn run_verify(path: &Path, extra: &[&str]) -> ExitCode {
             }
             for x in &v.external {
                 println!("external {} {} {} session {}", &x.from_id[..12], x.rel, &x.to_id[..x.to_id.len().min(12)], x.session);
+            }
+            if let Some(w) = witness {
+                let entries = match symbia::witness::read(&symbia::witness::file_of(w)) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("cannot read witness {}: {e:#}", w.display());
+                        return ExitCode::FAILURE;
+                    }
+                };
+                match symbia::witness::check(path, &v.session, v.chain_seq, &entries) {
+                    Ok(c) => println!("witness {}", c.describe()),
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
             ExitCode::SUCCESS
         }
