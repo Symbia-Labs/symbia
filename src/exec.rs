@@ -229,9 +229,15 @@ fn shell(policy: &Policy, _sandbox_exec: &Path, command: &str) -> Result<tokio::
     if policy.network() == Network::Deny {
         return Err("refused: exec_network \"deny\" needs the macOS sandbox".into());
     }
-    let mut c = tokio::process::Command::new("/bin/zsh");
+    let mut c = tokio::process::Command::new(linux_shell());
     c.arg("-lc").arg(command);
     Ok(c)
+}
+
+/// Off macOS, zsh is often missing (containers, CI): the first of zsh, bash, sh that exists.
+#[cfg(not(target_os = "macos"))]
+fn linux_shell() -> &'static str {
+    ["/bin/zsh", "/bin/bash", "/bin/sh"].into_iter().find(|s| Path::new(s).exists()).unwrap_or("/bin/sh")
 }
 
 /// What a finished command left behind: the reply and the two evidence streams.

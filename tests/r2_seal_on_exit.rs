@@ -4,7 +4,7 @@
 mod common;
 
 use common::stdio::{BIN, Mcp, seals};
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[tokio::test]
 async fn closing_stdin_seals_a_session_with_records() {
@@ -69,5 +69,5 @@ async fn exec_record_names_command_sandbox_and_network() {
     assert_eq!(s.len(), 1);
     let c = rusqlite::Connection::open_with_flags(&s[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let body: String = c.query_row("SELECT json(body) FROM records WHERE kind = 'tool_call'", [], |r| r.get(0)).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["command"], "echo 'it ran'");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["command"], "echo 'it ran'");
 }

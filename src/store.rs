@@ -120,7 +120,7 @@ pub fn find_elsewhere(home: &Path, own: &Path, id: &str) -> Option<String> {
             }
         }
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().find_map(|(_, p)| {
         let conn = Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
         conn.query_row("SELECT session FROM records WHERE id = ?1", [id], |r| r.get(0)).optional().ok()?
