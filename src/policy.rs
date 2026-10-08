@@ -126,6 +126,8 @@ pub struct Config {
     pub resume_window_ms: i64,
     /// Programs `symbia_exec` may run outside the sandbox when a call asks (`unsandboxed: true`).
     pub exec_unsandboxed: Vec<crate::unsandboxed::RuleConfig>,
+    /// Where vector search gets its embeddings.
+    pub embed: Option<crate::embed::EmbedConfig>,
 }
 
 impl Default for Config {
@@ -141,6 +143,7 @@ impl Default for Config {
             exec_unlock: Vec::new(),
             resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
             exec_unsandboxed: Vec::new(),
+            embed: None,
         }
     }
 }
@@ -166,6 +169,7 @@ pub struct Policy {
     unlocked: Vec<Spelled>,
     resume_window_ms: i64,
     unsandboxed: Vec<crate::unsandboxed::Rule>,
+    embed: Option<crate::embed::EmbedSpec>,
 }
 
 /// Resolve `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
@@ -251,6 +255,7 @@ impl Policy {
             .iter()
             .map(|r| crate::unsandboxed::Rule::load(r, |p| expand(p, user_home)))
             .collect::<anyhow::Result<_>>()?;
+        let embed = c.embed.as_ref().map(|e| crate::embed::EmbedSpec::load(e, |p| expand(p, user_home))).transpose()?;
         Ok(Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
@@ -267,7 +272,13 @@ impl Policy {
             unlocked,
             resume_window_ms: c.resume_window_ms,
             unsandboxed,
+            embed,
         })
+    }
+
+    /// Where vector search gets its embeddings, if configured.
+    pub fn embed(&self) -> Option<&crate::embed::EmbedSpec> {
+        self.embed.as_ref()
     }
 
     /// `exec_unsandboxed` rules, checked at load.

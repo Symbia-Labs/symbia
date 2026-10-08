@@ -32,7 +32,7 @@ globset = "=0.4.20"
 grep = "=0.4.1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
-hyper = { version = "=1.11.1", features = ["server", "http1"] }
+hyper = { version = "=1.11.1", features = ["server", "client", "http1"] }
 hyper-util = { version = "=0.1.20", features = ["tokio", "service"] }
 ignore = "=0.4.33"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }

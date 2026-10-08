@@ -68,6 +68,9 @@ pub struct Facts {
     pub action: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running: Option<bool>,
+    /// A search or report: what was asked and what came back (hit ids, not records).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<Value>,
     pub truncated: bool,
 }
 

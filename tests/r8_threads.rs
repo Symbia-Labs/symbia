@@ -39,21 +39,21 @@ async fn threads_over_stdio() {
     assert_eq!(call["body"]["client_meta_keys"], json!(["example/chat", "progressToken"]));
     assert!(!call.to_string().contains("c-1"));
 
-    // Seal chat-a: a1, a2 and the listing are kept; b1 and the refusal are withheld.
+    // Seal chat-a: a1, a2 and the listing are kept; b1, the refusal and three finds (recorded in main) are withheld.
     let s = m.tool(11, "symbia_seal", json!({"in_thread": "chat-a"})).await.unwrap();
-    assert_eq!((s["records"].as_i64(), s["withheld"].as_i64(), s["verified"].as_bool()), (Some(3), Some(2), Some(true)), "{s}");
+    assert_eq!((s["records"].as_i64(), s["withheld"].as_i64(), s["verified"].as_bool()), (Some(3), Some(5), Some(true)), "{s}");
     let path = s["path"].as_str().unwrap().to_string();
     let out = std::process::Command::new(BIN).args(["verify", &path]).env("SYMBIA_HOME", t.path()).output().unwrap();
     assert!(out.status.success(), "{out:?}");
     let line = String::from_utf8_lossy(&out.stdout);
-    assert!(line.trim_end().ends_with("thread chat-a: 3 records, 2 withheld"), "{line}");
+    assert!(line.trim_end().ends_with("thread chat-a: 3 records, 5 withheld"), "{line}");
     assert!(!std::fs::read(&path).unwrap().windows(15).any(|w| w == b"SECRET-r8-bravo"));
 
     // Every tool in the list takes `thread`.
     m.send(json!({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})).await;
     let l = m.reply(12).await;
     let tools = l["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
     for tool in tools {
         assert!(tool["inputSchema"]["properties"]["thread"].is_object(), "{}", tool["name"]);
     }

@@ -72,15 +72,16 @@ async fn a_restart_after_sigterm_resumes_the_session() {
     assert_eq!(body["resumes"], 1);
     b.close().await;
 
-    // One session file; the latest seal covers both processes' records and verifies.
+    // One session file; the latest seal covers both processes' records (the find's own record
+    // makes four) and verifies.
     let files = session_dir(t.path());
     assert!(files.iter().all(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&session)), "{files:?}");
     assert!(files.iter().all(|p| p.extension().is_none_or(|x| x != "lock")), "{files:?}");
     let latest = seals(t.path()).into_iter().max_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap()).unwrap();
-    assert!(latest.to_str().unwrap().ends_with(&format!("{session}-3.sqlite")), "{latest:?}");
+    assert!(latest.to_str().unwrap().ends_with(&format!("{session}-4.sqlite")), "{latest:?}");
     let out = cli_verify(t.path(), &latest);
     assert!(out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with(&format!("ok {session} seq 3 ")));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with(&format!("ok {session} seq 4 ")));
 }
 
 #[tokio::test]

@@ -42,6 +42,11 @@ pub struct Rule {
     pub cwd: Option<PathBuf>,
 }
 
+/// An executable regular file.
+pub fn is_executable(p: &Path) -> bool {
+    executable(p)
+}
+
 fn executable(p: &Path) -> bool {
     #[cfg(unix)]
     {

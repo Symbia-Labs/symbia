@@ -20,7 +20,9 @@ use serde_json::json;
 
 use crate::canon::{canonical, hex_prefix, sha256};
 use crate::files::{Facts, ReadOut, SEARCH_DEADLINE, SearchArgs};
+use crate::embed::Embedder;
 use crate::http::Sessions;
+use crate::index::Index;
 use crate::jobs::Jobs;
 use crate::policy::Policy;
 use crate::record::{MAIN_THREAD, RecordInput, check_thread};
@@ -51,6 +53,8 @@ pub struct SymbiaServer {
     jobs: Arc<Jobs>,
     /// Set over stdio, where the session is opened on the first tool call that needs it.
     stdio: Option<Arc<Mutex<Stdio>>>,
+    /// Embeddings for vector search, when `embed` is configured.
+    embedder: Option<Arc<Embedder>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -195,8 +199,14 @@ pub struct JobArgs {
     pub bytes: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FindArgs {
+    /// session (default): the open session. all: every session and full seal under the data folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Text to search by meaning (vector search); needs embed in config.json. With query too, the two rankings are fused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar: Option<String>,
     /// Full-text terms matched against key and body; all terms must match.
     #[serde(default)]
     pub query: Option<String>,
@@ -212,6 +222,25 @@ pub struct FindArgs {
     /// Only records in this thread.
     #[serde(default)]
     pub in_thread: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ReportArgs {
+    /// session (default) or all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Records at or after this time (UTC ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// Records before this time (UTC ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<i64>,
+    /// Only records in this thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_thread: Option<String>,
+    /// Group by thread (default), tool, kind, model or day (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -297,7 +326,8 @@ impl SymbiaServer {
         let store = Arc::new(Mutex::new(None));
         let client: Arc<Mutex<Option<String>>> = Arc::default();
         let jobs = Arc::new(Jobs::new(store.clone(), key.clone(), client.clone()));
-        Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, stdio, tool_router: Self::tool_router() }
+        let embedder = policy.embed().map(|e| Arc::new(Embedder::new(e.clone())));
+        Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, stdio, embedder, tool_router: Self::tool_router() }
     }
 
     /// Close the stdio session on exit: drop its store, which releases and deletes its lock.
@@ -345,8 +375,151 @@ impl SymbiaServer {
 
     /// Replace the path policy (tests).
     pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.embedder = policy.embed().map(|e| Arc::new(Embedder::new(e.clone())));
         self.policy = Arc::new(policy);
         self
+    }
+
+    /// The open session's id.
+    fn session_id(&self) -> Result<String, String> {
+        self.with_store(|s| Ok(s.session().to_string()))
+    }
+
+    /// Open the index and bring it up to date; true when the refresh ran out of time.
+    async fn index(&self) -> Result<(Index, bool), String> {
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Index, bool)> {
+            let mut ix = Index::open(&home)?;
+            let behind = ix.refresh(crate::index::REFRESH_BUDGET)?;
+            Ok((ix, behind))
+        })
+        .await
+        .map_err(err)?
+        .map_err(err)
+    }
+
+    async fn find(&self, args: &FindArgs, facts: &mut Facts) -> Result<String, String> {
+        if args.limit.is_some_and(|l| l > FIND_LIMIT_MAX) {
+            return Err(format!("limit must be at most {FIND_LIMIT_MAX}"));
+        }
+        let all = match args.scope.as_deref() {
+            None | Some("session") => false,
+            Some("all") => true,
+            Some(other) => return Err(format!("scope must be session or all, not {other:?}")),
+        };
+        let mut retrieval = json!({"scope": if all { "all" } else { "session" }});
+        if let Some(q) = &args.query {
+            retrieval["query"] = q.as_str().into();
+        }
+        if let Some(s) = &args.similar {
+            retrieval["similar"] = s.chars().take(200).collect::<String>().into();
+        }
+        for (k, v) in [("kind", &args.kind), ("lane", &args.lane), ("key_prefix", &args.key_prefix), ("in_thread", &args.in_thread)] {
+            if let Some(v) = v {
+                retrieval[k] = v.as_str().into();
+            }
+        }
+        facts.retrieval = Some(retrieval.clone());
+        if !all && args.similar.is_none() {
+            let q = FindQuery {
+                query: args.query.clone(),
+                kind: args.kind.clone(),
+                lane: args.lane.clone(),
+                key_prefix: args.key_prefix.clone(),
+                limit: args.limit,
+                thread: args.in_thread.clone(),
+            };
+            let hits = self.with_store(|store| store.find(&q).map_err(err))?;
+            retrieval["hits"] = hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>().into();
+            facts.retrieval = Some(retrieval);
+            return serde_json::to_string(&hits).map_err(err);
+        }
+        let embedder = match (&args.similar, &self.embedder) {
+            (Some(_), None) => return Err(crate::embed::NOT_CONFIGURED.into()),
+            (_, e) => e.clone(),
+        };
+        let limit = args.limit.unwrap_or(20).clamp(1, FIND_LIMIT_MAX);
+        let filter = crate::index::Filter {
+            session: if all { None } else { Some(self.session_id()?) },
+            kind: args.kind.clone(),
+            lane: args.lane.clone(),
+            key_prefix: args.key_prefix.clone(),
+            thread: args.in_thread.clone(),
+            ..Default::default()
+        };
+        let (mut ix, behind) = self.index().await?;
+        let text = match &args.query {
+            Some(q) => ix.search_text(q, &filter, limit).map_err(err)?,
+            None => Vec::new(),
+        };
+        let mut unembedded = 0;
+        let vector = match (&args.similar, embedder) {
+            (Some(similar), Some(e)) => {
+                let model = e.model_name();
+                let (todo, total) = ix.unembedded(&model, &filter, crate::embed::PER_CALL).map_err(err)?;
+                if !todo.is_empty() {
+                    let (docs, texts): (Vec<i64>, Vec<String>) = todo.into_iter().unzip();
+                    let vectors = e.embed(&texts).await?;
+                    ix.store_vectors(&model, &docs, &vectors).map_err(err)?;
+                    unembedded = total - i64::try_from(docs.len()).map_err(err)?;
+                }
+                let q = e.embed(std::slice::from_ref(similar)).await?.pop().ok_or("no vector for the query")?;
+                ix.search_vector(&q, &model, &filter, limit).map_err(err)?
+            }
+            _ => Vec::new(),
+        };
+        let hits = match (args.query.is_some(), args.similar.is_some()) {
+            (true, true) => crate::index::fuse(&text, &vector, limit as usize),
+            (false, true) => vector,
+            (true, false) => text,
+            (false, false) => ix.recent(&filter, limit).map_err(err)?,
+        };
+        let mut out: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::to_value(h).unwrap_or_default()).collect();
+        if !all {
+            for h in &mut out {
+                h.as_object_mut().map(|o| o.remove("session"));
+            }
+        }
+        retrieval["hits"] = hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>().into();
+        let mut reply = serde_json::Value::Array(out);
+        if behind || unembedded > 0 {
+            reply = json!({"hits": reply});
+            if behind {
+                reply["index_behind"] = true.into();
+                retrieval["index_behind"] = true.into();
+            }
+            if unembedded > 0 {
+                reply["unembedded"] = unembedded.into();
+                retrieval["unembedded"] = unembedded.into();
+            }
+        }
+        facts.retrieval = Some(retrieval);
+        Ok(reply.to_string())
+    }
+
+    async fn report(&self, args: &ReportArgs, facts: &mut Facts) -> Result<String, String> {
+        let all = match args.scope.as_deref() {
+            None | Some("session") => false,
+            Some("all") => true,
+            Some(other) => return Err(format!("scope must be session or all, not {other:?}")),
+        };
+        let by = crate::index::By::parse(args.by.as_deref())?;
+        facts.retrieval = Some(serde_json::to_value(args).map_err(err)?);
+        let filter = crate::index::Filter {
+            session: if all { None } else { Some(self.session_id()?) },
+            thread: args.in_thread.clone(),
+            since_ms: args.since_ms,
+            until_ms: args.until_ms,
+            ..Default::default()
+        };
+        let (ix, behind) = self.index().await?;
+        let mut r = ix.report(&filter, by).map_err(err)?;
+        r["scope"] = (if all { "all" } else { "session" }).into();
+        r["index_behind"] = behind.into();
+        if let Some(v) = facts.retrieval.as_mut() {
+            v["records"] = r["records"].clone();
+        }
+        Ok(r.to_string())
     }
 
     /// Seal the session if a record was written after its last seal (on exit). `None` when
@@ -555,18 +728,29 @@ impl SymbiaServer {
     #[tool(
         title = "Find records",
         annotations(title = "Find records", read_only_hint = true, open_world_hint = false),
-        description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]."
+        description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]. scope all searches every session and full seal, and each hit adds session and score. similar searches by meaning (needs embed in config.json); with query too, the rankings are fused. When the index is still catching up or vectors are pending, the reply is {hits, index_behind, unembedded}. Every find is recorded with its hit ids."
     )]
     pub async fn symbia_find(&self, Parameters(args): Parameters<FindArgs>) -> Result<String, String> {
-        if args.limit.is_some_and(|l| l > FIND_LIMIT_MAX) {
-            return Err(format!("limit must be at most {FIND_LIMIT_MAX}"));
-        }
-        self.with_store(|store| {
-            let hits = store
-                .find(&FindQuery { query: args.query, kind: args.kind, lane: args.lane, key_prefix: args.key_prefix, limit: args.limit, thread: args.in_thread })
-                .map_err(err)?;
-            serde_json::to_string(&hits).map_err(err)
-        })
+        const TOOL: &str = "symbia_find";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let mut facts = Facts::default();
+        let result = self.find(&args, &mut facts).await;
+        self.log(TOOL, &digest, started, &facts, result, &[])
+    }
+
+    #[tool(
+        title = "Report",
+        annotations(title = "Report", read_only_hint = true, open_world_hint = false),
+        description = "Report on the open session (or scope all: every session and full seal): records grouped by thread, tool, kind, model or day (UTC), each with tool calls, chars returned to the model, host ms, errors, refusals and estimate-to-actual ratios; and predictions: how many, how many have results, how many are open, verdicts held and broke. Filters: since_ms, until_ms, in_thread. Recorded like a find."
+    )]
+    pub async fn symbia_report(&self, Parameters(args): Parameters<ReportArgs>) -> Result<String, String> {
+        const TOOL: &str = "symbia_report";
+        let started = Instant::now();
+        let digest = self.begin(&args)?;
+        let mut facts = Facts::default();
+        let result = self.report(&args, &mut facts).await;
+        self.log(TOOL, &digest, started, &facts, result, &[])
     }
 
     #[tool(
@@ -810,6 +994,39 @@ impl SymbiaServer {
     }
 }
 
+/// Whether a property schema allows JSON type `t`, directly, in a type list, or in an `anyOf` branch.
+fn allows(schema: &serde_json::Value, t: &str) -> bool {
+    match &schema["type"] {
+        serde_json::Value::String(s) if s == t => return true,
+        serde_json::Value::Array(a) if a.iter().any(|x| x == t) => return true,
+        _ => {}
+    }
+    schema["anyOf"].as_array().is_some_and(|branches| branches.iter().any(|b| allows(b, t)))
+}
+
+/// A client holding an older tool list sends arguments it has no schema for as strings. Where the
+/// tool's schema wants a boolean or an integer and the string is exactly one, use the value.
+/// Anything else is left for the tool's own parsing to refuse.
+fn coerce_args(tool: &Tool, args: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(props) = tool.input_schema.get("properties").and_then(|p| p.as_object()) else { return };
+    for (name, value) in args.iter_mut() {
+        let (Some(schema), serde_json::Value::String(s)) = (props.get(name), &*value) else { continue };
+        if allows(schema, "string") {
+            continue;
+        }
+        let parsed = if allows(schema, "boolean") && (s == "true" || s == "false") {
+            Some(serde_json::Value::Bool(s == "true"))
+        } else if allows(schema, "integer") {
+            s.parse::<i64>().ok().map(serde_json::Value::from)
+        } else {
+            None
+        };
+        if let Some(v) = parsed {
+            *value = v;
+        }
+    }
+}
+
 /// Add `notice` to the reply's JSON object, or as a text block of its own when the reply has none.
 fn add_notice(res: &mut CallToolResult, notice: String) {
     for block in &mut res.content {
@@ -846,6 +1063,11 @@ impl ServerHandler for SymbiaServer {
         meta_keys.sort();
         if let Err(e) = check_thread(&thread) {
             return self.refuse_call(&request, e).into_call_tool_result();
+        }
+        if let Some(args) = request.arguments.as_mut()
+            && let Some(tool) = self.tool_router.list_all().into_iter().find(|t| t.name == request.name)
+        {
+            coerce_args(&tool, args);
         }
         let call = Call { thread, meta_keys };
         let r = CALL.scope(call, self.tool_router.call(ToolCallContext::new(self, request, context))).await;
@@ -1215,7 +1437,8 @@ mod tests {
             for n in ["symbia_fs_read", "symbia_fs_list", "symbia_fs_search", "symbia_fs_write", "symbia_fs_edit", "symbia_exec", "symbia_job"] {
                 assert!(names.iter().any(|x| x == n), "missing {n}");
             }
-            assert_eq!(names.len(), 12);
+            assert_eq!(names.len(), 13);
+            assert!(names.iter().any(|x| x == "symbia_report"));
         }
     }
 
@@ -1235,7 +1458,7 @@ mod tests {
     fn every_tool_takes_a_thread() {
         let (_t, s) = server();
         let tools = s.tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         for t in &tools {
             assert_eq!(t.input_schema["properties"]["thread"]["description"], THREAD_DOC, "{}", t.name);
         }
@@ -1297,6 +1520,104 @@ mod tests {
         let end = recs.iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
         let start = recs.iter().find(|r| r["key"] == "tool.symbia_exec").unwrap();
         assert_eq!((start["thread"].as_str(), end["thread"].as_str()), (Some("chat-j"), Some("chat-j")));
+    }
+
+    #[tokio::test]
+    async fn find_reaches_earlier_sessions_and_is_recorded() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("config.json"), r#"{"resume_window_ms": 0}"#).unwrap();
+        let earlier = {
+            let mut a = Store::create(t.path()).unwrap();
+            a.write(&RecordInput { body: json!({"text": "condensate trap stuck open"}), ..rec("boiler.note") }, Instant::now()).unwrap();
+            a.session().to_string()
+        };
+        let s = SymbiaServer::new(t.path()).unwrap();
+        s.symbia_record(Parameters(RecordInput { body: json!({"text": "pump replaced"}), ..rec("pump.note") })).await.unwrap();
+        assert_ne!(s.session_id().unwrap(), earlier);
+        let find = |a: FindArgs| s.symbia_find(Parameters(a));
+        // Session scope is today's search: nothing from the earlier session.
+        let here: Value = serde_json::from_str(&find(FindArgs { query: Some("condensate".into()), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!(here, json!([]));
+        let all: Value = serde_json::from_str(&find(FindArgs { query: Some("condensate trap".into()), scope: Some("all".into()), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!((all[0]["key"].as_str(), all[0]["session"].as_str()), (Some("boiler.note"), Some(earlier.as_str())));
+        assert!(all[0]["score"].as_f64().unwrap() > 0.0);
+        // Filters only, across everything: newest first.
+        let listed: Value = serde_json::from_str(&find(FindArgs { scope: Some("all".into()), key_prefix: Some("pump".into()), ..Default::default() }).await.unwrap()).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        let e = find(FindArgs { scope: Some("everything".into()), ..Default::default() }).await.unwrap_err();
+        assert_eq!(e, "scope must be session or all, not \"everything\"");
+        let e = find(FindArgs { similar: Some("leaky trap".into()), ..Default::default() }).await.unwrap_err();
+        assert_eq!(e, crate::embed::NOT_CONFIGURED);
+        // Every find is recorded with what it asked and the ids it returned, refusals included.
+        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|r| r["body"]["tool"] == "symbia_find").collect();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0]["body"]["retrieval"], json!({"scope": "session", "query": "condensate", "hits": []}));
+        assert_eq!(calls[1]["body"]["retrieval"]["hits"][0], all[0]["id"]);
+        assert_eq!(calls[4]["body"]["error"], crate::embed::NOT_CONFIGURED);
+        assert_eq!(calls[4]["body"]["retrieval"]["similar"], "leaky trap");
+    }
+
+    #[tokio::test]
+    async fn similar_embeds_pending_records_and_ranks_by_meaning() {
+        let (port, _) = crate::embed::fake::serve().await;
+        let t = tempfile::tempdir().unwrap();
+        let c = crate::policy::Config {
+            embed: Some(serde_json::from_value(json!({"url": format!("http://127.0.0.1:{port}/v1/embeddings"), "model": "fake-8"})).unwrap()),
+            ..Default::default()
+        };
+        let s = SymbiaServer::new(t.path()).unwrap().with_policy(Policy::with_config(&[t.path().to_path_buf()], t.path(), t.path(), &c).unwrap());
+        for (k, text) in [("a.note", "aaaa aaaa"), ("h.note", "hhhh hhhh"), ("mix", "abab")] {
+            s.symbia_record(Parameters(RecordInput { body: json!({"text": text}), ..rec(k) })).await.unwrap();
+        }
+        let r: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { similar: Some("aaa".into()), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(r[0]["key"], "a.note", "{r}");
+        assert!(r[0].get("session").is_none(), "session scope leaves out the session");
+        let stored: i64 = Index::open(t.path()).unwrap().conn().query_row("SELECT COUNT(*) FROM vectors WHERE model = 'fake-8'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, 3);
+        // Fused with a query: both lists agree on h.note.
+        let r: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { similar: Some("hhh".into()), query: Some("note".into()), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(r[0]["key"], "h.note", "{r}");
+    }
+
+    #[tokio::test]
+    async fn report_sums_the_session_and_reads_verdicts() {
+        let (_t, s) = server();
+        CALL.scope(in_thread("chat-a"), s.symbia_record(Parameters(rec("a")))).await.unwrap();
+        let p: Value = serde_json::from_str(&s.symbia_record(Parameters(RecordInput { kind: "prediction".into(), ..rec("p") })).await.unwrap()).unwrap();
+        let links = Some(vec![crate::record::LinkInput { to_id: p["id"].as_str().unwrap().into(), rel: "results_of".into() }]);
+        let body = json!({"verdicts": {"P1": "held", "P2": "broke"}});
+        s.symbia_record(Parameters(RecordInput { kind: "result".into(), body, links, ..rec("r") })).await.unwrap();
+        let r: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs::default())).await.unwrap()).unwrap();
+        assert_eq!((r["scope"].as_str(), r["records"].as_i64(), r["sessions"].as_i64()), (Some("session"), Some(3), Some(1)), "{r}");
+        assert_eq!((r["groups"][0]["group"].as_str(), r["groups"][0]["records"].as_i64()), (Some("main"), Some(2)));
+        assert_eq!(r["groups"][1]["group"], "chat-a");
+        assert_eq!(r["predictions"], json!({"records": 1, "with_results": 1, "open": 0, "held": 1, "broke": 1}));
+        assert_eq!(r["index_behind"], false);
+        // The report recorded itself; grouped by tool, it shows up.
+        let by_tool: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs { by: Some("tool".into()), ..Default::default() })).await.unwrap()).unwrap();
+        let g = by_tool["groups"].as_array().unwrap().iter().find(|g| g["group"] == "symbia_report").unwrap();
+        assert_eq!(g["tool_calls"], 1);
+        let thread: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs { in_thread: Some("chat-a".into()), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(thread["records"], 1);
+        let e = s.symbia_report(Parameters(ReportArgs { by: Some("week".into()), ..Default::default() })).await.unwrap_err();
+        assert!(e.starts_with("by must be"), "{e}");
+    }
+
+    #[test]
+    fn stale_clients_get_their_string_booleans_and_integers_read() {
+        let (_t, s) = server();
+        let exec = s.tools().into_iter().find(|t| t.name == "symbia_exec").unwrap();
+        let mut args = json!({"command": "true", "cwd": "/tmp", "unsandboxed": "true", "timeout_ms": "500", "yield_ms": "soon", "tail_bytes": 300})
+            .as_object()
+            .unwrap()
+            .clone();
+        coerce_args(&exec, &mut args);
+        assert_eq!(serde_json::Value::Object(args), json!({"command": "true", "cwd": "/tmp", "unsandboxed": true, "timeout_ms": 500, "yield_ms": "soon", "tail_bytes": 300}));
+        // A string field stays a string even when it reads as a boolean.
+        let read = s.tools().into_iter().find(|t| t.name == "symbia_fs_read").unwrap();
+        let mut args = json!({"path": "true", "full": "false", "offset": "12"}).as_object().unwrap().clone();
+        coerce_args(&read, &mut args);
+        assert_eq!(serde_json::Value::Object(args), json!({"path": "true", "full": false, "offset": 12}));
     }
 
     #[test]
@@ -1457,7 +1778,9 @@ mod tests {
     async fn find_rejects_limit_over_50() {
         let (_t, s) = server();
         assert!(s.symbia_find(Parameters(FindArgs { limit: Some(51), ..Default::default() })).await.is_err());
-        assert_eq!(s.symbia_find(Parameters(FindArgs { limit: Some(50), ..Default::default() })).await.unwrap(), "[]");
+        // The refused find is itself recorded, so it is the one record found.
+        let hits: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { limit: Some(50), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!((hits.as_array().unwrap().len(), hits[0]["key"].as_str()), (1, Some("tool.symbia_find")));
     }
 
     #[tokio::test]

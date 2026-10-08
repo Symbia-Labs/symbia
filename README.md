@@ -61,7 +61,8 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 | --- | --- |
 | `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes, and the previous session when it was not resumed; also the caller's thread, the threads written most recently, and a fresh thread name to adopt. |
 | `symbia_record` | Writes a typed record to the ledger and returns its id, version, seq and head. |
-| `symbia_find` | Finds records by full-text query, kind, lane, key prefix or thread. |
+| `symbia_find` | Finds records by full-text query, kind, lane, key prefix or thread, in the open session or (`scope: "all"`) in every session and seal; `similar` searches by meaning. |
+| `symbia_report` | Sums records by thread, tool, kind, model or day: tool calls, characters returned to the model, host time, errors and refusals, estimates against actuals, and predictions with their results and verdicts. |
 | `symbia_get` | Returns one full record with its links and thread, by id or by key and version. |
 | `symbia_seal` | Seals the session into a signed, verified copy under `seals/`, or with `in_thread` seals one thread. |
 | `symbia_fs_read` | Reads a text file with line numbers, up to 2,000 lines and 256 KB per call. PNG, JPEG, GIF, WebP, TIFF and BMP files (detected by their bytes) come back as an image: scaled to a 1,568 px long edge unless `full: true`, never over 8,000 px or 5 MB, TIFF and BMP as PNG. The image as sent is kept as evidence. Other binary files, HEIC and audio included, are refused. |
@@ -72,13 +73,28 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 | `symbia_exec` | Runs a shell command with a timeout (up to 1 hour) and saves its full output as evidence. A command still running after `yield_ms` (default 45 s) becomes a job: the call returns its id and output so far, and the command keeps running. `tail_bytes` sizes the output tails. |
 | `symbia_job` | Follows a job: `status`, `wait` (up to 50 s), `tail` or `kill` (the whole process group). Once it ends, gives the exit and evidence paths. |
 
-That is 12 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
+That is 13 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
 
 ## Threads
 
 Every chat in one Claude app shares one `symbia mcp` process, and so one session. A thread says which conversation or agent wrote a record. The caller names it: every tool takes an optional `thread` (1–64 characters from `A-Z a-z 0-9 . _ : -`), and a call without one goes in `main`. An agent should pick one name when it starts (`symbia_status` offers a fresh one as `new_thread`) and pass it on every call. Each record a call writes, its `tool_call` record and a job's end record included, carries that thread. The chain hash covers each row's thread, so a record can't be moved to another thread without breaking the chain.
 
 `symbia_seal` with `in_thread` seals one thread. The copy keeps that thread's records in full. For every other record it keeps only the chain row and the record's digest. It verifies against the same chain head as a full seal at the same point, so it proves the thread's records and where they fall among everything else, without showing what the other threads wrote. `symbia verify` prints the thread and the counts of kept and withheld records.
+
+## Search
+
+`symbia_find` searches the open session by default. With `scope: "all"` it searches every session file and full seal under the data folder, through an index kept at `index.sqlite`. The index covers each record's key and text, and for a command, the first 16 KB of its saved output. It is derived data: delete it whenever you like, and the next search rebuilds it. Each search catches it up for at most 2 seconds and says `index_behind` when there's more to read.
+
+`similar` searches by meaning. It needs embeddings from a model on your own machine, set in `config.json` one of two ways:
+
+- `{"embed": {"url": "http://127.0.0.1:8081/v1/embeddings", "model": "nomic-embed-text"}}` uses an OpenAI-style embeddings endpoint you run yourself. Only loopback addresses are accepted.
+- `{"embed": {"server": "/opt/homebrew/bin/llama-server", "model_path": "~/models/nomic-embed-text-v1.5.Q8_0.gguf"}}` has Symbia start llama.cpp's server on first use and stop it on exit.
+
+Records are embedded as searches need them, at most 256 per call; the reply says `unembedded` when some are still waiting. A search with both `query` and `similar` fuses the two rankings. Every find is recorded as a `tool_call`, with what it asked and the ids it returned.
+
+## Report
+
+`symbia_report` sums the open session, or with `scope: "all"` everything indexed, grouped by thread, tool, kind, model or UTC day. Each group gives the record and tool-call counts, the characters returned to the model, host time, errors, refusals, and how actual cost compared with the estimate where one was given. It also counts predictions: how many have a linked result, how many are still open, and the verdicts results gave. A result states its verdict as `"held": true|false`, or as a `"verdicts"` map of `"held"` and `"broke"`.
 
 ## Data and safety
 

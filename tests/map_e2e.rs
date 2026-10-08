@@ -103,7 +103,8 @@ async fn map_run_prediction_then_result() {
     assert_eq!(found, json!([{"id": pred_id, "key": "map.boiler.pressure", "version": 1, "kind": "prediction", "lane": "conditional", "thread": "main"}]));
 
     let status = call(&client, "symbia_status", json!({})).await.unwrap();
-    assert_eq!(status["seq"], 2);
+    // Two records and the find, which is recorded as a tool call.
+    assert_eq!(status["seq"], 3);
     assert_eq!(status["last_seal"]["chain_seq"], 2);
 
     client.cancel().await.unwrap();
