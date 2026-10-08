@@ -175,7 +175,10 @@ fn run_verify(path: &Path, extra: &[&str]) -> ExitCode {
     }
     match symbia::seal::verify_trusted(path, &trusted) {
         Ok(v) => {
-            println!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]);
+            match &v.thread {
+                Some(t) => println!("ok {} seq {} head {} thread {t}: {} records, {} withheld", v.session, v.chain_seq, &v.chain_head[..12], v.records, v.withheld),
+                None => println!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]),
+            }
             for x in &v.external {
                 println!("external {} {} {} session {}", &x.from_id[..12], x.rel, &x.to_id[..x.to_id.len().min(12)], x.session);
             }

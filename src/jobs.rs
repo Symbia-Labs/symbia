@@ -21,6 +21,8 @@ struct Entry {
     job: Arc<Job>,
     /// The `tool_call` record of the call that started it.
     start_id: String,
+    /// The starting call's thread; the end record goes there too.
+    thread: String,
     recorded: AtomicBool,
 }
 
@@ -47,9 +49,10 @@ impl Jobs {
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Track job `id`, started by the call recorded as `start_id`, and record its end when it ends.
-    pub fn insert(self: &Arc<Self>, id: &str, job: Arc<Job>, start_id: String) {
-        let entry = Arc::new(Entry { job, start_id, recorded: AtomicBool::new(false) });
+    /// Track job `id`, started by the call recorded as `start_id` in `thread`, and record its
+    /// end in the same thread when it ends.
+    pub fn insert(self: &Arc<Self>, id: &str, job: Arc<Job>, start_id: String, thread: String) {
+        let entry = Arc::new(Entry { job, start_id, thread, recorded: AtomicBool::new(false) });
         self.entries().insert(id.to_string(), entry.clone());
         let jobs = Arc::downgrade(self);
         let id = id.to_string();
@@ -130,7 +133,7 @@ impl Jobs {
         };
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         let Some(store) = slot.as_mut() else { return };
-        match store.write_with(&input, Instant::now(), None, &evidence) {
+        match store.write_in(&e.thread, &input, Instant::now(), None, &evidence) {
             Ok(_) => {
                 if let Err(err) = crate::seal::checkpoint(store, &self.key, &input.kind) {
                     eprintln!("symbia: checkpoint seal of {} failed: {err:#}", store.session());

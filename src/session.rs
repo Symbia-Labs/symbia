@@ -122,13 +122,16 @@ struct Facts {
     last_at_ms: Option<i64>,
     retention: String,
     expires_ms: Option<i64>,
+    /// `file_meta.format`; 1 for a file from before the column.
+    format: i64,
 }
 
 fn facts(path: &Path) -> Option<Facts> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
     let (rows, last_at_ms) = conn.query_row("SELECT COUNT(*), MAX(at_ms) FROM chain", [], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
     let (retention, expires_ms) = conn.query_row("SELECT retention, expires_ms FROM file_meta", [], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
-    Some(Facts { rows, last_at_ms, retention, expires_ms })
+    let format = conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0)).unwrap_or(1);
+    Some(Facts { rows, last_at_ms, retention, expires_ms, format })
 }
 
 /// Delete session files with no chain rows whose lock is free (left by duplicate starts).
@@ -161,6 +164,8 @@ pub enum NotResumed {
     Expired,
     Sealed,
     ResumeOff,
+    /// Written by an earlier build in an older file format, which this build doesn't extend.
+    OlderFormat,
 }
 
 impl NotResumed {
@@ -171,6 +176,7 @@ impl NotResumed {
             Self::Expired => "expired",
             Self::Sealed => "sealed",
             Self::ResumeOff => "resume off",
+            Self::OlderFormat => "older file format",
         }
     }
 }
@@ -219,6 +225,8 @@ pub fn open(home: &Path, resume_window_ms: i64, me: Holder) -> anyhow::Result<(S
             Some(NotResumed::ResumeOff)
         } else if f.retention != "session" {
             Some(NotResumed::Sealed)
+        } else if f.format != crate::record::FORMAT {
+            Some(NotResumed::OlderFormat)
         } else if f.expires_ms.is_some_and(|e| e <= now) {
             Some(NotResumed::Expired)
         } else if now - last_at > resume_window_ms {
@@ -368,6 +376,10 @@ mod tests {
         assert_eq!(why(RESUME_WINDOW_DEFAULT_MS), NotResumed::Expired);
         a.conn().execute("UPDATE file_meta SET retention = 'seal'", []).unwrap();
         assert_eq!(why(RESUME_WINDOW_DEFAULT_MS), NotResumed::Sealed);
+        // A file from an earlier build is left alone.
+        a.conn().execute("UPDATE file_meta SET retention = 'session', expires_ms = NULL, format = 2", []).unwrap();
+        assert_eq!(why(RESUME_WINDOW_DEFAULT_MS), NotResumed::OlderFormat);
+        assert_eq!(NotResumed::OlderFormat.as_str(), "older file format");
     }
 
     #[test]

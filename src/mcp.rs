@@ -11,7 +11,7 @@ use ed25519_dalek::SigningKey;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Extensions, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Extensions, ListToolsResult, PaginatedRequestParams, ProtocolVersion, Tool};
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -23,7 +23,7 @@ use crate::files::{Facts, ReadOut, SEARCH_DEADLINE, SearchArgs};
 use crate::http::Sessions;
 use crate::jobs::Jobs;
 use crate::policy::Policy;
-use crate::record::RecordInput;
+use crate::record::{MAIN_THREAD, RecordInput, check_thread};
 use crate::seal;
 use crate::store::{Evidence, FIND_LIMIT_MAX, FindQuery, Store};
 
@@ -209,6 +209,46 @@ pub struct FindArgs {
     /// At most 50; default 20.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Only records in this thread.
+    #[serde(default)]
+    pub in_thread: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SealArgs {
+    /// Seal only this thread: other threads' records are withheld, leaving their chain rows and digests.
+    #[serde(default)]
+    pub in_thread: Option<String>,
+}
+
+/// What `tools/list` says about the `thread` argument every tool takes.
+pub const THREAD_DOC: &str = "Name of the conversation or agent making this call (1-64 characters from A-Z a-z 0-9 . _ : -). Pass the same value on every call; default main.";
+
+tokio::task_local! {
+    /// The tool call being handled: its thread and the key names of its `_meta`.
+    static CALL: Call;
+}
+
+#[derive(Debug, Clone, Default)]
+struct Call {
+    thread: String,
+    meta_keys: Vec<String>,
+}
+
+/// The current call's thread; `main` outside a call.
+fn current_thread() -> String {
+    CALL.try_with(|c| c.thread.clone()).unwrap_or_else(|_| MAIN_THREAD.to_string())
+}
+
+fn current_meta_keys() -> Vec<String> {
+    CALL.try_with(|c| c.meta_keys.clone()).unwrap_or_default()
+}
+
+/// `t-` and 8 random hex digits: a thread name an agent can adopt.
+fn new_thread() -> Result<String, String> {
+    let mut r = [0u8; 4];
+    getrandom::fill(&mut r).map_err(err)?;
+    Ok(format!("t-{}", hex::encode(r)))
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -372,6 +412,11 @@ impl SymbiaServer {
         if let Err(e) = &result {
             body["error"] = e.as_str().into();
         }
+        let meta_keys = current_meta_keys();
+        if !meta_keys.is_empty() {
+            body["client_meta_keys"] = meta_keys.into();
+        }
+        let thread = current_thread();
         let input = RecordInput {
             key: format!("tool.{tool}"),
             kind: "tool_call".into(),
@@ -384,11 +429,31 @@ impl SymbiaServer {
             links: None,
         };
         let id = self.with_store(|s| {
-            let w = s.write_with(&input, started, Some(text.chars().count() + extra), evidence).map_err(err)?;
+            let w = s.write_in(&thread, &input, started, Some(text.chars().count() + extra), evidence).map_err(err)?;
             self.checkpoint(s, &input.kind);
             Ok(w.id)
         })?;
         result.map(|t| (t, id))
+    }
+
+    /// The tool list as served: every tool also takes `thread`.
+    pub fn tools(&self) -> Vec<Tool> {
+        let mut tools = self.tool_router.list_all();
+        for t in &mut tools {
+            let schema = Arc::make_mut(&mut t.input_schema);
+            let props = schema.entry("properties").or_insert_with(|| json!({}));
+            if let Some(p) = props.as_object_mut() {
+                p.insert("thread".into(), json!({"type": "string", "description": THREAD_DOC}));
+            }
+        }
+        tools
+    }
+
+    /// Refuse a call whose `thread` is invalid, recording the refusal in `main`.
+    fn refuse_call(&self, request: &CallToolRequestParams, error: String) -> Result<String, String> {
+        let digest = canonical(&request.arguments).map(|c| hex::encode(sha256(c.as_bytes()))).unwrap_or_default();
+        let tool = request.name.to_string();
+        self.log(&tool, &digest, Instant::now(), &Facts::default(), Err(error), &[])
     }
 
     /// Seal if a checkpoint is due after a write. A failure goes to stderr and never fails the write.
@@ -439,10 +504,11 @@ impl SymbiaServer {
     #[tool(
         title = "Session status",
         annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
-        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes after server restarts, and the previous session when it was not resumed."
+        description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes after server restarts, the previous session when it was not resumed, the caller's thread, the threads written most recently, and new_thread, a fresh thread name to adopt."
     )]
     pub async fn symbia_status(&self) -> Result<String, String> {
         let jobs = self.jobs.running();
+        let fresh = new_thread()?;
         self.with_store(|store| {
             let (seq, head) = store.head().map_err(err)?;
             let last = seal::last_seal(store.home(), store.session())
@@ -464,6 +530,9 @@ impl SymbiaServer {
                 "exec_unsandboxed": self.policy.exec_unsandboxed().iter().map(|r| r.describe()).collect::<Vec<_>>(),
                 "resumes": crate::session::resumes(store).map_err(err)?,
                 "previous_session": self.previous_session(),
+                "thread": current_thread(),
+                "threads": store.threads(20).map_err(err)?,
+                "new_thread": fresh,
             })
             .to_string())
         })
@@ -477,7 +546,7 @@ impl SymbiaServer {
     pub async fn symbia_record(&self, Parameters(args): Parameters<RecordInput>) -> Result<String, String> {
         let started = Instant::now();
         self.with_store(|store| {
-            let reply = store.write(&args, started).map_err(err)?.reply();
+            let reply = store.write_in(&current_thread(), &args, started, None, &[]).map_err(err)?.reply();
             self.checkpoint(store, &args.kind);
             Ok(reply)
         })
@@ -486,7 +555,7 @@ impl SymbiaServer {
     #[tool(
         title = "Find records",
         annotations(title = "Find records", read_only_hint = true, open_world_hint = false),
-        description = "Find records by full-text query, kind, lane or key prefix. Returns [{id, key, version, kind, lane}]."
+        description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]."
     )]
     pub async fn symbia_find(&self, Parameters(args): Parameters<FindArgs>) -> Result<String, String> {
         if args.limit.is_some_and(|l| l > FIND_LIMIT_MAX) {
@@ -494,7 +563,7 @@ impl SymbiaServer {
         }
         self.with_store(|store| {
             let hits = store
-                .find(&FindQuery { query: args.query, kind: args.kind, lane: args.lane, key_prefix: args.key_prefix, limit: args.limit })
+                .find(&FindQuery { query: args.query, kind: args.kind, lane: args.lane, key_prefix: args.key_prefix, limit: args.limit, thread: args.in_thread })
                 .map_err(err)?;
             serde_json::to_string(&hits).map_err(err)
         })
@@ -520,10 +589,23 @@ impl SymbiaServer {
     #[tool(
         title = "Seal the session",
         annotations(title = "Seal the session", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
-        description = "Seal the session: signed, verified copy under seals/. Returns {path, file_sha256, chain_seq, verified}."
+        description = "Seal the session: signed, verified copy under seals/. Returns {path, file_sha256, chain_seq, verified}. With in_thread, seal one thread: the copy keeps that thread's records and only the chain rows and digests of the others, and verifies against the same chain head. Returns {path, file_sha256, chain_seq, thread, records, withheld, verified}."
     )]
-    pub async fn symbia_seal(&self) -> Result<String, String> {
+    pub async fn symbia_seal(&self, Parameters(args): Parameters<SealArgs>) -> Result<String, String> {
         self.with_store(|store| {
+            if let Some(thread) = &args.in_thread {
+                let t = seal::seal_thread(store, &self.key, thread).map_err(err)?;
+                return Ok(json!({
+                    "path": t.sealed.path.display().to_string(),
+                    "file_sha256": &t.sealed.sidecar.file_sha256[..PREFIX],
+                    "chain_seq": t.sealed.sidecar.chain_seq,
+                    "thread": thread,
+                    "records": t.records,
+                    "withheld": t.withheld,
+                    "verified": t.sealed.verified,
+                })
+                .to_string());
+            }
             let s = seal::seal(store, &self.key).map_err(err)?;
             Ok(json!({
                 "path": s.path.display().to_string(),
@@ -664,7 +746,7 @@ impl SymbiaServer {
         reply.as_object_mut().map(|o| o.remove("duration_ms"));
         match self.log_sized(TOOL, &digest, started, &facts, Ok(reply.to_string()), 0, &[]) {
             Ok((text, start_id)) => {
-                self.jobs.insert(&id, job, start_id);
+                self.jobs.insert(&id, job, start_id, current_thread());
                 Ok(text)
             }
             Err(e) => {
@@ -753,7 +835,20 @@ impl ServerHandler for SymbiaServer {
         {
             *c = Some(info.client_info.name.clone());
         }
-        let r = self.tool_router.call(ToolCallContext::new(self, request, context)).await;
+        // `thread` belongs to the call, not the tool: take it out before the tool sees its arguments.
+        let mut request = request;
+        let thread = match request.arguments.as_mut().and_then(|a| a.remove("thread")) {
+            None | Some(serde_json::Value::Null) => MAIN_THREAD.to_string(),
+            Some(serde_json::Value::String(s)) => s,
+            Some(other) => other.to_string(),
+        };
+        let mut meta_keys: Vec<String> = context.meta.keys().cloned().collect();
+        meta_keys.sort();
+        if let Err(e) = check_thread(&thread) {
+            return self.refuse_call(&request, e).into_call_tool_result();
+        }
+        let call = Call { thread, meta_keys };
+        let r = CALL.scope(call, self.tool_router.call(ToolCallContext::new(self, request, context))).await;
         match r {
             Ok(CallToolResponse::Complete(mut res)) => {
                 if let Some(n) = self.take_notice() {
@@ -763,6 +858,10 @@ impl ServerHandler for SymbiaServer {
             }
             other => other,
         }
+    }
+
+    async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(self.tools()))
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -1133,6 +1232,74 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_takes_a_thread() {
+        let (_t, s) = server();
+        let tools = s.tools();
+        assert_eq!(tools.len(), 12);
+        for t in &tools {
+            assert_eq!(t.input_schema["properties"]["thread"]["description"], THREAD_DOC, "{}", t.name);
+        }
+    }
+
+    fn in_thread(thread: &str) -> Call {
+        Call { thread: thread.into(), meta_keys: vec!["progressToken".into()] }
+    }
+
+    #[tokio::test]
+    async fn records_and_tool_calls_land_in_the_callers_thread() {
+        let (_t, w, s) = rooted();
+        let r: Value = serde_json::from_str(&CALL.scope(in_thread("chat-a"), s.symbia_record(Parameters(rec("a")))).await.unwrap()).unwrap();
+        let got: Value = serde_json::from_str(&s.symbia_get(Parameters(GetArgs { id: r["id"].as_str().map(String::from), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(got["thread"], "chat-a");
+        // A file tool's record carries the thread and the `_meta` key names.
+        let f = w.path().join("x.txt");
+        std::fs::write(&f, "x").unwrap();
+        let read = FsReadArgs { path: f.display().to_string(), offset: None, limit: None, full: None };
+        CALL.scope(in_thread("chat-b"), s.symbia_fs_read(Parameters(read))).await.unwrap();
+        let calls = tool_calls(&s);
+        let last = calls.last().unwrap();
+        assert_eq!((last["thread"].as_str(), last["body"]["client_meta_keys"].clone()), (Some("chat-b"), json!(["progressToken"])));
+        // Outside a call: main, and no meta keys.
+        s.symbia_record(Parameters(rec("b"))).await.unwrap();
+        let found: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { in_thread: Some("main".into()), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!((found.as_array().unwrap().len(), found[0]["key"].as_str()), (1, Some("b")));
+        assert_eq!(found[0]["thread"], "main");
+        let st: Value = serde_json::from_str(&CALL.scope(in_thread("chat-a"), s.symbia_status()).await.unwrap()).unwrap();
+        assert_eq!(st["thread"], "chat-a");
+        let threads: Vec<&str> = st["threads"].as_array().unwrap().iter().map(|t| t["thread"].as_str().unwrap()).collect();
+        assert_eq!(threads, ["main", "chat-b", "chat-a"]);
+        let fresh = st["new_thread"].as_str().unwrap();
+        assert!(fresh.starts_with("t-") && fresh.len() == 10 && check_thread(fresh).is_ok(), "{fresh}");
+        assert_ne!(fresh, serde_json::from_str::<Value>(&s.symbia_status().await.unwrap()).unwrap()["new_thread"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn seal_tool_seals_one_thread() {
+        let (_t, s) = server();
+        CALL.scope(in_thread("chat-a"), s.symbia_record(Parameters(rec("a")))).await.unwrap();
+        s.symbia_record(Parameters(rec("b"))).await.unwrap();
+        let r: Value = serde_json::from_str(&s.symbia_seal(Parameters(SealArgs { in_thread: Some("chat-a".into()) })).await.unwrap()).unwrap();
+        assert_eq!((r["thread"].as_str(), r["records"].as_i64(), r["withheld"].as_i64(), r["verified"].as_bool()), (Some("chat-a"), Some(1), Some(1), Some(true)));
+        assert!(r["path"].as_str().unwrap().contains(".thread-"));
+        let e = s.symbia_seal(Parameters(SealArgs { in_thread: Some("nobody".into()) })).await.unwrap_err();
+        assert!(e.contains("has no records"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_jobs_end_record_takes_its_starts_thread() {
+        let (_t, w, s) = rooted();
+        let a = ExecArgs { yield_ms: Some(100), ..exec_args("sleep 1; echo done", w.path()) };
+        let r: Value = serde_json::from_str(&CALL.scope(in_thread("chat-j"), s.symbia_exec(Parameters(a))).await.unwrap()).unwrap();
+        let id = r["job"].as_str().unwrap().to_string();
+        // Waited on from outside the call: the end record still goes where the job started.
+        job_call(&s, &id, JobAction::Wait).await.unwrap();
+        let recs = all_records(&s);
+        let end = recs.iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
+        let start = recs.iter().find(|r| r["key"] == "tool.symbia_exec").unwrap();
+        assert_eq!((start["thread"].as_str(), end["thread"].as_str()), (Some("chat-j"), Some("chat-j")));
+    }
+
+    #[test]
     fn tool_schemas_inline_everything() {
         let (_t, s) = server();
         for tool in s.tool_router.list_all() {
@@ -1257,7 +1424,7 @@ mod tests {
         assert_eq!(v["public_key"].as_str().unwrap().len(), 12);
         assert!(v["file"].as_str().unwrap().starts_with(t.path().to_str().unwrap()));
         s.symbia_record(Parameters(rec("a"))).await.unwrap();
-        s.symbia_seal().await.unwrap();
+        s.symbia_seal(Parameters(SealArgs::default())).await.unwrap();
         let v: Value = serde_json::from_str(&s.symbia_status().await.unwrap()).unwrap();
         assert_eq!(v["seq"], 1);
         assert_eq!(v["last_seal"]["chain_seq"], 1);
@@ -1365,7 +1532,7 @@ mod tests {
         assert_eq!(reply.as_object().unwrap().len(), 4, "the reply is unchanged");
         assert_eq!(seal_seqs(t.path()), [2]);
         // Sealed at its head: neither an explicit seal nor the exit seal makes another.
-        s.symbia_seal().await.unwrap();
+        s.symbia_seal(Parameters(SealArgs::default())).await.unwrap();
         assert!(s.seal_pending().unwrap().is_none());
         assert_eq!(seal_seqs(t.path()), [2]);
     }

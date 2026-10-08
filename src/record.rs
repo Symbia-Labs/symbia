@@ -45,8 +45,35 @@ pub fn record_id(f: &IdFields) -> anyhow::Result<String> {
     Ok(hex::encode(sha256(canonical(&doc)?.as_bytes())))
 }
 
-/// Chain format written by this build. Format 1 chained only the record id.
-pub const FORMAT: i64 = 2;
+/// Chain format written by this build. Format 1 chained only the record id; format 2 chained
+/// the row digest; format 3 adds the thread's digest to each chain row.
+pub const FORMAT: i64 = 3;
+
+/// The thread a record goes in when the caller names none.
+pub const MAIN_THREAD: &str = "main";
+pub const THREAD_MAX: usize = 64;
+pub const THREAD_RULE: &str = "thread must be 1-64 characters from A-Z a-z 0-9 . _ : -";
+
+/// Check a thread name: 1 to 64 characters from `A-Z a-z 0-9 . _ : -`.
+pub fn check_thread(t: &str) -> Result<(), String> {
+    let ok = !t.is_empty() && t.len() <= THREAD_MAX && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    if ok { Ok(()) } else { Err(THREAD_RULE.into()) }
+}
+
+/// sha256 of a thread's UTF-8 name, as chained.
+pub fn thread_sha256(t: &str) -> [u8; 32] {
+    sha256(t.as_bytes())
+}
+
+/// Format 3: `sha256(prev_hash || row_digest || at_ms as 8-byte big-endian || thread_sha256)`.
+pub fn chain_hash_v3(prev_hash: &[u8; 32], row_digest: &[u8; 32], at_ms: i64, thread_sha256: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(104);
+    buf.extend_from_slice(prev_hash);
+    buf.extend_from_slice(row_digest);
+    buf.extend_from_slice(&at_ms.to_be_bytes());
+    buf.extend_from_slice(thread_sha256);
+    sha256(&buf)
+}
 
 /// The write-time fields a format 2 row digest covers.
 #[derive(Clone, Copy)]
@@ -337,6 +364,29 @@ mod tests {
         buf.extend_from_slice(&digest);
         buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0]);
         assert_eq!(chain_hash_v2(&[1u8; 32], &digest, 256), sha256(&buf));
+    }
+
+    #[test]
+    fn chain_hash_v3_layout() {
+        let digest = [7u8; 32];
+        let t = thread_sha256("a-1");
+        let mut buf = vec![1u8; 32];
+        buf.extend_from_slice(&digest);
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0]);
+        buf.extend_from_slice(&t);
+        assert_eq!(chain_hash_v3(&[1u8; 32], &digest, 256, &t), sha256(&buf));
+        assert_eq!(t, sha256(b"a-1"));
+        assert_ne!(chain_hash_v3(&[1u8; 32], &digest, 256, &thread_sha256("a-2")), sha256(&buf));
+    }
+
+    #[test]
+    fn thread_names() {
+        for ok in ["main", "t-0a1b2c3d", "chat.42:review_B", &"x".repeat(64)] {
+            assert!(check_thread(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", &"x".repeat(65), "a b", "a/b", "é", "a;b", "a\n"] {
+            assert_eq!(check_thread(bad).unwrap_err(), THREAD_RULE, "{bad:?}");
+        }
     }
 
     fn input() -> RecordInput {

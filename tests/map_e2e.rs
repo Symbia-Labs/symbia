@@ -100,7 +100,7 @@ async fn map_run_prediction_then_result() {
     assert!(p["at_ms"].as_i64().unwrap() <= r["at_ms"].as_i64().unwrap());
 
     let found = call(&client, "symbia_find", json!({"query": "pressure", "kind": "prediction"})).await.unwrap();
-    assert_eq!(found, json!([{"id": pred_id, "key": "map.boiler.pressure", "version": 1, "kind": "prediction", "lane": "conditional"}]));
+    assert_eq!(found, json!([{"id": pred_id, "key": "map.boiler.pressure", "version": 1, "kind": "prediction", "lane": "conditional", "thread": "main"}]));
 
     let status = call(&client, "symbia_status", json!({})).await.unwrap();
     assert_eq!(status["seq"], 2);

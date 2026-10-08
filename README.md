@@ -59,11 +59,11 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 
 | Tool | What it does |
 | --- | --- |
-| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes, and the previous session when it was not resumed. |
+| `symbia_status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes, and the previous session when it was not resumed; also the caller's thread, the threads written most recently, and a fresh thread name to adopt. |
 | `symbia_record` | Writes a typed record to the ledger and returns its id, version, seq and head. |
-| `symbia_find` | Finds records by full-text query, kind, lane or key prefix. |
-| `symbia_get` | Returns one full record with its links, by id or by key and version. |
-| `symbia_seal` | Seals the session into a signed, verified copy under `seals/`. |
+| `symbia_find` | Finds records by full-text query, kind, lane, key prefix or thread. |
+| `symbia_get` | Returns one full record with its links and thread, by id or by key and version. |
+| `symbia_seal` | Seals the session into a signed, verified copy under `seals/`, or with `in_thread` seals one thread. |
 | `symbia_fs_read` | Reads a text file with line numbers, up to 2,000 lines and 256 KB per call. PNG, JPEG, GIF, WebP, TIFF and BMP files (detected by their bytes) come back as an image: scaled to a 1,568 px long edge unless `full: true`, never over 8,000 px or 5 MB, TIFF and BMP as PNG. The image as sent is kept as evidence. Other binary files, HEIC and audio included, are refused. |
 | `symbia_fs_list` | Lists a folder to depth 1–5, up to 1,000 entries. |
 | `symbia_fs_search` | Searches files for a regex or literal, respecting `.gitignore`. |
@@ -73,6 +73,12 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 | `symbia_job` | Follows a job: `status`, `wait` (up to 50 s), `tail` or `kill` (the whole process group). Once it ends, gives the exit and evidence paths. |
 
 That is 12 tools. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
+
+## Threads
+
+Every chat in one Claude app shares one `symbia mcp` process, and so one session. A thread says which conversation or agent wrote a record. The caller names it: every tool takes an optional `thread` (1–64 characters from `A-Z a-z 0-9 . _ : -`), and a call without one goes in `main`. An agent should pick one name when it starts (`symbia_status` offers a fresh one as `new_thread`) and pass it on every call. Each record a call writes, its `tool_call` record and a job's end record included, carries that thread. The chain hash covers each row's thread, so a record can't be moved to another thread without breaking the chain.
+
+`symbia_seal` with `in_thread` seals one thread. The copy keeps that thread's records in full. For every other record it keeps only the chain row and the record's digest. It verifies against the same chain head as a full seal at the same point, so it proves the thread's records and where they fall among everything else, without showing what the other threads wrote. `symbia verify` prints the thread and the counts of kept and withheld records.
 
 ## Data and safety
 

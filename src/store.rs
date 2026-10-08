@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::canon::{canonical, hex_prefix};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, Link, RecordInput, RowFields, chain_hash_v2, record_id, row_digest};
+use crate::record::{FORMAT, GENESIS, IdFields, Link, MAIN_THREAD, RecordInput, RowFields, chain_hash_v3, check_thread, record_id, row_digest, thread_sha256};
 use crate::session::Lock;
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -17,8 +17,9 @@ pub const FIND_LIMIT_MAX: u32 = 50;
 const FIND_LIMIT_DEFAULT: u32 = 20;
 
 pub const SCHEMA: &str = "
-CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT, format INTEGER NOT NULL, mcp_session_id TEXT) STRICT;
-CREATE TABLE chain (seq INTEGER PRIMARY KEY, prev_hash BLOB NOT NULL, hash BLOB NOT NULL, at_ms INTEGER NOT NULL, record_id TEXT) STRICT;
+CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT, format INTEGER NOT NULL, mcp_session_id TEXT, thread TEXT) STRICT;
+CREATE TABLE chain (seq INTEGER PRIMARY KEY, prev_hash BLOB NOT NULL, hash BLOB NOT NULL, at_ms INTEGER NOT NULL, record_id TEXT,
+  thread TEXT, thread_sha256 BLOB NOT NULL, row_digest BLOB) STRICT;
 CREATE TABLE records (
   id TEXT PRIMARY KEY, key TEXT NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL,
   lane TEXT NOT NULL, lane_reason TEXT NOT NULL, body BLOB NOT NULL, model TEXT NOT NULL,
@@ -31,6 +32,7 @@ CREATE VIRTUAL TABLE records_fts USING fts5(id UNINDEXED, key, body);
 CREATE INDEX links_from ON links (from_id);
 CREATE INDEX links_to ON links (to_id);
 CREATE INDEX chain_record ON chain (record_id);
+CREATE INDEX chain_thread ON chain (thread);
 ";
 
 pub struct Store {
@@ -75,6 +77,8 @@ pub struct FindQuery {
     pub lane: Option<String>,
     pub key_prefix: Option<String>,
     pub limit: Option<u32>,
+    /// Only records in this thread.
+    pub thread: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -84,6 +88,15 @@ pub struct FindHit {
     pub version: i64,
     pub kind: String,
     pub lane: String,
+    pub thread: String,
+}
+
+/// One thread's share of a session: how many records it holds and its newest seq.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ThreadSummary {
+    pub thread: String,
+    pub records: i64,
+    pub last_seq: i64,
 }
 
 pub fn new_session_id(at_ms: i64) -> anyhow::Result<String> {
@@ -227,6 +240,12 @@ impl Store {
     /// that reply's length (`None` measures this write's own reply), and `evidence` rows are
     /// added in the same transaction.
     pub fn write_with(&mut self, input: &RecordInput, started: Instant, reply_chars: Option<usize>, evidence: &[Evidence]) -> anyhow::Result<Written> {
+        self.write_in(MAIN_THREAD, input, started, reply_chars, evidence)
+    }
+
+    /// As [`Store::write_with`], in `thread`.
+    pub fn write_in(&mut self, thread: &str, input: &RecordInput, started: Instant, reply_chars: Option<usize>, evidence: &[Evidence]) -> anyhow::Result<Written> {
+        check_thread(thread).map_err(anyhow::Error::msg)?;
         input.validate()?;
         let tx = self.conn.transaction()?;
         let version: i64 = tx.query_row("SELECT COALESCE(MAX(version), 0) + 1 FROM records WHERE key = ?1", [&input.key], |r| r.get(0))?;
@@ -271,7 +290,8 @@ impl Store {
             est_chars: input.est_chars,
             links: &links,
         })?;
-        let hash = chain_hash_v2(&prev_hash, &digest, at_ms);
+        let thread_digest = thread_sha256(thread);
+        let hash = chain_hash_v3(&prev_hash, &digest, at_ms, &thread_digest);
         let body_text = canonical(&input.body)?;
         tx.execute(
             "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, est_host_ms, est_chars)
@@ -293,8 +313,8 @@ impl Store {
             ],
         )?;
         tx.execute(
-            "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seq, prev_hash.as_slice(), hash.as_slice(), at_ms, id],
+            "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id, thread, thread_sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![seq, prev_hash.as_slice(), hash.as_slice(), at_ms, id, thread, thread_digest.as_slice()],
         )?;
         for (to_id, rel, to_session) in &links {
             tx.execute("INSERT INTO links (from_id, to_id, rel, to_session) VALUES (?1, ?2, ?3, ?4)", params![id, to_id, rel, to_session])?;
@@ -316,7 +336,7 @@ impl Store {
 
     pub fn find(&self, q: &FindQuery) -> anyhow::Result<Vec<FindHit>> {
         let limit = q.limit.unwrap_or(FIND_LIMIT_DEFAULT).clamp(1, FIND_LIMIT_MAX);
-        let mut sql = String::from("SELECT r.id, r.key, r.version, r.kind, r.lane FROM records r JOIN chain c ON c.record_id = r.id");
+        let mut sql = String::from("SELECT r.id, r.key, r.version, r.kind, r.lane, c.thread FROM records r JOIN chain c ON c.record_id = r.id");
         let mut args: Vec<Box<dyn ToSql>> = Vec::new();
         let fts = q.query.as_deref().and_then(fts_query);
         if fts.is_some() {
@@ -340,13 +360,26 @@ impl Store {
             args.push(Box::new(p.clone()));
             args.push(Box::new(p.clone()));
         }
+        if let Some(t) = &q.thread {
+            sql.push_str(" AND c.thread = ?");
+            args.push(Box::new(t.clone()));
+        }
         sql.push_str(if fts.is_some() { " ORDER BY records_fts.rank, c.seq DESC" } else { " ORDER BY c.seq DESC" });
         sql.push_str(" LIMIT ?");
         args.push(Box::new(limit));
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            Ok(FindHit { id: r.get(0)?, key: r.get(1)?, version: r.get(2)?, kind: r.get(3)?, lane: r.get(4)? })
+            Ok(FindHit { id: r.get(0)?, key: r.get(1)?, version: r.get(2)?, kind: r.get(3)?, lane: r.get(4)?, thread: r.get(5)? })
         })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Threads by newest write first, at most `limit`.
+    pub fn threads(&self, limit: u32) -> anyhow::Result<Vec<ThreadSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread, COUNT(*), MAX(seq) FROM chain WHERE thread IS NOT NULL GROUP BY thread ORDER BY MAX(seq) DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| Ok(ThreadSummary { thread: r.get(0)?, records: r.get(1)?, last_seq: r.get(2)? }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -365,7 +398,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT r.id, r.key, r.version, r.kind, r.lane, r.lane_reason, json(r.body), r.model, r.session, r.at_ms, r.expires_ms,
-                        r.est_host_ms, r.est_chars, r.host_ms, r.chars, c.seq
+                        r.est_host_ms, r.est_chars, r.host_ms, r.chars, c.seq, c.thread
                  FROM records r LEFT JOIN chain c ON c.record_id = r.id WHERE r.id = ?1",
                 [id],
                 |r| {
@@ -387,6 +420,7 @@ impl Store {
                             "host_ms": r.get::<_, Option<i64>>(13)?,
                             "chars": r.get::<_, Option<i64>>(14)?,
                             "seq": r.get::<_, Option<i64>>(15)?,
+                            "thread": r.get::<_, Option<String>>(16)?,
                         }),
                         body,
                     ))
@@ -448,7 +482,7 @@ mod tests {
         assert!(s.path().starts_with(s.home().join("sessions")));
         assert_eq!(s.path().file_name().unwrap().to_str().unwrap(), format!("{}.sqlite", s.session()));
         let format: i64 = s.conn().query_row("SELECT format FROM file_meta", [], |r| r.get(0)).unwrap();
-        assert_eq!(format, 2);
+        assert_eq!(format, 3);
         assert_eq!(s.expires_ms().unwrap(), Some(exp));
         assert_eq!(s.mcp_session_id().unwrap(), None);
     }
@@ -528,7 +562,7 @@ mod tests {
             links: &[],
         })
         .unwrap();
-        assert_eq!(rows[0].2, chain_hash_v2(&GENESIS, &digest, rows[0].3).to_vec());
+        assert_eq!(rows[0].2, chain_hash_v3(&GENESIS, &digest, rows[0].3, &thread_sha256("main")).to_vec());
         assert_eq!(rows[1].1, rows[0].2);
         assert_eq!(rows[1].4, w2.id);
         assert_eq!(hex_prefix(&rows[1].2, 12), w2.head);
@@ -660,5 +694,34 @@ mod tests {
     fn get_missing_is_none() {
         let (_t, s) = store();
         assert!(s.get("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn writes_carry_their_thread() {
+        let (_t, mut s) = store();
+        let a = s.write_in("chat-a", &input("x", "observation", json!(1)), Instant::now(), None, &[]).unwrap();
+        let m = s.write(&input("y", "observation", json!(2)), Instant::now()).unwrap();
+        let b = s.write_in("chat-b", &input("z", "observation", json!(3)), Instant::now(), None, &[]).unwrap();
+        let a2 = s.write_in("chat-a", &input("x", "observation", json!(4)), Instant::now(), None, &[]).unwrap();
+        let row = |seq: i64| -> (String, Vec<u8>, Option<Vec<u8>>) {
+            s.conn().query_row("SELECT thread, thread_sha256, row_digest FROM chain WHERE seq = ?1", [seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        assert_eq!(row(1), ("chat-a".to_string(), thread_sha256("chat-a").to_vec(), None));
+        assert_eq!(row(2).0, "main");
+        assert_eq!(s.get(&b.id).unwrap().unwrap()["thread"], "chat-b");
+        assert_eq!(s.get(&m.id).unwrap().unwrap()["thread"], "main");
+        let ids = |t: &str| s.find(&FindQuery { thread: Some(t.into()), ..Default::default() }).unwrap().into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(ids("chat-a"), vec![a2.id.clone(), a.id.clone()]);
+        assert_eq!(ids("chat-b"), vec![b.id.clone()]);
+        assert!(ids("nobody").is_empty());
+        assert_eq!(s.find(&FindQuery::default()).unwrap()[0].thread, "chat-a");
+        let sums = s.threads(20).unwrap();
+        let got: Vec<(&str, i64, i64)> = sums.iter().map(|t| (t.thread.as_str(), t.records, t.last_seq)).collect();
+        assert_eq!(got, [("chat-a", 2, 4), ("chat-b", 1, 3), ("main", 1, 2)]);
+        assert_eq!(s.threads(1).unwrap().len(), 1);
+        // A bad name is refused before anything is written.
+        let e = s.write_in("a b", &input("w", "observation", json!(0)), Instant::now(), None, &[]).unwrap_err();
+        assert_eq!(e.to_string(), crate::record::THREAD_RULE);
+        assert_eq!(s.head().unwrap().0, 4);
     }
 }

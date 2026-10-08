@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::canon::{canonical, sha256};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, Link, RowFields, chain_hash, chain_hash_v2, record_id, row_digest};
+use crate::record::{FORMAT, GENESIS, IdFields, Link, RowFields, chain_hash, chain_hash_v2, chain_hash_v3, check_thread, record_id, row_digest, thread_sha256};
 use crate::store::{Store, chain_head};
 
 /// The `.seal.json` sidecar. Byte fields are lowercase hex.
@@ -23,6 +23,9 @@ pub struct Sidecar {
     pub public_key: String,
     pub signature: String,
     pub at_ms: i64,
+    /// Set on a thread seal only, so full-seal sidecars are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +35,16 @@ pub struct Sealed {
     pub verified: bool,
 }
 
+/// A thread seal and what it holds.
+#[derive(Debug, Clone)]
+pub struct ThreadSealed {
+    pub sealed: Sealed,
+    /// Records of the thread kept in the copy.
+    pub records: i64,
+    /// Chain rows of other threads whose records were withheld.
+    pub withheld: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
     pub session: String,
@@ -39,6 +52,12 @@ pub struct Verified {
     pub chain_head: String,
     /// Links to records in other sessions: hashed with the row, target not checked here.
     pub external: Vec<External>,
+    /// The thread a thread seal covers; `None` for a full seal.
+    pub thread: Option<String>,
+    /// Records present in the file.
+    pub records: i64,
+    /// Chain rows whose records a thread seal withheld.
+    pub withheld: i64,
 }
 
 /// A link whose target lives in another session.
@@ -107,10 +126,115 @@ pub fn seal(store: &Store, key: &SigningKey) -> anyhow::Result<Sealed> {
         public_key: hex::encode(key.verifying_key().to_bytes()),
         signature: hex::encode(signature.to_bytes()),
         at_ms: now_ms(),
+        thread: None,
     };
     std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
     let verified = verify(&path).is_ok();
     Ok(Sealed { path, sidecar, verified })
+}
+
+/// The format 2 row digest of record `rid`, read from `conn`, with `at_ms` from its chain row.
+fn stored_row_digest(conn: &Connection, rid: &str, at_ms: i64) -> anyhow::Result<[u8; 32]> {
+    type Row = (String, i64, String, String, String, String, String, String, Option<i64>, Option<i64>, Option<i64>);
+    let r: Row = conn.query_row(
+        "SELECT key, version, kind, lane, lane_reason, json(body), model, session, expires_ms, est_host_ms, est_chars FROM records WHERE id = ?1",
+        [rid],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+    )?;
+    let links: Vec<Link> = conn
+        .prepare("SELECT to_id, rel, to_session FROM links WHERE from_id = ?1")?
+        .query_map([rid], |l| Ok((l.get(0)?, l.get(1)?, l.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let body: Value = serde_json::from_str(&r.5)?;
+    row_digest(&RowFields {
+        id: rid,
+        key: &r.0,
+        version: r.1,
+        kind: &r.2,
+        lane: &r.3,
+        lane_reason: &r.4,
+        body: &body,
+        model: &r.6,
+        session: &r.7,
+        at_ms,
+        expires_ms: r.8,
+        est_host_ms: r.9,
+        est_chars: r.10,
+        links: &links,
+    })
+}
+
+/// `seals/<session>-<seq>.thread-<first 8 hex of the thread's sha256>.sqlite`.
+pub fn thread_seal_path(store: &Store, seq: i64, thread: &str) -> PathBuf {
+    let tag = &hex::encode(thread_sha256(thread))[..8];
+    store.home().join("seals").join(format!("{}-{seq}.thread-{tag}.sqlite", store.session()))
+}
+
+/// Seal one thread: a copy of the whole chain in which every other thread's records are
+/// withheld, leaving only their chain rows and row digests. The copy proves the thread's
+/// records and their place in the chain; its head is the full chain's head at the same seq.
+pub fn seal_thread(store: &Store, key: &SigningKey, thread: &str) -> anyhow::Result<ThreadSealed> {
+    check_thread(thread).map_err(anyhow::Error::msg)?;
+    let conn = store.conn();
+    let format = file_format(conn)?;
+    anyhow::ensure!(format >= 3, "this session predates threads (file format {format})");
+    let records: i64 = conn.query_row("SELECT COUNT(*) FROM chain WHERE thread = ?1", [thread], |r| r.get(0))?;
+    anyhow::ensure!(records > 0, "thread {thread} has no records");
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let (seq, head) = chain_head(conn)?;
+    let path = thread_seal_path(store, seq, thread);
+    if path.exists() {
+        if let Ok(sidecar) = read_sidecar(&path) {
+            let v = verify(&path);
+            let withheld = v.as_ref().map_or(0, |v| v.withheld);
+            return Ok(ThreadSealed { sealed: Sealed { path, sidecar, verified: v.is_ok() }, records, withheld });
+        }
+        std::fs::remove_file(&path)?;
+    }
+    let path_str = path.to_str().context("seal path is not UTF-8")?;
+    conn.execute("VACUUM INTO ?1", [path_str])?;
+
+    let withheld = {
+        let copy = Connection::open(&path)?;
+        copy.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))?;
+        let others: Vec<(i64, String, i64)> = copy
+            .prepare("SELECT seq, record_id, at_ms FROM chain WHERE thread IS NOT ?1 AND record_id IS NOT NULL ORDER BY seq")?
+            .query_map([thread], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        for (row_seq, rid, at_ms) in &others {
+            let digest = stored_row_digest(&copy, rid, *at_ms)?;
+            copy.execute("UPDATE chain SET row_digest = ?1, thread = NULL WHERE seq = ?2", rusqlite::params![digest.as_slice(), row_seq])?;
+        }
+        let gone = "(SELECT record_id FROM chain WHERE thread IS NULL AND record_id IS NOT NULL)";
+        copy.execute(&format!("DELETE FROM links WHERE from_id IN {gone}"), [])?;
+        copy.execute(&format!("DELETE FROM records_fts WHERE id IN {gone}"), [])?;
+        copy.execute(&format!("DELETE FROM records WHERE id IN {gone}"), [])?;
+        copy.execute("DELETE FROM evidence WHERE NOT EXISTS (SELECT 1 FROM records r WHERE instr(json(r.body), lower(hex(evidence.sha256))) > 0)", [])?;
+        // Merge the full-text index so withheld text is not left in old segments.
+        copy.execute("INSERT INTO records_fts (records_fts) VALUES ('optimize')", [])?;
+        copy.execute("UPDATE file_meta SET retention = 'seal', thread = ?1", [thread])?;
+        // Drop the deleted content from free pages.
+        copy.execute_batch("VACUUM")?;
+        let (copy_seq, copy_head) = chain_head(&copy)?;
+        anyhow::ensure!(copy_seq == seq && copy_head == head, "chain moved during seal");
+        copy.close().map_err(|(_, e)| e)?;
+        i64::try_from(others.len())?
+    };
+    let file_sha = sha256(&std::fs::read(&path)?);
+    let signature = key.sign(&signed_message(&file_sha, &head));
+    let sidecar = Sidecar {
+        session: store.session().to_string(),
+        file_sha256: hex::encode(file_sha),
+        chain_head: hex::encode(head),
+        chain_seq: seq,
+        public_key: hex::encode(key.verifying_key().to_bytes()),
+        signature: hex::encode(signature.to_bytes()),
+        at_ms: now_ms(),
+        thread: Some(thread.to_string()),
+    };
+    std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
+    let verified = verify(&path).is_ok();
+    Ok(ThreadSealed { sealed: Sealed { path, sidecar, verified }, records, withheld })
 }
 
 /// Seal `store` if a record was written after its last seal. `None` for an empty session
@@ -228,7 +352,20 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         return Err(format!("unknown file format {format}"));
     }
 
-    let mut chain = conn.prepare("SELECT seq, prev_hash, hash, at_ms, record_id FROM chain ORDER BY seq").map_err(db)?;
+    // Format 3 adds the thread columns; a thread seal names its thread in file_meta.
+    let scope: Option<String> = if format >= 3 { conn.query_row("SELECT thread FROM file_meta", [], |r| r.get(0)).map_err(db)? } else { None };
+    if scope != sc.thread {
+        return Err("sidecar thread does not match the file".into());
+    }
+    if let Some(t) = &scope {
+        check_thread(t)?;
+    }
+    let chain_sql = if format >= 3 {
+        "SELECT seq, prev_hash, hash, at_ms, record_id, thread, thread_sha256, row_digest FROM chain ORDER BY seq"
+    } else {
+        "SELECT seq, prev_hash, hash, at_ms, record_id, NULL, NULL, NULL FROM chain ORDER BY seq"
+    };
+    let mut chain = conn.prepare(chain_sql).map_err(db)?;
     let mut rec = conn
         .prepare(
             "SELECT key, version, kind, lane, lane_reason, json(body), model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars
@@ -247,14 +384,24 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
     let mut external = Vec::new();
     let rows = chain
         .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
+            Ok(ChainRow {
+                seq: r.get(0)?,
+                prev_hash: r.get(1)?,
+                hash: r.get(2)?,
+                at_ms: r.get(3)?,
+                record_id: r.get(4)?,
+                thread: r.get(5)?,
+                thread_sha256: r.get(6)?,
+                row_digest: r.get(7)?,
+            })
         })
         .map_err(db)?;
     let mut prev = GENESIS;
     let mut seq_expected = 1i64;
     let mut on_chain = 0i64;
+    let mut withheld = 0i64;
     for row in rows {
-        let (seq, prev_hash, hash, at_ms, rid) = row.map_err(db)?;
+        let ChainRow { seq, prev_hash, hash, at_ms, record_id: rid, thread, thread_sha256: thread_digest, row_digest: stored_digest } = row.map_err(db)?;
         if seq != seq_expected {
             return Err(format!("chain seq gap at {seq_expected}"));
         }
@@ -274,7 +421,10 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
             seq_expected += 1;
             continue;
         };
-        on_chain += 1;
+        let tsha: Option<[u8; 32]> = match (format >= 3, thread_digest) {
+            (false, _) => None,
+            (true, d) => Some(d.and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).ok_or_else(|| format!("chain thread digest malformed at seq {seq}"))?),
+        };
         let r = rec
             .query_row([&rid], |r| {
                 Ok(StoredRow {
@@ -297,8 +447,43 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
             .optional()
             .map_err(db)?;
         let Some(r) = r else {
-            return Err(format!("record missing at seq {seq}"));
+            // Only a thread seal withholds records, and never one of its own thread.
+            let (Some(scope), Some(tsha)) = (&scope, tsha) else {
+                return Err(format!("record missing at seq {seq}"));
+            };
+            if thread.is_some() {
+                return Err(format!("withheld row names its thread at seq {seq}"));
+            }
+            if tsha == thread_sha256(scope) {
+                return Err(format!("a record of thread {scope} was withheld at seq {seq}"));
+            }
+            let digest = stored_digest
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(|| format!("withheld row has no digest at seq {seq}"))?;
+            let computed = chain_hash_v3(&prev, &digest, at_ms, &tsha);
+            if hash != computed {
+                return Err(format!("chain hash mismatch at seq {seq}"));
+            }
+            withheld += 1;
+            prev = computed;
+            seq_expected += 1;
+            continue;
         };
+        on_chain += 1;
+        if let Some(tsha) = tsha {
+            let t = thread.as_deref().ok_or_else(|| format!("chain row without thread at seq {seq}"))?;
+            if thread_sha256(t) != tsha {
+                return Err(format!("thread digest mismatch at seq {seq}"));
+            }
+            if let Some(scope) = &scope
+                && t != scope
+            {
+                return Err(format!("record of thread {t} in a seal of thread {scope} at seq {seq}"));
+            }
+            if stored_digest.is_some() {
+                return Err(format!("row digest stored beside its record at seq {seq}"));
+            }
+        }
         let body: Value = serde_json::from_str(&r.body).map_err(|_| format!("record body unreadable at seq {seq}"))?;
         let id = record_id(&IdFields {
             key: &r.key,
@@ -341,7 +526,10 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
                 links: &row_links,
             })
             .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
-            chain_hash_v2(&prev, &digest, at_ms)
+            match tsha {
+                Some(t) => chain_hash_v3(&prev, &digest, at_ms, &t),
+                None => chain_hash_v2(&prev, &digest, at_ms),
+            }
         };
         if hash != computed {
             return Err(format!("chain hash mismatch at seq {seq}"));
@@ -375,7 +563,19 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
     if prev != want_head {
         return Err("chain head mismatch".into());
     }
-    Ok(Verified { session: sc.session, chain_seq: last_seq, chain_head: sc.chain_head, external })
+    Ok(Verified { session: sc.session, chain_seq: last_seq, chain_head: sc.chain_head, external, thread: scope, records: on_chain, withheld })
+}
+
+/// One chain row as read for verification; the last three columns are format 3 only.
+struct ChainRow {
+    seq: i64,
+    prev_hash: Vec<u8>,
+    hash: Vec<u8>,
+    at_ms: i64,
+    record_id: Option<String>,
+    thread: Option<String>,
+    thread_sha256: Option<Vec<u8>>,
+    row_digest: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -569,7 +769,7 @@ mod tests {
             ("UPDATE records SET host_ms = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
             ("UPDATE records SET chars = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
             ("INSERT INTO links (from_id, to_id, rel) VALUES ('x', 'y', 'cites')", "1 link(s) not on the chain"),
-            ("UPDATE file_meta SET format = 3", "unknown file format 3"),
+            ("UPDATE file_meta SET format = 4", "unknown file format 4"),
         ];
         for (sql, want) in cases {
             let f = fx();
@@ -582,12 +782,140 @@ mod tests {
 
     /// A seal written by the part 1 build: no `format` column, chain over record ids only.
     fn format1_fixture() -> (tempfile::TempDir, PathBuf) {
+        fixture("format1")
+    }
+
+    /// `tests/fixtures/<name>.sqlite` and its sidecar, copied to a temp dir.
+    fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let dst = t.path().join("format1.sqlite");
-        std::fs::copy(src.join("format1.sqlite"), &dst).unwrap();
-        std::fs::copy(src.join("format1.seal.json"), sidecar_path(&dst)).unwrap();
+        let dst = t.path().join(format!("{name}.sqlite"));
+        std::fs::copy(src.join(format!("{name}.sqlite")), &dst).unwrap();
+        std::fs::copy(src.join(format!("{name}.seal.json")), sidecar_path(&dst)).unwrap();
         (t, dst)
+    }
+
+    #[test]
+    fn format2_seal_still_verifies() {
+        // Written by the R7 binary: three records, a resume record and one link.
+        let (_t, path) = fixture("format2");
+        let c = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(file_format(&c).unwrap(), 2);
+        let v = verify(&path).unwrap();
+        assert_eq!((v.chain_seq, v.records, v.withheld, v.thread), (4, 4, 0, None));
+    }
+
+    const SECRET: &str = "SECRET-b-4f1e-withheld";
+
+    /// Threads `a` and `b` interleaved, then one record in `main`. `b` holds a secret; `a2`
+    /// links to `b1` and cites evidence of its own.
+    fn threaded() -> (tempfile::TempDir, Store, SigningKey) {
+        use crate::store::Evidence;
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let now = Instant::now;
+        let a1 = s.write_in("a", &input("a1", json!({"text": "alpha one"})), now(), None, &[]).unwrap();
+        let ev_b = Evidence { sha256: [0xab; 32], bytes: 3, media: "text/plain" };
+        let b1 = s.write_in("b", &input("b1", json!({"text": SECRET, "stdout_sha256": hex::encode([0xab; 32])})), now(), None, &[ev_b]).unwrap();
+        let ev_a = Evidence { sha256: [0xcd; 32], bytes: 4, media: "text/plain" };
+        let mut a2 = input("a2", json!({"stdout_sha256": hex::encode([0xcd; 32])}));
+        a2.links = Some(vec![LinkInput { to_id: b1.id, rel: "cites".into() }, LinkInput { to_id: a1.id, rel: "revises".into() }]);
+        s.write_in("a", &a2, now(), None, &[ev_a]).unwrap();
+        s.write_in("b", &input("b2", json!({"text": SECRET})), now(), None, &[]).unwrap();
+        s.write(&input("m", json!(1)), now()).unwrap();
+        (t, s, key)
+    }
+
+    fn contains(path: &Path, needle: &str) -> bool {
+        std::fs::read(path).unwrap().windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    #[test]
+    fn thread_seal_keeps_one_thread_and_withholds_the_rest() {
+        let (_t, s, key) = threaded();
+        let full = seal(&s, &key).unwrap();
+        let ts = seal_thread(&s, &key, "a").unwrap();
+        assert!(ts.sealed.verified);
+        assert_eq!((ts.records, ts.withheld), (2, 3));
+        // Same head as the full chain at the same seq.
+        assert_eq!((ts.sealed.sidecar.chain_seq, &ts.sealed.sidecar.chain_head), (5, &full.sidecar.chain_head));
+        assert_eq!(ts.sealed.sidecar.thread.as_deref(), Some("a"));
+        let tag = &hex::encode(thread_sha256("a"))[..8];
+        assert_eq!(ts.sealed.path, s.home().join("seals").join(format!("{}-5.thread-{tag}.sqlite", s.session())));
+        let v = verify(&ts.sealed.path).unwrap();
+        assert_eq!((v.thread.as_deref(), v.records, v.withheld), (Some("a"), 2, 3));
+        let vf = verify(&full.path).unwrap();
+        assert_eq!((vf.thread, vf.records, vf.withheld), (None, 5, 0));
+        // The other thread's text is gone from every page of the file; the full seal is the control.
+        assert!(contains(&full.path, SECRET));
+        assert!(!contains(&ts.sealed.path, SECRET));
+        // Evidence rows cited only by withheld records are dropped.
+        let c = Connection::open_with_flags(&ts.sealed.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let ev: Vec<Vec<u8>> = c.prepare("SELECT sha256 FROM evidence").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ev, vec![vec![0xcd; 32]]);
+        // Thread seals don't count as the session's last seal, and sealing again reuses the file.
+        assert_eq!(last_seal(s.home(), s.session()).unwrap().1, full.sidecar);
+        assert_eq!(seal_thread(&s, &key, "a").unwrap().sealed.sidecar, ts.sealed.sidecar);
+        // The main thread seals on its own too.
+        let m = seal_thread(&s, &key, "main").unwrap();
+        assert_eq!((m.records, m.withheld, m.sealed.verified), (1, 4, true));
+    }
+
+    #[test]
+    fn thread_seal_refusals() {
+        let (_t, s, key) = threaded();
+        assert!(seal_thread(&s, &key, "nobody").unwrap_err().to_string().contains("thread nobody has no records"));
+        assert_eq!(seal_thread(&s, &key, "a b").unwrap_err().to_string(), crate::record::THREAD_RULE);
+    }
+
+    #[test]
+    fn tampered_thread_seals_fail() {
+        let (t, s, key) = threaded();
+        let ts = seal_thread(&s, &key, "a").unwrap();
+        let relabel = format!("UPDATE chain SET thread = 'b', thread_sha256 = X'{}' WHERE seq = 1", hex::encode(thread_sha256("b")));
+        let cases = [
+            ("DELETE FROM records WHERE key = 'a2'", "withheld row names its thread at seq 3".to_string()),
+            (
+                "DELETE FROM records WHERE key = 'a2'; UPDATE chain SET thread = NULL, row_digest = zeroblob(32) WHERE seq = 3",
+                "a record of thread a was withheld at seq 3".to_string(),
+            ),
+            ("UPDATE chain SET thread = 'b' WHERE seq = 1", "thread digest mismatch at seq 1".to_string()),
+            (relabel.as_str(), "record of thread b in a seal of thread a at seq 1".to_string()),
+            ("UPDATE chain SET row_digest = zeroblob(32) WHERE seq = 2", "chain hash mismatch at seq 2".to_string()),
+            ("UPDATE chain SET thread_sha256 = zeroblob(32) WHERE seq = 2", "chain hash mismatch at seq 2".to_string()),
+            ("UPDATE file_meta SET thread = 'b'", "sidecar thread does not match the file".to_string()),
+        ];
+        for (sql, want) in cases {
+            let copy = t.path().join("copy.sqlite");
+            std::fs::copy(&ts.sealed.path, &copy).unwrap();
+            std::fs::copy(sidecar_path(&ts.sealed.path), sidecar_path(&copy)).unwrap();
+            Connection::open(&copy).unwrap().execute_batch(sql).unwrap();
+            resign(&copy, &key);
+            assert_eq!(verify(&copy).unwrap_err(), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn tampered_threads_in_a_full_seal_fail() {
+        let (t, s, key) = threaded();
+        let full = seal(&s, &key).unwrap();
+        let sha_b = hex::encode(thread_sha256("b"));
+        let cases = [
+            ("UPDATE chain SET thread = 'b' WHERE seq = 1".to_string(), "thread digest mismatch at seq 1"),
+            // Moving a record to another thread, digest and all, breaks the chain.
+            (format!("UPDATE chain SET thread = 'b', thread_sha256 = X'{sha_b}' WHERE seq = 1"), "chain hash mismatch at seq 1"),
+            ("UPDATE chain SET row_digest = zeroblob(32) WHERE seq = 1".to_string(), "row digest stored beside its record at seq 1"),
+            ("DELETE FROM records WHERE key = 'm'".to_string(), "record missing at seq 5"),
+        ];
+        for (sql, want) in cases {
+            let copy = t.path().join("copy.sqlite");
+            std::fs::copy(&full.path, &copy).unwrap();
+            std::fs::copy(sidecar_path(&full.path), sidecar_path(&copy)).unwrap();
+            Connection::open(&copy).unwrap().execute_batch(&sql).unwrap();
+            resign(&copy, &key);
+            assert_eq!(verify(&copy).unwrap_err(), want, "{sql}");
+        }
     }
 
     #[test]
