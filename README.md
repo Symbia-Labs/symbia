@@ -2,6 +2,18 @@
 
 Symbia keeps a cryptographically signed, hash-chained record of the work AI agents do. Each record sits in a lane (`canonical`, `conditional` or `apocryphal`, from most to least trusted) that marks how far its result can be trusted. It is one Rust binary on SQLite and serves its tools over MCP, on stdio and streamable HTTP.
 
+## Install
+
+macOS on Apple silicon, with Homebrew:
+
+```sh
+brew install symbia-labs/tap/symbia
+```
+
+Or download a binary from [Releases](https://github.com/Symbia-Labs/symbia/releases): `symbia-<version>-aarch64-apple-darwin.zip` (signed with a Developer ID and notarized by Apple) or `symbia-<version>-x86_64-unknown-linux-gnu.tar.gz`. Each has a `.sha256` file beside it.
+
+On Linux there is no shell sandbox yet: `symbia_exec` runs commands with your own rights, and `exec_network: "deny"` is refused rather than ignored.
+
 ## Build from source
 
 Requires Rust 1.91 or later.
@@ -21,6 +33,8 @@ The binary is `target/release/symbia`.
 | `symbia --version` | Print the build. |
 
 ## Use with Claude
+
+Use the full path to the binary: `/opt/homebrew/bin/symbia` after a Homebrew install, or wherever you put a downloaded or built binary.
 
 Claude Desktop, in `claude_desktop_config.json`:
 
