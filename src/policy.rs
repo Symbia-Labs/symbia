@@ -173,6 +173,8 @@ pub struct Policy {
     resume_window_ms: i64,
     unsandboxed: Vec<crate::unsandboxed::Rule>,
     embed: Option<crate::embed::EmbedSpec>,
+    /// `embed.document_prefix` and `embed.query_prefix`, empty when unset.
+    embed_prefixes: (String, String),
     witness: Option<PathBuf>,
 }
 
@@ -289,8 +291,24 @@ impl Policy {
             resume_window_ms: c.resume_window_ms,
             unsandboxed,
             embed,
+            embed_prefixes: c
+                .embed
+                .as_ref()
+                .map(|e| (e.document_prefix.clone().unwrap_or_default(), e.query_prefix.clone().unwrap_or_default()))
+                .unwrap_or_default(),
             witness,
         })
+    }
+
+    /// Prefixes for record texts and queries sent to the embedding model.
+    pub fn embed_prefixes(&self) -> (&str, &str) {
+        (&self.embed_prefixes.0, &self.embed_prefixes.1)
+    }
+
+    /// The embedder this policy configures, if any.
+    pub fn embedder(&self) -> Option<crate::embed::Embedder> {
+        let (d, q) = self.embed_prefixes();
+        self.embed.clone().map(|e| crate::embed::Embedder::new(e).with_prefixes(d, q))
     }
 
     /// The witness folder, if configured.

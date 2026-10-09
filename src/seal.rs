@@ -178,6 +178,72 @@ pub fn seal_for(store: &Store, key: &SigningKey, reason: Reason) -> anyhow::Resu
     Ok(Sealed { path, sidecar, verified })
 }
 
+/// What a legacy cleanup did, or would do, for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyPrune {
+    pub session: String,
+    /// The newest full seal, kept.
+    pub kept: PathBuf,
+    /// Older reason-less full seals that the kept one covers: removed, or to be removed.
+    pub superseded: Vec<PathBuf>,
+    /// Why the session was left alone, when it was.
+    pub skipped: Option<String>,
+}
+
+/// Remove full seals made before seals recorded a reason, where a newer full seal of the same
+/// session covers them. For each session the newest full seal is kept; an older reason-less
+/// seal goes only if the newest verifies and its chain holds the older seal's head at the
+/// older seq. Each removed seal is first written to the witness folder (with reason `legacy`),
+/// so its signed head and time outlive the file. Nothing is removed unless `confirm`.
+pub fn prune_legacy(home: &Path, witness: &Path, confirm: bool) -> anyhow::Result<Vec<LegacyPrune>> {
+    let mut by_session: std::collections::BTreeMap<String, Vec<(i64, PathBuf)>> = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(home.join("seals"))?.flatten() {
+        let path = e.path();
+        let Some(stem) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".sqlite")) else { continue };
+        if stem.contains(".thread-") {
+            continue;
+        }
+        let Some((session, n)) = stem.rsplit_once('-').and_then(|(s, n)| n.parse::<i64>().ok().map(|n| (s.to_string(), n))) else { continue };
+        by_session.entry(session).or_default().push((n, path));
+    }
+    let mut out = Vec::new();
+    for (session, mut files) in by_session {
+        files.sort();
+        let Some((newest_seq, newest)) = files.pop() else { continue };
+        let mut report = LegacyPrune { session, kept: newest.clone(), superseded: Vec::new(), skipped: None };
+        if let Err(e) = verify(&newest) {
+            report.skipped = Some(format!("newest seal does not verify: {e}"));
+            out.push(report);
+            continue;
+        }
+        let conn = Connection::open_with_flags(&newest, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        for (seq, path) in files {
+            let Ok(sc) = read_sidecar(&path) else { continue };
+            if sc.reason.is_some() || seq >= newest_seq {
+                continue;
+            }
+            let head: Option<Vec<u8>> = if seq == 0 {
+                Some(GENESIS.to_vec())
+            } else {
+                conn.query_row("SELECT hash FROM chain WHERE seq = ?1", [seq], |r| r.get(0)).optional()?
+            };
+            if head.map(hex::encode).as_deref() != Some(sc.chain_head.as_str()) {
+                continue;
+            }
+            if confirm {
+                let mut entry = crate::witness::Entry::from_sidecar(&sc);
+                entry.reason = Some("legacy".into());
+                crate::witness::append(witness, &entry)?;
+                std::fs::remove_file(&path)?;
+                let _ = std::fs::remove_file(sidecar_path(&path));
+            }
+            report.superseded.push(path);
+        }
+        out.push(report);
+    }
+    Ok(out)
+}
+
 /// Write a new seal to the store's witness folder; a failure goes to stderr.
 fn witness(store: &Store, sidecar: &Sidecar) {
     if let Some(dir) = store.witness()
@@ -1184,6 +1250,56 @@ mod tests {
         resign(&copy, &key);
         assert!(verify(&copy).is_ok(), "re-signed with the device key, the rewrite is self-consistent");
         assert_eq!(check(&copy, &sid, 3, &entries), Err("witness mismatch at seq 1".into()));
+    }
+
+    #[test]
+    fn legacy_seals_are_pruned_only_when_covered_and_witnessed_first() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("sym");
+        let wdir = t.path().join("witness");
+        let mut s = Store::create(&home).unwrap();
+        let key = crate::keys::load_or_create(&home).unwrap();
+        let mut legacy = Vec::new();
+        for k in ["a", "b", "c"] {
+            s.write(&input(k, json!(1)), Instant::now()).unwrap();
+            // An explicit seal with its reason removed stands in for one made before R10.
+            let x = seal(&s, &key).unwrap();
+            let mut sc = x.sidecar.clone();
+            sc.reason = None;
+            std::fs::write(sidecar_path(&x.path), canonical(&sc).unwrap()).unwrap();
+            legacy.push(x);
+        }
+        s.write(&input("d", json!(1)), Instant::now()).unwrap();
+        let kept = seal(&s, &key).unwrap();
+        // A seal of another chain under the same session name is not covered, and stays.
+        let other_home = t.path().join("other");
+        let mut o = Store::create_with(&other_home, s.session(), i64::MAX, None).unwrap();
+        o.write(&input("zz", json!(9)), Instant::now()).unwrap();
+        let foreign = seal(&o, &key).unwrap();
+        let mut sc = foreign.sidecar.clone();
+        sc.reason = None;
+        std::fs::write(sidecar_path(&foreign.path), canonical(&sc).unwrap()).unwrap();
+        let alien = home.join("seals").join(format!("{}-1.sqlite", s.session()));
+        std::fs::remove_file(&alien).unwrap();
+        std::fs::copy(&foreign.path, &alien).unwrap();
+        std::fs::copy(sidecar_path(&foreign.path), sidecar_path(&alien)).unwrap();
+
+        let dry = prune_legacy(&home, &wdir, false).unwrap();
+        assert_eq!(dry.len(), 1);
+        assert_eq!(dry[0].kept, kept.path);
+        assert_eq!(dry[0].superseded, vec![legacy[1].path.clone(), legacy[2].path.clone()]);
+        assert!(legacy[1].path.exists() && !wdir.exists(), "a dry run changes nothing");
+        let done = prune_legacy(&home, &wdir, true).unwrap();
+        assert_eq!(done[0].superseded.len(), 2);
+        assert!(!legacy[1].path.exists() && !sidecar_path(&legacy[2].path).exists());
+        assert!(alien.exists() && kept.path.exists());
+        let lines = crate::witness::read(&wdir.join(crate::witness::FILE)).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].chain_seq, lines[0].reason.as_deref(), lines[0].signature.as_str()), (2, Some("legacy"), legacy[1].sidecar.signature.as_str()));
+        // The kept seal still checks out against the lines written for the removed ones.
+        assert_eq!(crate::witness::check(&kept.path, s.session(), 4, &lines), Ok(crate::witness::Check::Ok { entries: 2 }));
+        // Running again finds nothing more.
+        assert!(prune_legacy(&home, &wdir, true).unwrap()[0].superseded.is_empty());
     }
 
     #[test]

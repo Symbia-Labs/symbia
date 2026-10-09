@@ -8,6 +8,7 @@ use rmcp::ServiceExt;
 const USAGE: &str = "usage: symbia mcp
        symbia serve [--listen 127.0.0.1:7341] [--allow-remote]
        symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder or witness.jsonl>]
+       symbia prune-legacy [--confirm]
        symbia trust add <hex> <label>
        symbia trust list
        symbia --version";
@@ -25,6 +26,8 @@ fn main() -> ExitCode {
             Some(v) => run_verify(Path::new(v.path), &v.trust, v.witness.map(Path::new)),
             None => usage(),
         },
+        ["prune-legacy"] => report("symbia prune-legacy", prune_legacy(false)),
+        ["prune-legacy", "--confirm"] => report("symbia prune-legacy", prune_legacy(true)),
         ["trust", "add", key, label] => report("symbia trust", trust_add(key, label)),
         ["trust", "list"] => report("symbia trust", trust_list()),
         ["--version"] => {
@@ -217,6 +220,28 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Remove seals made before seals recorded a reason, where a newer full seal covers them. Each
+/// removed seal is written to the witness first, so a witness must be configured. A dry run
+/// unless `confirm`.
+fn prune_legacy(confirm: bool) -> anyhow::Result<()> {
+    let home = symbia::home::from_env()?;
+    let policy = symbia::policy::Policy::from_env(&home)?;
+    let witness = policy.witness().ok_or_else(|| anyhow::anyhow!("set \"witness\" in config.json first: each removed seal is written there before it goes"))?;
+    let report = symbia::seal::prune_legacy(&home, witness, confirm)?;
+    let (mut sessions, mut files) = (0, 0);
+    for r in &report {
+        if let Some(why) = &r.skipped {
+            println!("skip {} ({why})", r.session);
+        } else if !r.superseded.is_empty() {
+            sessions += 1;
+            files += r.superseded.len();
+            println!("{} {}: {} superseded, keeping {}", if confirm { "pruned" } else { "would prune" }, r.session, r.superseded.len(), r.kept.display());
+        }
+    }
+    println!("{} {files} seal(s) in {sessions} session(s){}", if confirm { "removed" } else { "would remove" }, if confirm { "" } else { "; run again with --confirm" });
+    Ok(())
 }
 
 fn trust_add(key: &str, label: &str) -> anyhow::Result<()> {

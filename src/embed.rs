@@ -20,6 +20,9 @@ pub const PER_CALL: u32 = 256;
 pub const START_WAIT: Duration = Duration::from_secs(60);
 const REQUEST_WAIT: Duration = Duration::from_secs(60);
 pub const NOT_CONFIGURED: &str = "vector search needs \"embed\" in config.json";
+/// Characters of a text sent to the model: the start of a record carries its meaning, and long
+/// inputs overflow a local server's batch (found live: 570 tokens against a batch of 512).
+pub const EMBED_TEXT_MAX: usize = 2_000;
 
 /// `embed` in config.json: `{url, model}` or `{server, model_path}`.
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +36,12 @@ pub struct EmbedConfig {
     pub server: Option<String>,
     #[serde(default)]
     pub model_path: Option<String>,
+    /// Put before each record's text, e.g. `"search_document: "` for nomic-embed.
+    #[serde(default)]
+    pub document_prefix: Option<String>,
+    /// Put before each query, e.g. `"search_query: "` for nomic-embed.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
 }
 
 /// Where vectors come from, checked at load.
@@ -101,6 +110,10 @@ impl EmbedSpec {
             &port.to_string(),
             "--ctx-size",
             "2048",
+            "--batch-size",
+            "2048",
+            "--ubatch-size",
+            "2048",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -116,7 +129,15 @@ struct Started {
 
 pub struct Embedder {
     spec: EmbedSpec,
+    document_prefix: String,
+    query_prefix: String,
     started: tokio::sync::Mutex<Option<Started>>,
+}
+
+/// `prefix` and the first [`EMBED_TEXT_MAX`] characters of `text`.
+fn prepare(prefix: &str, text: &str) -> String {
+    let end = text.char_indices().nth(EMBED_TEXT_MAX).map_or(text.len(), |(i, _)| i);
+    format!("{prefix}{}", &text[..end])
 }
 
 /// One HTTP/1.1 request to `host:port`; the status and the body.
@@ -148,7 +169,25 @@ fn free_port() -> Result<u16, String> {
 
 impl Embedder {
     pub fn new(spec: EmbedSpec) -> Self {
-        Self { spec, started: tokio::sync::Mutex::new(None) }
+        Self { spec, document_prefix: String::new(), query_prefix: String::new(), started: tokio::sync::Mutex::new(None) }
+    }
+
+    /// Prefixes put before record texts and queries, for models trained with them.
+    pub fn with_prefixes(mut self, document: &str, query: &str) -> Self {
+        self.document_prefix = document.to_string();
+        self.query_prefix = query.to_string();
+        self
+    }
+
+    /// Vectors for record texts: prefixed and capped.
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        let prepared: Vec<String> = texts.iter().map(|t| prepare(&self.document_prefix, t)).collect();
+        self.embed(&prepared).await
+    }
+
+    /// The vector for a query: prefixed and capped.
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.embed(&[prepare(&self.query_prefix, text)]).await?.pop().ok_or_else(|| "no vector for the query".to_string())
     }
 
     pub fn model_name(&self) -> String {
@@ -327,7 +366,21 @@ mod tests {
     #[test]
     fn server_arguments() {
         let a = EmbedSpec::server_args(std::path::Path::new("/m/x.gguf"), 4242);
-        assert_eq!(a.join(" "), "--model /m/x.gguf --embeddings --pooling mean --host 127.0.0.1 --port 4242 --ctx-size 2048");
+        assert_eq!(a.join(" "), "--model /m/x.gguf --embeddings --pooling mean --host 127.0.0.1 --port 4242 --ctx-size 2048 --batch-size 2048 --ubatch-size 2048");
+    }
+
+    #[tokio::test]
+    async fn documents_and_queries_are_prefixed_and_capped() {
+        let (port, _) = fake::serve().await;
+        let e = Embedder::new(fake::spec(port)).with_prefixes("dd: ", "hh: ");
+        let long = "a".repeat(EMBED_TEXT_MAX + 500);
+        let docs = e.embed_documents(&[long, "b".into()]).await.unwrap();
+        // The fake counts letters a-h: the cap keeps 2,000 a's, the prefix adds two d's.
+        assert_eq!((docs[0][0], docs[0][3]), (EMBED_TEXT_MAX as f32, 2.0));
+        assert_eq!((docs[1][1], docs[1][3]), (1.0, 2.0));
+        let q = e.embed_query("c").await.unwrap();
+        assert_eq!((q[2], q[7]), (1.0, 2.0));
+        assert_eq!(prepare("", "é".repeat(3).as_str()), "ééé");
     }
 
     #[tokio::test]

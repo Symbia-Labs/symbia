@@ -348,7 +348,7 @@ impl SymbiaServer {
         let store = Arc::new(Mutex::new(None));
         let client: Arc<Mutex<Option<String>>> = Arc::default();
         let jobs = Arc::new(Jobs::new(store.clone(), key.clone(), client.clone()));
-        let embedder = policy.embed().map(|e| Arc::new(Embedder::new(e.clone())));
+        let embedder = policy.embedder().map(Arc::new);
         Self { home: home.to_path_buf(), key, store, sessions, policy, client, jobs, stdio, embedder, tool_router: Self::tool_router() }
     }
 
@@ -398,7 +398,7 @@ impl SymbiaServer {
 
     /// Replace the path policy (tests).
     pub fn with_policy(mut self, policy: Policy) -> Self {
-        self.embedder = policy.embed().map(|e| Arc::new(Embedder::new(e.clone())));
+        self.embedder = policy.embedder().map(Arc::new);
         self.policy = Arc::new(policy);
         self
     }
@@ -482,11 +482,11 @@ impl SymbiaServer {
                 let (todo, total) = ix.unembedded(&model, &filter, crate::embed::PER_CALL).map_err(err)?;
                 if !todo.is_empty() {
                     let (docs, texts): (Vec<i64>, Vec<String>) = todo.into_iter().unzip();
-                    let vectors = e.embed(&texts).await?;
+                    let vectors = e.embed_documents(&texts).await?;
                     ix.store_vectors(&model, &docs, &vectors).map_err(err)?;
                     unembedded = total - i64::try_from(docs.len()).map_err(err)?;
                 }
-                let q = e.embed(std::slice::from_ref(similar)).await?.pop().ok_or("no vector for the query")?;
+                let q = e.embed_query(similar).await?;
                 ix.search_vector(&q, &model, &filter, limit).map_err(err)?
             }
             _ => Vec::new(),
