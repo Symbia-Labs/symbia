@@ -56,6 +56,163 @@ Claude Code:
 claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 ```
 
+## Try it on the example seals
+
+[`examples/`](examples/) holds real seals from a short run of two agents, signed by a throwaway example key. agent-a predicted that `orders.csv` holds 3 orders and that the amounts sum to 100, measured both with shell commands, and recorded the results: the first held and the second broke. agent-b searched the file and left a note. You can check all of it with `symbia` and `sqlite3`, without running an agent. The queries need SQLite 3.45 or later, which reads the binary JSON that record bodies are stored in.
+
+```sh
+git clone https://github.com/Symbia-Labs/symbia && cd symbia/examples
+KEY=$(cat example-key.pub)
+```
+
+### Verify
+
+```sh
+symbia verify seals/session.sqlite --trust $KEY --witness witness
+# ok 1791560407633-0e8022e0 seq 9 head ec1ea4fc7103
+# witness ok (4 entries)
+
+symbia verify seals/agent-a.sqlite --trust $KEY        # agent-a's thread alone
+# ok 1791560407633-0e8022e0 seq 9 head ec1ea4fc7103 thread agent-a: 7 records, 2 withheld
+
+symbia verify seals/session.sqlite                     # the example key isn't pinned
+# untrusted key 489024d5d267                             (exit 1)
+```
+
+Someone moved agent-b's note from the `conditional` lane to `canonical` after the session was sealed. Both copies of the edit fail:
+
+```sh
+symbia verify seals/tampered.sqlite --trust $KEY          # file sha256 mismatch          (exit 1)
+symbia verify seals/tampered-rehashed.sqlite --trust $KEY # signature invalid             (exit 1)
+
+sqlite3 -readonly seals/tampered.sqlite "SELECT lane FROM records WHERE key = 'review.orders'"   # canonical
+sqlite3 -readonly seals/session.sqlite  "SELECT lane FROM records WHERE key = 'review.orders'"   # conditional
+```
+
+The second copy rewrote the file hash in the sidecar to match the edit. The signature covers that hash, and only the holder of the private key can sign a new one. To accept seals from another machine for good, pin its key with `symbia trust add <hex> <label>` and drop `--trust`.
+
+### Query
+
+A seal is a SQLite file. Open it with `-readonly` or work on a copy: any write changes the file's hash, and the seal no longer verifies.
+
+Every record in chain order, with its thread and lane:
+
+```sh
+sqlite3 -readonly -column -header seals/session.sqlite "
+  SELECT c.seq, c.thread, r.kind, r.lane, r.key
+  FROM chain c JOIN records r ON r.id = c.record_id ORDER BY c.seq"
+```
+
+```
+seq  thread   kind         lane         key
+---  -------  -----------  -----------  -------------------
+1    agent-a  tool_call    apocryphal   tool.write
+2    agent-a  prediction   canonical    orders.rows
+3    agent-a  prediction   canonical    orders.total
+4    agent-a  tool_call    apocryphal   tool.exec
+5    agent-a  tool_call    apocryphal   tool.exec
+6    agent-a  result       canonical    orders.rows.result
+7    agent-a  result       canonical    orders.total.result
+8    agent-b  tool_call    apocryphal   tool.search
+9    agent-b  observation  conditional  review.orders
+```
+
+Each prediction with its result:
+
+```sh
+sqlite3 -readonly -column -header seals/session.sqlite "
+  SELECT p.key AS prediction, json_extract(p.body, '$.claim') AS claim,
+         CASE json_extract(r.body, '$.held') WHEN 1 THEN 'held' ELSE 'broke' END AS verdict
+  FROM links l
+  JOIN records p ON p.id = l.to_id
+  JOIN records r ON r.id = l.from_id
+  WHERE l.rel = 'results_of'"
+```
+
+```
+prediction    claim                      verdict
+------------  -------------------------  -------
+orders.rows   orders.csv holds 3 orders  held
+orders.total  the amounts sum to 100     broke
+```
+
+One record in full. Bodies are stored as binary JSON, so wrap them in `json()`:
+
+```sh
+sqlite3 -readonly seals/session.sqlite "SELECT json(body) FROM records WHERE key = 'orders.total.result'"
+# {"held":false,"note":"the amounts sum to 90, not 100","total":90}
+```
+
+The commands an agent ran, with their exit status, host time and the characters returned to the model:
+
+```sh
+sqlite3 -readonly -column -header seals/session.sqlite "
+  SELECT json_extract(body, '$.command') AS command, json_extract(body, '$.exit') AS exit, host_ms, chars
+  FROM records WHERE kind = 'tool_call' AND json_extract(body, '$.tool') = 'exec'"
+```
+
+A command's full output, from the evidence folder. The record holds only its sha256:
+
+```sh
+sha=$(sqlite3 -readonly seals/session.sqlite "SELECT json_extract(body, '$.stdout_sha256') FROM records
+      WHERE json_extract(body, '$.command') LIKE 'awk%'")
+cat evidence/$sha                  # 90
+shasum -a 256 evidence/$sha        # the same sha256
+```
+
+Cost by kind of record:
+
+```sh
+sqlite3 -readonly -column -header seals/session.sqlite "
+  SELECT kind, COUNT(*) AS records, SUM(chars) AS chars_to_model, SUM(host_ms) AS host_ms
+  FROM records GROUP BY kind"
+```
+
+Full-text search over keys and bodies (quote terms that hold punctuation):
+
+```sh
+sqlite3 -readonly -column seals/session.sqlite "
+  SELECT r.key, c.thread FROM records_fts f
+  JOIN records r ON r.id = f.id JOIN chain c ON c.record_id = r.id
+  WHERE records_fts MATCH '\"A-102\"'"
+# review.orders  agent-b
+```
+
+When a record was written, and by which model, in UTC:
+
+```sh
+sqlite3 -readonly -column -header seals/session.sqlite "
+  SELECT c.thread, r.kind, r.lane, datetime(r.at_ms / 1000, 'unixepoch') AS at_utc, r.model
+  FROM chain c JOIN records r ON r.id = c.record_id WHERE r.key = 'review.orders'"
+```
+
+What a thread seal withholds. Rows from other threads keep only a digest:
+
+```sh
+sqlite3 -readonly -column -header seals/agent-a.sqlite "
+  SELECT c.seq, IFNULL(r.key, '(withheld)') AS key, c.thread, hex(substr(c.row_digest, 1, 6)) AS digest
+  FROM chain c LEFT JOIN records r ON r.id = c.record_id ORDER BY c.seq"
+```
+
+```
+seq  key                  thread   digest
+---  -------------------  -------  ------------
+1    tool.write           agent-a
+…
+7    orders.total.result  agent-a
+8    (withheld)                    4DC033A5F93C
+9    (withheld)                    05E373C576DA
+```
+
+The sidecar and the witness:
+
+```sh
+cat seals/session.seal.json        # session, chain_seq, chain_head, file_sha256, public_key, signature, reason
+jq -c '{chain_seq, reason, head: .chain_head[0:12]}' witness/witness.jsonl
+```
+
+The same queries work on your own seals in the data folder's `seals/` (see Data and safety).
+
 ## Tools
 
 | Tool | What it does |

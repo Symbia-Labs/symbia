@@ -23,6 +23,11 @@ impl Mcp {
 
     /// Start with extra environment variables, e.g. a temp `HOME`.
     pub async fn start_with(home: &Path, env: &[(&str, &Path)]) -> Self {
+        Self::start_as(home, env, "stdio-test").await
+    }
+
+    /// Start as a client named `client`, which tool-call records carry as their model.
+    pub async fn start_as(home: &Path, env: &[(&str, &Path)], client: &str) -> Self {
         let mut cmd = Command::new(BIN);
         cmd.arg("mcp").env("SYMBIA_HOME", home);
         for (k, v) in env {
@@ -33,7 +38,7 @@ impl Mcp {
         let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
         let mut m = Self { child, stdin, stdout };
         m.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "stdio-test", "version": "0"}}}))
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": client, "version": "0"}}}))
             .await;
         assert!(m.reply(0).await["result"]["protocolVersion"].is_string());
         m.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `examples/`: real seals from a short run of two agents, signed by an example key, with a full seal, a thread seal, two tampered copies, the commands' evidence and the witness. The README's new "Try it on the example seals" section verifies and queries them with `symbia` and `sqlite3`. A test checks the committed files on every run.
+
 ## 0.1.0
 
 First public release.
