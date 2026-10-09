@@ -1,0 +1,29 @@
+name: ci
+
+# Every push to main and every pull request: the full test suite and clippy, on macOS (where exec
+# runs in the system sandbox) and on Linux.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal --component clippy
+          rustup default 1.91.0
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings

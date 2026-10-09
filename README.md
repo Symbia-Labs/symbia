@@ -1,5 +1,7 @@
 # Symbia
 
+[![ci](https://github.com/Symbia-Labs/symbia/actions/workflows/ci.yml/badge.svg)](https://github.com/Symbia-Labs/symbia/actions/workflows/ci.yml)
+
 Symbia keeps a cryptographically signed, hash-chained record of the work AI agents do. Each record sits in a lane (`canonical`, `conditional` or `apocryphal`, from most to least trusted) that marks how far its result can be trusted. It is one Rust binary on SQLite and serves its tools over MCP, on stdio and streamable HTTP.
 
 ## Install
@@ -315,6 +317,10 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 Symbia collects no telemetry and sends nothing over the network itself. All records, seals, keys and evidence stay in `SYMBIA_HOME` on your machine, kept until you delete them. Commands run through `exec` can reach the network like any shell command you run. No data is shared with Symbia Labs or third parties.
 
 Contact: hello@symbia-labs.com
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
