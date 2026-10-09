@@ -29,5 +29,5 @@ pub fn now_ms() -> i64 {
     i64::try_from(d.as_millis()).expect("time overflows i64")
 }
 
-/// Build string reported by `symbia_status`.
+/// Build string reported by `status`.
 pub const BUILD: &str = concat!("symbia ", env!("CARGO_PKG_VERSION"));

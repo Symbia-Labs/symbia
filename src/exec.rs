@@ -1,4 +1,4 @@
-//! `symbia_exec`: run `/bin/zsh -lc <command>` in its own process group, keep the full
+//! `exec`: run `/bin/zsh -lc <command>` in its own process group, keep the full
 //! output as evidence and reply with its tail. On macOS the shell runs under
 //! `sandbox-exec` with a profile built from the path policy. A command is a [`Job`]: a task
 //! owns the child until it ends, so a call can return while the command keeps running.
@@ -254,7 +254,7 @@ pub struct Finished {
     pub duration_ms: u64,
     pub stdout: Stream,
     pub stderr: Stream,
-    /// Who killed it: `"symbia_job"` or `"shutdown"`.
+    /// Who killed it: `"job"` or `"shutdown"`.
     pub killed: Option<&'static str>,
 }
 
@@ -464,7 +464,7 @@ pub fn start(policy: &Policy, home: &Path, command: &str, cwd: &str, timeout_ms:
     start_request(policy, home, &Request { command, cwd, unsandboxed: false }, timeout_ms, tail_bytes, facts)
 }
 
-/// One `symbia_exec` call's command.
+/// One `exec` call's command.
 pub struct Request<'a> {
     pub command: &'a str,
     pub cwd: &'a str,
@@ -665,7 +665,7 @@ mod tests {
         assert!(!job.wait(Some(Duration::from_millis(200))).await);
         let st = job.status(job.tail_bytes);
         assert_eq!((st["running"].clone(), st["sandbox"].clone()), (json!(true), json!("none")), "{st}");
-        job.kill("symbia_job");
+        job.kill("job");
         assert!(job.wait(Some(Duration::from_secs(5))).await);
         assert_eq!(job.status(job.tail_bytes)["exit"], "killed");
         assert!(!alive(job.pid));

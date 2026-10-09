@@ -1,4 +1,4 @@
-//! Commands still running when their `symbia_exec` call returned. They belong to the server
+//! Commands still running when their `exec` call returned. They belong to the server
 //! process: each is tracked here until it ends, when a `tool_call` record keyed `job.<id>`
 //! records the outcome and `revises` the call's own record.
 
@@ -104,7 +104,7 @@ impl Jobs {
         if e.recorded.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut body = json!({"tool": "symbia_exec", "job": id, "command": e.job.command, "running": false});
+        let mut body = json!({"tool": "exec", "job": id, "command": e.job.command, "running": false});
         let mut evidence = Vec::new();
         match &outcome {
             Ok(f) => {

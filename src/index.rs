@@ -1,5 +1,5 @@
 //! The search index, `$SYMBIA_HOME/index.sqlite`: one document per record from every session
-//! file and full seal, with full-text search, vectors and the sums behind `symbia_report`.
+//! file and full seal, with full-text search, vectors and the sums behind `report`.
 //!
 //! The index is derived data. It can be deleted at any time and is rebuilt on the next search;
 //! it is never sealed and is not part of any chain. Sources are opened read-only.
@@ -96,7 +96,7 @@ pub struct Hit {
     pub score: f64,
 }
 
-/// How `symbia_report` groups records.
+/// How `report` groups records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum By {
     Thread,
@@ -121,7 +121,12 @@ impl By {
     fn expr(self) -> &'static str {
         match self {
             Self::Thread => "d.thread",
-            Self::Tool => "COALESCE(d.tool, '-')",
+            // Before R11 tools were named symbia_<name>, and the file tools symbia_fs_<name>.
+            Self::Tool => {
+                "CASE WHEN d.tool LIKE 'symbia\\_fs\\_%' ESCAPE '\\' THEN substr(d.tool, 11)
+                      WHEN d.tool LIKE 'symbia\\_%' ESCAPE '\\' THEN substr(d.tool, 8)
+                      ELSE COALESCE(d.tool, '-') END"
+            }
             Self::Kind => "d.kind",
             Self::Model => "d.model",
             Self::Day => "strftime('%Y-%m-%d', d.at_ms / 1000, 'unixepoch')",
@@ -432,7 +437,7 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The `symbia_report` body for documents passing `f`, grouped `by`.
+    /// The `report` body for documents passing `f`, grouped `by`.
     pub fn report(&self, f: &Filter, by: By) -> anyhow::Result<Value> {
         let (clauses, args) = f.sql();
         let p = rusqlite::params_from_iter(args.iter());
@@ -750,7 +755,7 @@ mod tests {
         assert_eq!(r["groups"][1]["group"], "chat-b");
         assert_eq!(r["predictions"], json!({"records": 2, "with_results": 1, "open": 1, "held": 1, "broke": 0}));
         let by_tool = ix.report(&Filter::default(), By::Tool).unwrap();
-        let fs = by_tool["groups"].as_array().unwrap().iter().find(|g| g["group"] == "symbia_fs_read").unwrap();
+        let fs = by_tool["groups"].as_array().unwrap().iter().find(|g| g["group"] == "read").unwrap();
         assert_eq!((fs["tool_calls"].as_i64(), fs["errors"].as_i64(), fs["refused"].as_i64()), (Some(1), Some(1), Some(1)));
         let one = ix.report(&Filter { session: Some(sa), ..Default::default() }, By::Kind).unwrap();
         assert_eq!(one["records"], 2);
@@ -759,6 +764,21 @@ mod tests {
         let thread = ix.report(&Filter { thread: Some("chat-b".into()), ..Default::default() }, By::Thread).unwrap();
         assert_eq!(thread["records"], 1);
         assert_eq!(By::parse(Some("week")).unwrap_err(), "by must be thread, tool, kind, model or day, not \"week\"");
+    }
+
+    #[test]
+    fn report_counts_tools_from_before_r11_under_their_new_names() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        for (key, tool) in [("tool.symbia_fs_read", "symbia_fs_read"), ("tool.read", "read"), ("tool.symbia_exec", "symbia_exec"), ("tool.exec", "exec"), ("tool.symbia_job", "symbia_job")] {
+            s.write(&rec(key, "tool_call", json!({"tool": tool})), Instant::now()).unwrap();
+        }
+        s.write(&rec("note", "observation", json!({})), Instant::now()).unwrap();
+        let mut ix = Index::open(t.path()).unwrap();
+        ix.refresh(REFRESH_BUDGET).unwrap();
+        let r = ix.report(&Filter::default(), By::Tool).unwrap();
+        let groups: Vec<(&str, i64)> = r["groups"].as_array().unwrap().iter().map(|g| (g["group"].as_str().unwrap(), g["tool_calls"].as_i64().unwrap())).collect();
+        assert_eq!(groups, [("exec", 2), ("read", 2), ("-", 0), ("job", 1)]);
     }
 
     #[test]

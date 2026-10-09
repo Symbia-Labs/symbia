@@ -74,7 +74,7 @@ impl Spelled {
     }
 }
 
-/// Whether `symbia_exec` commands may open network connections (`exec_network` in config.json).
+/// Whether `exec` commands may open network connections (`exec_network` in config.json).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
@@ -92,7 +92,7 @@ impl Network {
     }
 }
 
-/// What `symbia_exec` commands may read (`exec_read` in config.json).
+/// What `exec` commands may read (`exec_read` in config.json).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub enum ExecRead {
     /// Nothing under the user's home except the roots, the read allowances and the evidence folder.
@@ -124,7 +124,7 @@ pub struct Config {
     pub exec_unlock: Vec<String>,
     /// How recent the last write must be for `symbia mcp` to resume a session; 0 turns resume off.
     pub resume_window_ms: i64,
-    /// Programs `symbia_exec` may run outside the sandbox when a call asks (`unsandboxed: true`).
+    /// Programs `exec` may run outside the sandbox when a call asks (`unsandboxed: true`).
     pub exec_unsandboxed: Vec<crate::unsandboxed::RuleConfig>,
     /// Where vector search gets its embeddings.
     pub embed: Option<crate::embed::EmbedConfig>,

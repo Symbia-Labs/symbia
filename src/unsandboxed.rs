@@ -1,4 +1,4 @@
-//! `exec_unsandboxed`: named programs `symbia_exec` may run outside the sandbox when a call
+//! `exec_unsandboxed`: named programs `exec` may run outside the sandbox when a call
 //! asks for it with `unsandboxed: true`. No shell runs: the command is split into words here,
 //! and the rule's program is started by its absolute path, never found through `PATH`.
 //!

@@ -44,26 +44,26 @@ fn cli_verify(home: &Path, seal: &Path) -> std::process::Output {
 async fn a_restart_after_sigterm_resumes_the_session() {
     let t = tempfile::tempdir().unwrap();
     let mut a = Mcp::start(t.path()).await;
-    let w = a.tool(1, "symbia_record", record("before")).await.unwrap();
+    let w = a.tool(1, "record", record("before")).await.unwrap();
     assert_eq!(w["seq"], 1);
-    let session = a.tool(2, "symbia_status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
+    let session = a.tool(2, "status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
     assert!(notice(&w).starts_with(&format!("new session {session}")), "{w}");
     sigterm(a).await;
     assert!(!t.path().join("sessions").join(format!("{session}.lock")).exists());
 
     let mut b = Mcp::start(t.path()).await;
-    let w = b.tool(1, "symbia_record", record("after")).await.unwrap();
+    let w = b.tool(1, "record", record("after")).await.unwrap();
     assert_eq!(w["seq"], 3, "{w}");
     let n = notice(&w);
     assert!(n.starts_with(&format!("session {session} resumed after a server restart; gap ")), "{n}");
     assert!(n.ends_with("s; seq continues at 2"), "{n}");
-    let st = b.tool(2, "symbia_status", json!({})).await.unwrap();
+    let st = b.tool(2, "status", json!({})).await.unwrap();
     assert_eq!(st["session"], session.as_str());
     assert_eq!(st["resumes"], 1);
     assert_eq!(st["previous_session"], Value::Null);
-    let found = b.tool(3, "symbia_find", json!({"key_prefix": "session.resumed"})).await.unwrap();
+    let found = b.tool(3, "find", json!({"key_prefix": "session.resumed"})).await.unwrap();
     assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
-    let rec = b.tool(4, "symbia_get", json!({"id": found[0]["id"]})).await.unwrap();
+    let rec = b.tool(4, "get", json!({"id": found[0]["id"]})).await.unwrap();
     assert_eq!((rec["kind"].as_str(), rec["lane"].as_str(), rec["seq"].as_i64()), (Some("observation"), Some("apocryphal"), Some(2)));
     let body = &rec["body"];
     assert!(body["previous_pid"].as_i64().unwrap() > 0, "{body}");
@@ -88,20 +88,20 @@ async fn a_restart_after_sigterm_resumes_the_session() {
 async fn a_second_live_process_gets_its_own_session() {
     let t = tempfile::tempdir().unwrap();
     let mut a = Mcp::start(t.path()).await;
-    a.tool(1, "symbia_record", record("a")).await.unwrap();
-    let a_session = a.tool(2, "symbia_status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
+    a.tool(1, "record", record("a")).await.unwrap();
+    let a_session = a.tool(2, "status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
 
     let mut b = Mcp::start(t.path()).await;
-    let w = b.tool(1, "symbia_record", record("b")).await.unwrap();
+    let w = b.tool(1, "record", record("b")).await.unwrap();
     assert_eq!(w["seq"], 1);
     let n = notice(&w);
     assert!(n.starts_with("new session ") && n.ends_with(&format!("; the previous one ({a_session}) was not resumed: in use")), "{n}");
-    let st = b.tool(2, "symbia_status", json!({})).await.unwrap();
+    let st = b.tool(2, "status", json!({})).await.unwrap();
     assert_ne!(st["session"], a_session.as_str());
     assert_eq!(st["previous_session"], a_session.as_str());
     assert_eq!(st["resumes"], 0);
     // A still writes to its own chain.
-    assert_eq!(a.tool(3, "symbia_record", record("a2")).await.unwrap()["seq"], 2);
+    assert_eq!(a.tool(3, "record", record("a2")).await.unwrap()["seq"], 2);
     a.close().await;
     b.close().await;
 }
@@ -112,13 +112,13 @@ async fn outside_the_window_or_with_resume_off_a_new_session_opens() {
         let t = tempfile::tempdir().unwrap();
         set_window(t.path(), window);
         let mut a = Mcp::start(t.path()).await;
-        a.tool(1, "symbia_record", record("a")).await.unwrap();
-        let a_session = a.tool(2, "symbia_status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
+        a.tool(1, "record", record("a")).await.unwrap();
+        let a_session = a.tool(2, "status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
         a.close().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let mut b = Mcp::start(t.path()).await;
-        let st = b.tool(1, "symbia_status", json!({})).await.unwrap();
+        let st = b.tool(1, "status", json!({})).await.unwrap();
         assert_ne!(st["session"], a_session.as_str());
         assert_eq!(st["seq"], 0);
         assert!(notice(&st).ends_with(&format!("; the previous one ({a_session}) was not resumed: {reason}")), "{st}");
@@ -158,17 +158,17 @@ async fn empty_leftover_files_are_removed_at_startup() {
 async fn the_notice_comes_with_the_first_reply_only() {
     let t = tempfile::tempdir().unwrap();
     let mut m = Mcp::start(t.path()).await;
-    let first = m.tool(1, "symbia_status", json!({})).await.unwrap();
+    let first = m.tool(1, "status", json!({})).await.unwrap();
     assert_eq!(notice(&first), format!("new session {}", first["session"].as_str().unwrap()));
-    let second = m.tool(2, "symbia_status", json!({})).await.unwrap();
+    let second = m.tool(2, "status", json!({})).await.unwrap();
     assert!(second.get("notice").is_none(), "{second}");
-    let third = m.tool(3, "symbia_record", record("x")).await.unwrap();
+    let third = m.tool(3, "record", record("x")).await.unwrap();
     assert!(third.get("notice").is_none(), "{third}");
     m.close().await;
 
     // A reply that is not a JSON object gets the notice as a block of its own.
     let mut m = Mcp::start(t.path()).await;
-    m.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "symbia_get", "arguments": {"id": "nope"}}})).await;
+    m.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get", "arguments": {"id": "nope"}}})).await;
     let r = m.reply(1).await;
     assert_eq!(r["result"]["isError"], true);
     assert_eq!(r["result"]["content"][0]["text"], "no such record");

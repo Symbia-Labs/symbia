@@ -156,18 +156,18 @@ async fn s1_resume_continues_the_same_file_and_chain() {
     // First connection: initialize, write one record.
     let mut a = connect(&server.addr).await;
     let sid = a.initialize().await;
-    let w1 = a.tool(&sid, 1, "symbia_record", record("s1.first")).await;
+    let w1 = a.tool(&sid, 1, "record", record("s1.first")).await;
     assert_eq!(w1["seq"], 1);
-    let st1 = a.tool(&sid, 2, "symbia_status", json!({})).await;
+    let st1 = a.tool(&sid, 2, "status", json!({})).await;
     assert_eq!(st1["mcp_session_id"], sid.as_str());
     assert!(st1["expires_ms"].as_i64().unwrap() > symbia::now_ms());
 
     // Drop the connection; reconnect on a new one with the same session id.
     drop(a);
     let mut b = connect(&server.addr).await;
-    let w2 = b.tool(&sid, 3, "symbia_record", record("s1.second")).await;
+    let w2 = b.tool(&sid, 3, "record", record("s1.second")).await;
     assert_eq!(w2["seq"], 2);
-    let st2 = b.tool(&sid, 4, "symbia_status", json!({})).await;
+    let st2 = b.tool(&sid, 4, "status", json!({})).await;
     assert_eq!(st2["session"], st1["session"]);
     assert_eq!(st2["file"], st1["file"]);
     assert_eq!(st2["head"], w2["head"]);
@@ -194,14 +194,14 @@ async fn s1_resume_continues_the_same_file_and_chain() {
     }
 
     // The resumed session seals and verifies like any other.
-    let sealed = b.tool(&sid, 5, "symbia_seal", json!({})).await;
+    let sealed = b.tool(&sid, 5, "seal", json!({})).await;
     assert_eq!((sealed["verified"].clone(), sealed["chain_seq"].clone()), (json!(true), json!(2)));
 
     // A second client gets its own session and its own file.
     let mut c = connect(&server.addr).await;
     let other = c.initialize().await;
     assert_ne!(other, sid);
-    assert_eq!(c.tool(&other, 1, "symbia_record", record("other")).await["seq"], 1);
+    assert_eq!(c.tool(&other, 1, "record", record("other")).await["seq"], 1);
     assert_eq!(session_files(t.path()).len(), 2);
 
     // An unknown session id is 404; so is a session after DELETE.
@@ -222,10 +222,10 @@ async fn sigterm_seals_sessions_with_records() {
     let mut server = start(t.path()).await;
     let mut a = connect(&server.addr).await;
     let sid = a.initialize().await;
-    a.tool(&sid, 1, "symbia_record", record("before.term")).await;
+    a.tool(&sid, 1, "record", record("before.term")).await;
     let mut b = connect(&server.addr).await;
     let empty = b.initialize().await;
-    b.tool(&empty, 1, "symbia_status", json!({})).await;
+    b.tool(&empty, 1, "status", json!({})).await;
 
     let pid = i32::try_from(server.child.id().unwrap()).unwrap();
     // SAFETY: signals our own child.
@@ -253,7 +253,7 @@ async fn server_restart_ends_sessions_but_keeps_their_files() {
     let addr = first.addr.clone();
     let mut a = connect(&addr).await;
     let sid = a.initialize().await;
-    a.tool(&sid, 1, "symbia_record", record("before.restart")).await;
+    a.tool(&sid, 1, "record", record("before.restart")).await;
     drop(a);
     first.child.kill().await.unwrap();
 
@@ -261,7 +261,7 @@ async fn server_restart_ends_sessions_but_keeps_their_files() {
     let mut b = connect(&second.addr).await;
     assert_eq!(b.post(Some(&sid), json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).await.status, StatusCode::NOT_FOUND);
     let fresh = b.initialize().await;
-    assert_eq!(b.tool(&fresh, 3, "symbia_record", record("after.restart")).await["seq"], 1);
+    assert_eq!(b.tool(&fresh, 3, "record", record("after.restart")).await["seq"], 1);
 
     let files = session_files(t.path());
     assert_eq!(files.len(), 2);

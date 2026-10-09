@@ -21,7 +21,7 @@ async fn spawn(home: &Path) -> Client {
 }
 
 async fn seq(client: &Client) -> i64 {
-    call(client, "symbia_status", json!({})).await.unwrap()["seq"].as_i64().unwrap()
+    call(client, "status", json!({})).await.unwrap()["seq"].as_i64().unwrap()
 }
 
 /// Raw text of a tool reply, error or not.
@@ -49,81 +49,81 @@ async fn b3_replace_runs_end_to_end_and_seals() {
     let r = |p: &str| root.join(p).display().to_string();
 
     let client = spawn(&home).await;
-    let session = call(&client, "symbia_status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
+    let session = call(&client, "status", json!({})).await.unwrap()["session"].as_str().unwrap().to_string();
     let mut calls: Vec<&str> = Vec::new();
     let mut expect_seq = seq(&client).await;
     assert_eq!(expect_seq, 0);
 
     // list
-    let listed = call(&client, "symbia_fs_list", json!({"path": r(""), "depth": 2})).await.unwrap();
+    let listed = call(&client, "list", json!({"path": r(""), "depth": 2})).await.unwrap();
     let paths: Vec<&str> = listed["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
     assert!(paths.contains(&"src/boiler.rs"), "{paths:?}");
-    calls.push("symbia_fs_list");
+    calls.push("list");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // search: .gitignore keeps target/ out
-    let found = call(&client, "symbia_fs_search", json!({"pattern": "pressure =", "path": r(""), "literal": true, "context": 1})).await.unwrap();
+    let found = call(&client, "search", json!({"pattern": "pressure =", "path": r(""), "literal": true, "context": 1})).await.unwrap();
     let m = &found["matches"].as_array().unwrap()[..];
     assert_eq!(m.len(), 1);
     assert_eq!((m[0]["file"].as_str(), m[0]["line"].as_u64()), (Some("src/boiler.rs"), Some(2)));
     assert_eq!(m[0]["before"], json!(["fn main() {"]));
-    calls.push("symbia_fs_search");
+    calls.push("search");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // read
-    let (ok, body) = text(&client, "symbia_fs_read", json!({"path": r("src/boiler.rs"), "offset": 2, "limit": 1})).await;
+    let (ok, body) = text(&client, "read", json!({"path": r("src/boiler.rs"), "offset": 2, "limit": 1})).await;
     assert!(ok, "{body}");
     assert!(body.starts_with("     2\t    let pressure = 11;\n"), "{body}");
     assert!(body.contains("continue with offset 3"), "{body}");
-    calls.push("symbia_fs_read");
+    calls.push("read");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // write
-    let w = call(&client, "symbia_fs_write", json!({"path": r("notes/run.md"), "content": "threshold 12 bar\n"})).await.unwrap();
+    let w = call(&client, "write", json!({"path": r("notes/run.md"), "content": "threshold 12 bar\n"})).await.unwrap();
     assert_eq!(w["bytes"], 17);
     assert_eq!(std::fs::read_to_string(root.join("notes/run.md")).unwrap(), "threshold 12 bar\n");
-    calls.push("symbia_fs_write");
+    calls.push("write");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // edit
-    let e = call(&client, "symbia_fs_edit", json!({"path": r("notes/run.md"), "old": "12 bar", "new": "11.4 bar"})).await.unwrap();
+    let e = call(&client, "edit", json!({"path": r("notes/run.md"), "old": "12 bar", "new": "11.4 bar"})).await.unwrap();
     assert_eq!(e["line"], 1);
     assert_eq!(e["sha256_before"], w["sha256"]);
     assert_ne!(e["sha256_before"], e["sha256_after"]);
-    calls.push("symbia_fs_edit");
+    calls.push("edit");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // exec
-    let x = call(&client, "symbia_exec", json!({"command": "cat notes/run.md; echo warn >&2; exit 4", "cwd": r("")})).await.unwrap();
+    let x = call(&client, "exec", json!({"command": "cat notes/run.md; echo warn >&2; exit 4", "cwd": r("")})).await.unwrap();
     assert_eq!(x["exit"], 4);
     assert_eq!(x["stdout"]["tail"], "threshold 11.4 bar\n");
     assert_eq!(x["stderr"]["tail"], "warn\n");
-    calls.push("symbia_exec");
+    calls.push("exec");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // The full output is readable by its evidence path, though it sits outside the roots.
     let evidence = x["stdout"]["evidence"].as_str().unwrap().to_string();
-    let (ok, body) = text(&client, "symbia_fs_read", json!({"path": evidence})).await;
+    let (ok, body) = text(&client, "read", json!({"path": evidence})).await;
     assert!(ok, "{body}");
     assert_eq!(body, "     1\tthreshold 11.4 bar\n");
-    calls.push("symbia_fs_read");
+    calls.push("read");
     expect_seq += 1;
 
     // A refused call is recorded too.
-    let (ok, body) = text(&client, "symbia_fs_read", json!({"path": home.join("keys/device.ed25519")})).await;
+    let (ok, body) = text(&client, "read", json!({"path": home.join("keys/device.ed25519")})).await;
     assert!(!ok && body.contains("deny list"), "{body}");
-    calls.push("symbia_fs_read");
+    calls.push("read");
     expect_seq += 1;
     assert_eq!(seq(&client).await, expect_seq);
 
     // seal
-    let sealed = call(&client, "symbia_seal", json!({})).await.unwrap();
+    let sealed = call(&client, "seal", json!({})).await.unwrap();
     assert_eq!(sealed["verified"], true);
     assert_eq!(sealed["chain_seq"], expect_seq);
     client.cancel().await.unwrap();

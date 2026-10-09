@@ -33,7 +33,7 @@ const PREFIX: usize = 12;
 const SESSION_HEADER: &str = "mcp-session-id";
 const NO_SESSION: &str = "no session: initialize an MCP session first (Mcp-Session-Id, protocol 2025-11-25 or earlier)";
 pub(crate) const TOOL_LANE_REASON: &str = "tool output, not verified";
-/// How long `symbia_job` kill waits for the job to end (its pipes get 2 s to drain).
+/// How long `job` kill waits for the job to end (its pipes get 2 s to drain).
 const KILL_WAIT: Duration = Duration::from_millis(2_500);
 /// `model` on a `tool_call` record when the client did not name itself.
 pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
@@ -49,7 +49,7 @@ pub struct SymbiaServer {
     policy: Arc<Policy>,
     /// The MCP client's name from `initialize`, recorded as `model` on `tool_call` records.
     client: Arc<Mutex<Option<String>>>,
-    /// Commands still running after their `symbia_exec` call returned.
+    /// Commands still running after their `exec` call returned.
     jobs: Arc<Jobs>,
     /// Set over stdio, where the session is opened on the first tool call that needs it.
     stdio: Option<Arc<Mutex<Stdio>>>,
@@ -136,9 +136,12 @@ pub struct FsWriteArgs {
 pub struct FsEditArgs {
     /// Absolute path of a UTF-8 text file.
     pub path: String,
-    /// Exact text to replace; must occur exactly once.
+    /// Exact text to replace; must occur exactly once unless replace_all.
     pub old: String,
     pub new: String,
+    /// Replace every non-overlapping occurrence (at least one) instead of exactly one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_all: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -186,7 +189,7 @@ impl JobAction {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct JobArgs {
-    /// Job id from symbia_exec.
+    /// Job id from exec.
     pub job: String,
     /// status (default), wait, tail or kill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -877,6 +880,7 @@ impl SymbiaServer {
 #[tool_router]
 impl SymbiaServer {
     #[tool(
+        name = "status",
         title = "Session status",
         annotations(title = "Session status", read_only_hint = true, open_world_hint = false),
         description = "Session status: build, session and when it started, MCP session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes after server restarts, the previous session when it was not resumed, the caller's thread, the threads written most recently, and new_thread, a fresh thread name to adopt."
@@ -914,6 +918,7 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "record",
         title = "Write a record",
         annotations(title = "Write a record", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
         description = "Write a record to the ledger. links is a list of {\"to_id\": \"<record id>\", \"rel\": \"<rel>\"}, rel one of results_of, revises, supersedes, cites; the target may be in an earlier session. A prediction is sealed at once. Returns {id, version, seq, head}."
@@ -928,12 +933,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "find",
         title = "Find records",
         annotations(title = "Find records", read_only_hint = true, open_world_hint = false),
         description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]. scope all searches every session and full seal, and each hit adds session and score. similar searches by meaning (needs embed in config.json); with query too, the rankings are fused. When the index is still catching up or vectors are pending, the reply is {hits, index_behind, unembedded}. Every find is recorded with its hit ids."
     )]
     pub async fn symbia_find(&self, Parameters(args): Parameters<FindArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_find";
+        const TOOL: &str = "find";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
@@ -942,12 +948,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "report",
         title = "Report",
         annotations(title = "Report", read_only_hint = true, open_world_hint = false),
         description = "Report on the open session (or scope all: every session and full seal): records grouped by thread, tool, kind, model or day (UTC), each with tool calls, chars returned to the model, host ms, errors, refusals and estimate-to-actual ratios; and predictions: how many, how many have results, how many are open, verdicts held and broke. Filters: since_ms, until_ms, in_thread. Recorded like a find."
     )]
     pub async fn symbia_report(&self, Parameters(args): Parameters<ReportArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_report";
+        const TOOL: &str = "report";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
@@ -956,12 +963,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "open",
         title = "Open a seal",
         annotations(title = "Open a seal", read_only_hint = true, open_world_hint = false),
         description = "Open a sealed copy read-only: verify it against the pinned keys (and the witness, when one is configured), then list its newest records, or return one in full with id. Paths: the data folder's seals/ and ledger/, or anywhere the file tools may read. Returns {verified, reason?, session, chain_seq, head, thread, records, withheld, external_links, witness?, list | record}."
     )]
     pub async fn symbia_open(&self, Parameters(args): Parameters<OpenArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_open";
+        const TOOL: &str = "open";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
@@ -970,12 +978,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "promote",
         title = "Promote a seal",
         annotations(title = "Promote a seal", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         description = "Promote a verified seal into the long-lived ledger (ledger/ledger.sqlite): copy it to ledger/, write a promotion record that supersedes the session's earlier promotion, and seal the ledger. Default seal: seal the open session now. Dry run unless confirm is true. A file already promoted is left alone (already_promoted). Returns {seal, session, chain_seq, records, withheld, thread?, supersedes?, witness?, already_promoted, promoted, ledger_seq?}."
     )]
     pub async fn symbia_promote(&self, Parameters(args): Parameters<PromoteArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_promote";
+        const TOOL: &str = "promote";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
@@ -984,6 +993,7 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "get",
         title = "Get a record",
         annotations(title = "Get a record", read_only_hint = true, open_world_hint = false),
         description = "Get one full record with its links, by id or by key and optional version."
@@ -1001,6 +1011,7 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "seal",
         title = "Seal the session",
         annotations(title = "Seal the session", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         description = "Seal the session: signed, verified copy under seals/. Returns {path, file_sha256, chain_seq, verified}. With in_thread, seal one thread: the copy keeps that thread's records and only the chain rows and digests of the others, and verifies against the same chain head. Returns {path, file_sha256, chain_seq, thread, records, withheld, verified}."
@@ -1032,12 +1043,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "read",
         title = "Read a file",
         annotations(title = "Read a file", read_only_hint = true, open_world_hint = false),
         description = "Read a text file with 1-based line numbers. Caps: 2,000 lines and 256 KB; the reply says which limit cut it and where to continue. PNG, JPEG, GIF, WebP, TIFF and BMP files come back as an image (scaled to a 1,568 px long edge unless full; at most 8,000 px and 5 MB) plus {path, format, width, height, sent_width, sent_height, bytes, sha256} of the image sent. Other binary files (HEIC, audio) are refused with size and sha256."
     )]
     pub async fn symbia_fs_read(&self, Parameters(args): Parameters<FsReadArgs>) -> Result<CallToolResult, String> {
-        const TOOL: &str = "symbia_fs_read";
+        const TOOL: &str = "read";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let policy = self.policy.clone();
@@ -1063,21 +1075,23 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "list",
         title = "List a folder",
         annotations(title = "List a folder", read_only_hint = true, open_world_hint = false),
         description = "List a directory to depth 1-5 with type, size and mtime_ms; optional glob. Cap 1,000 entries, with a truncated flag."
     )]
     pub async fn symbia_fs_list(&self, Parameters(args): Parameters<FsListArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_list", args, |p, a, f| crate::files::list(p, &a.path, a.depth, a.glob.as_deref(), f)).await
+        self.file_tool("list", args, |p, a, f| crate::files::list(p, &a.path, a.depth, a.glob.as_deref(), f)).await
     }
 
     #[tool(
+        name = "search",
         title = "Search files",
         annotations(title = "Search files", read_only_hint = true, open_world_hint = false),
         description = "Search files (ripgrep engine, respects .gitignore) for a regex or literal. Returns matches with file, line and context. Stops at max_matches or 30 s, flagged."
     )]
     pub async fn symbia_fs_search(&self, Parameters(args): Parameters<FsSearchArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_search", args, |p, a, f| {
+        self.file_tool("search", args, |p, a, f| {
             let s = SearchArgs {
                 pattern: &a.pattern,
                 path: &a.path,
@@ -1093,12 +1107,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "write",
         title = "Write a file",
         annotations(title = "Write a file", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false),
         description = "Write a file atomically (temp file then rename), or with append add to its end (created if missing). Returns {path, bytes, sha256}; append adds size."
     )]
     pub async fn symbia_fs_write(&self, Parameters(args): Parameters<FsWriteArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_write", args, |p, a, f| match (a.create_only.unwrap_or(false), a.append.unwrap_or(false)) {
+        self.file_tool("write", args, |p, a, f| match (a.create_only.unwrap_or(false), a.append.unwrap_or(false)) {
             (true, true) => {
                 f.path = Some(a.path.clone());
                 Err("create_only and append cannot both be set".into())
@@ -1110,21 +1125,30 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "edit",
         title = "Edit a file",
         annotations(title = "Edit a file", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
-        description = "Replace one exact occurrence of old with new, atomically. Refuses zero or several matches. Returns {path, line, sha256_before, sha256_after}."
+        description = "Replace one exact occurrence of old with new, atomically. Refuses zero or several matches. With replace_all, replaces every non-overlapping occurrence (at least one) and adds replaced, the count. Returns {path, line, sha256_before, sha256_after, replaced?}."
     )]
     pub async fn symbia_fs_edit(&self, Parameters(args): Parameters<FsEditArgs>) -> Result<String, String> {
-        self.file_tool("symbia_fs_edit", args, |p, a, f| crate::files::edit(p, &a.path, &a.old, &a.new, f)).await
+        self.file_tool("edit", args, |p, a, f| {
+            if a.replace_all.unwrap_or(false) {
+                crate::files::edit_all(p, &a.path, &a.old, &a.new, f)
+            } else {
+                crate::files::edit(p, &a.path, &a.old, &a.new, f)
+            }
+        })
+        .await
     }
 
     #[tool(
+        name = "exec",
         title = "Run a command",
         annotations(title = "Run a command", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true),
-        description = "Run /bin/zsh -lc <command> in cwd (off macOS: zsh, else bash, else sh), in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last tail_bytes (default 8 KB) of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. If it is still running after yield_ms (default 45 s), returns {job, running: true, pid, started_ms} and the output so far at once, and the command keeps running: follow it with symbia_job. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary. With unsandboxed: true, a command matching an exec_unsandboxed rule runs outside the sandbox: no shell (no pipes, redirects, variables, ~ or globs), the rule's program by its absolute path, recorded with sandbox \"none\". That is a short logged list, not containment: a rule for a program that can run arbitrary code grants exactly that."
+        description = "Run /bin/zsh -lc <command> in cwd (off macOS: zsh, else bash, else sh), in its own process group; killed with its children at timeout_ms. Returns exit (or \"timeout\"), duration_ms and the last tail_bytes (default 8 KB) of stdout and stderr; full output is saved at the named evidence path; an empty stream is left out. If it is still running after yield_ms (default 45 s), returns {job, running: true, pid, started_ms} and the output so far at once, and the command keeps running: follow it with job. Commands run sandboxed: deny-list paths are off limits, the home folder is unreadable outside the roots and a few toolchain files (exec_read), the data directory is read-only, and network may be off. Commands matching exec_deny or Claude Code's Bash(...) deny rules are refused; that check is a policy convenience, not a boundary (eval, $(...), sh -c and scripts get around it); the sandbox is the boundary. With unsandboxed: true, a command matching an exec_unsandboxed rule runs outside the sandbox: no shell (no pipes, redirects, variables, ~ or globs), the rule's program by its absolute path, recorded with sandbox \"none\". That is a short logged list, not containment: a rule for a program that can run arbitrary code grants exactly that."
     )]
     pub async fn symbia_exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_exec";
+        const TOOL: &str = "exec";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let mut facts = Facts::default();
@@ -1172,12 +1196,13 @@ impl SymbiaServer {
     }
 
     #[tool(
+        name = "job",
         title = "Check a job",
         annotations(title = "Check a job", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
-        description = "Follow a command symbia_exec left running. action: status (default), wait (up to wait_ms, default 45,000, at most 50,000), tail (bytes of each stream, 256 to 65,536) or kill (the whole process group). Returns {job, running, pid, started_ms, duration_ms, stdout, stderr}; once it has ended also exit (or \"timeout\" or \"killed\") and evidence paths."
+        description = "Follow a command exec left running. action: status (default), wait (up to wait_ms, default 45,000, at most 50,000), tail (bytes of each stream, 256 to 65,536) or kill (the whole process group). Returns {job, running, pid, started_ms, duration_ms, stdout, stderr}; once it has ended also exit (or \"timeout\" or \"killed\") and evidence paths."
     )]
     pub async fn symbia_job(&self, Parameters(args): Parameters<JobArgs>) -> Result<String, String> {
-        const TOOL: &str = "symbia_job";
+        const TOOL: &str = "job";
         let started = Instant::now();
         let digest = self.begin(&args)?;
         let action = args.action.unwrap_or_default();
@@ -1208,7 +1233,7 @@ impl SymbiaServer {
                 }
             }
             JobAction::Kill => {
-                job.kill("symbia_job");
+                job.kill("job");
                 job.wait(Some(KILL_WAIT)).await;
             }
         }
@@ -1225,6 +1250,13 @@ impl SymbiaServer {
 }
 
 /// Whether a property schema allows JSON type `t`, directly, in a type list, or in an `anyOf` branch.
+/// Today's name for a tool called by its name before R11: `symbia_<name>`, or `symbia_fs_<name>`
+/// for the file tools.
+fn renamed(name: &str) -> Option<String> {
+    let bare = name.strip_prefix("symbia_")?;
+    Some(bare.strip_prefix("fs_").unwrap_or(bare).to_string())
+}
+
 fn allows(schema: &serde_json::Value, t: &str) -> bool {
     match &schema["type"] {
         serde_json::Value::String(s) if s == t => return true,
@@ -1284,6 +1316,12 @@ impl ServerHandler for SymbiaServer {
         }
         // `thread` belongs to the call, not the tool: take it out before the tool sees its arguments.
         let mut request = request;
+        // A client holding a tool list from before R11 still calls symbia_<name>; answer as <name>.
+        if let Some(name) = renamed(&request.name)
+            && self.tool_router.list_all().iter().any(|t| t.name == name)
+        {
+            request.name = name.into();
+        }
         let thread = match request.arguments.as_mut().and_then(|a| a.remove("thread")) {
             None | Some(serde_json::Value::Null) => MAIN_THREAD.to_string(),
             Some(serde_json::Value::String(s)) => s,
@@ -1542,7 +1580,7 @@ mod tests {
             let recs = all_records(&s);
             let keys: Vec<&str> = recs.iter().map(|r| r["key"].as_str().unwrap()).collect();
             let end_key = format!("job.{id}");
-            assert_eq!(keys, ["tool.symbia_exec", "tool.symbia_job", end_key.as_str(), "tool.symbia_job"]);
+            assert_eq!(keys, ["tool.exec", "tool.job", end_key.as_str(), "tool.job"]);
             let (start, end) = (&recs[0], &recs[2]);
             assert_eq!((start["body"]["job"].as_str(), start["body"]["running"].clone()), (Some(id.as_str()), json!(true)));
             assert!(start["body"].get("exit").is_none());
@@ -1599,17 +1637,17 @@ mod tests {
             let id = r["job"].as_str().unwrap().to_string();
             let child: i64 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
             let k = parse(job_call(&s, &id, JobAction::Kill).await);
-            assert_eq!((k["running"].clone(), k["exit"].clone(), k["killed"].clone()), (json!(false), json!("killed"), json!("symbia_job")), "{k}");
+            assert_eq!((k["running"].clone(), k["exit"].clone(), k["killed"].clone()), (json!(false), json!("killed"), json!("job")), "{k}");
             let gone = (0..50).any(|_| {
                 std::thread::sleep(Duration::from_millis(100));
                 !alive(child)
             });
             assert!(gone, "background child {child} still running");
             let end = all_records(&s).into_iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
-            assert_eq!((end["body"]["exit"].clone(), end["body"]["killed"].clone()), (json!("killed"), json!("symbia_job")));
+            assert_eq!((end["body"]["exit"].clone(), end["body"]["killed"].clone()), (json!("killed"), json!("job")));
             // Killing an ended job changes nothing.
             let again = parse(job_call(&s, &id, JobAction::Kill).await);
-            assert_eq!(again["killed"], "symbia_job");
+            assert_eq!(again["killed"], "job");
             assert_eq!(all_records(&s).iter().filter(|r| r["key"] == format!("job.{id}")).count(), 1);
         }
 
@@ -1664,11 +1702,11 @@ mod tests {
         let (_t, stdio) = server();
         for s in [http, stdio] {
             let names: Vec<String> = s.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
-            for n in ["symbia_fs_read", "symbia_fs_list", "symbia_fs_search", "symbia_fs_write", "symbia_fs_edit", "symbia_exec", "symbia_job"] {
+            for n in ["read", "list", "search", "write", "edit", "exec", "job"] {
                 assert!(names.iter().any(|x| x == n), "missing {n}");
             }
             assert_eq!(names.len(), 15);
-            for n in ["symbia_report", "symbia_open", "symbia_promote"] {
+            for n in ["report", "open", "promote"] {
                 assert!(names.iter().any(|x| x == n), "missing {n}");
             }
         }
@@ -1677,7 +1715,7 @@ mod tests {
     #[test]
     fn job_tool_annotations() {
         let (_t, s) = server();
-        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_job").unwrap();
+        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "job").unwrap();
         let a = tool.annotations.unwrap();
         assert_eq!(a.title.as_deref(), Some("Check a job"));
         assert_eq!(
@@ -1750,7 +1788,7 @@ mod tests {
         job_call(&s, &id, JobAction::Wait).await.unwrap();
         let recs = all_records(&s);
         let end = recs.iter().find(|r| r["key"] == format!("job.{id}")).unwrap();
-        let start = recs.iter().find(|r| r["key"] == "tool.symbia_exec").unwrap();
+        let start = recs.iter().find(|r| r["key"] == "tool.exec").unwrap();
         assert_eq!((start["thread"].as_str(), end["thread"].as_str()), (Some("chat-j"), Some("chat-j")));
     }
 
@@ -1781,7 +1819,7 @@ mod tests {
         let e = find(FindArgs { similar: Some("leaky trap".into()), ..Default::default() }).await.unwrap_err();
         assert_eq!(e, crate::embed::NOT_CONFIGURED);
         // Every find is recorded with what it asked and the ids it returned, refusals included.
-        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|r| r["body"]["tool"] == "symbia_find").collect();
+        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|r| r["body"]["tool"] == "find").collect();
         assert_eq!(calls.len(), 5);
         assert_eq!(calls[0]["body"]["retrieval"], json!({"scope": "session", "query": "condensate", "hits": []}));
         assert_eq!(calls[1]["body"]["retrieval"]["hits"][0], all[0]["id"]);
@@ -1827,7 +1865,7 @@ mod tests {
         assert_eq!(r["index_behind"], false);
         // The report recorded itself; grouped by tool, it shows up.
         let by_tool: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs { by: Some("tool".into()), ..Default::default() })).await.unwrap()).unwrap();
-        let g = by_tool["groups"].as_array().unwrap().iter().find(|g| g["group"] == "symbia_report").unwrap();
+        let g = by_tool["groups"].as_array().unwrap().iter().find(|g| g["group"] == "report").unwrap();
         assert_eq!(g["tool_calls"], 1);
         let thread: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs { in_thread: Some("chat-a".into()), ..Default::default() })).await.unwrap()).unwrap();
         assert_eq!(thread["records"], 1);
@@ -1876,7 +1914,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let e = open(OpenArgs { path: outside.path().join("x.sqlite").display().to_string(), ..Default::default() }).await.unwrap_err();
         assert!(e.contains("outside the allowed roots"), "{e}");
-        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|c| c["body"]["tool"] == "symbia_open").collect();
+        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|c| c["body"]["tool"] == "open").collect();
         assert_eq!(calls.len(), 5);
         assert_eq!(calls[0]["body"]["retrieval"]["verified"], true);
         assert!(wdir.join("witness.jsonl").exists());
@@ -1933,7 +1971,7 @@ mod tests {
     #[test]
     fn stale_clients_get_their_string_booleans_and_integers_read() {
         let (_t, s) = server();
-        let exec = s.tools().into_iter().find(|t| t.name == "symbia_exec").unwrap();
+        let exec = s.tools().into_iter().find(|t| t.name == "exec").unwrap();
         let mut args = json!({"command": "true", "cwd": "/tmp", "unsandboxed": "true", "timeout_ms": "500", "yield_ms": "soon", "tail_bytes": 300})
             .as_object()
             .unwrap()
@@ -1941,7 +1979,7 @@ mod tests {
         coerce_args(&exec, &mut args);
         assert_eq!(serde_json::Value::Object(args), json!({"command": "true", "cwd": "/tmp", "unsandboxed": true, "timeout_ms": 500, "yield_ms": "soon", "tail_bytes": 300}));
         // A string field stays a string even when it reads as a boolean.
-        let read = s.tools().into_iter().find(|t| t.name == "symbia_fs_read").unwrap();
+        let read = s.tools().into_iter().find(|t| t.name == "read").unwrap();
         let mut args = json!({"path": "true", "full": "false", "offset": "12"}).as_object().unwrap().clone();
         coerce_args(&read, &mut args);
         assert_eq!(serde_json::Value::Object(args), json!({"path": "true", "full": false, "offset": 12}));
@@ -1954,12 +1992,12 @@ mod tests {
             let schema = serde_json::to_string(&tool.input_schema).unwrap();
             assert!(!schema.contains("$ref"), "{}: {schema}", tool.name);
         }
-        let job = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_job").unwrap();
+        let job = s.tool_router.list_all().into_iter().find(|t| t.name == "job").unwrap();
         let action = serde_json::to_string(&job.input_schema["properties"]["action"]).unwrap();
         for v in ["status", "wait", "tail", "kill"] {
             assert!(action.contains(&format!("\"{v}\"")), "{action}");
         }
-        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_exec").unwrap();
+        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "exec").unwrap();
         assert!(exec.input_schema["properties"].get("unsandboxed").is_some());
     }
 
@@ -1977,8 +2015,8 @@ mod tests {
         let recs = tool_calls(&s);
         assert_eq!(recs.len(), 2);
         let w = &recs[0];
-        assert_eq!((w["key"].as_str(), w["lane"].as_str(), w["model"].as_str()), (Some("tool.symbia_fs_write"), Some("apocryphal"), Some(UNKNOWN_CLIENT)));
-        assert_eq!(w["body"]["tool"], "symbia_fs_write");
+        assert_eq!((w["key"].as_str(), w["lane"].as_str(), w["model"].as_str()), (Some("tool.write"), Some("apocryphal"), Some(UNKNOWN_CLIENT)));
+        assert_eq!(w["body"]["tool"], "write");
         assert_eq!(w["body"]["bytes_returned"], reply.len());
         assert_eq!(w["body"]["truncated"], false);
         assert_eq!(w["body"]["sha256_after"], hex::encode(sha256(b"secret body")));
@@ -2107,7 +2145,7 @@ mod tests {
         assert!(s.symbia_find(Parameters(FindArgs { limit: Some(51), ..Default::default() })).await.is_err());
         // The refused find is itself recorded, so it is the one record found.
         let hits: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { limit: Some(50), ..Default::default() })).await.unwrap()).unwrap();
-        assert_eq!((hits.as_array().unwrap().len(), hits[0]["key"].as_str()), (1, Some("tool.symbia_find")));
+        assert_eq!((hits.as_array().unwrap().len(), hits[0]["key"].as_str()), (1, Some("tool.find")));
     }
 
     #[tokio::test]
@@ -2230,13 +2268,13 @@ mod tests {
     #[test]
     fn record_tool_states_the_link_shape_and_rels() {
         let (_t, s) = server();
-        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_record").unwrap();
+        let tool = s.tool_router.list_all().into_iter().find(|t| t.name == "record").unwrap();
         let d = tool.description.unwrap();
         assert!(d.contains(r#"{"to_id": "<record id>", "rel": "<rel>"}"#), "{d}");
         for rel in crate::record::RELS {
             assert!(d.contains(rel), "{rel}");
         }
-        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "symbia_exec").unwrap().description.unwrap();
+        let exec = s.tool_router.list_all().into_iter().find(|t| t.name == "exec").unwrap().description.unwrap();
         assert!(exec.contains("not a boundary"), "{exec}");
     }
 

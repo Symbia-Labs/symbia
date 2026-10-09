@@ -20,15 +20,15 @@ async fn promote_witness_and_open_over_stdio() {
     std::fs::write(home.join("config.json"), json!({"witness": wdir}).to_string()).unwrap();
     let mut m = Mcp::start(&home).await;
     let rec = json!({"key": "audit.note", "kind": "observation", "lane": "canonical", "lane_reason": "r10", "body": {"text": "boiler two serviced"}, "model": "m"});
-    m.tool(1, "symbia_record", rec).await.unwrap();
-    let p = m.tool(2, "symbia_promote", json!({"confirm": true})).await.unwrap();
+    m.tool(1, "record", rec).await.unwrap();
+    let p = m.tool(2, "promote", json!({"confirm": true})).await.unwrap();
     assert_eq!((p["promoted"].as_bool(), p["ledger_seq"].as_i64()), (Some(true), Some(1)), "{p}");
     let first_seal = p["seal"].as_str().unwrap().to_string();
     let copy = home.join("ledger").join(std::path::Path::new(&first_seal).file_name().unwrap());
-    let opened = m.tool(3, "symbia_open", json!({"path": copy})).await.unwrap();
+    let opened = m.tool(3, "open", json!({"path": copy})).await.unwrap();
     assert_eq!((opened["verified"].as_bool(), opened["witness"].as_str()), (Some(true), Some("ok (1 entries)")), "{opened}");
     assert_eq!(opened["list"][0]["key"], "audit.note");
-    m.tool(4, "symbia_record", json!({"key": "audit.later", "kind": "observation", "lane": "canonical", "lane_reason": "r10", "body": {}, "model": "m"})).await.unwrap();
+    m.tool(4, "record", json!({"key": "audit.later", "kind": "observation", "lane": "canonical", "lane_reason": "r10", "body": {}, "model": "m"})).await.unwrap();
     m.close().await;
 
     // The exit seal is the newest; it checks out against the witness.

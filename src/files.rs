@@ -63,7 +63,7 @@ pub struct Facts {
     pub image: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<String>,
-    /// `symbia_job`'s action.
+    /// `job`'s action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,7 +161,7 @@ pub fn read(policy: &Policy, path: &str, offset: Option<u64>, limit: Option<u64>
     read_at(&real, offset, limit, facts)
 }
 
-/// What `symbia_fs_read` sends back.
+/// What `read` sends back.
 pub enum ReadOut {
     Text(String),
     Image(SentImage),
@@ -206,7 +206,7 @@ pub fn read_any(policy: &Policy, evidence: &Path, path: &str, offset: Option<u64
     let real = checked(policy, path, Access::Read, &mut facts.path)?;
     let mut file = open_nofollow(&real).map_err(|e| open_error(&real, &e))?;
     if file.metadata().map_err(io)?.is_dir() {
-        return Err(format!("{} is a directory; use symbia_fs_list", real.display()));
+        return Err(format!("{} is a directory; use list", real.display()));
     }
     let mut head = Vec::with_capacity(SNIFF_BYTES);
     (&mut file).take(SNIFF_BYTES as u64).read_to_end(&mut head).map_err(io)?;
@@ -254,7 +254,7 @@ fn image_at(real: &Path, data: &[u8], format: crate::images::Format, full: bool,
 fn read_at(real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
     let file = open_nofollow(real).map_err(|e| open_error(real, &e))?;
     if file.metadata().map_err(io)?.is_dir() {
-        return Err(format!("{} is a directory; use symbia_fs_list", real.display()));
+        return Err(format!("{} is a directory; use list", real.display()));
     }
     let start = offset.unwrap_or(1).max(1);
     // The caller's limit applies when it is at or under the cap; above it, the cap does.
@@ -650,15 +650,24 @@ fn occurrences(hay: &str, needle: &str) -> Vec<usize> {
 
 /// Replace the one exact occurrence of `old` with `new`, atomically.
 pub fn edit(policy: &Policy, path: &str, old: &str, new: &str, facts: &mut Facts) -> Result<String, String> {
+    edit_checked(policy, path, old, new, false, facts)
+}
+
+/// Replace every non-overlapping occurrence of `old` with `new` (at least one), atomically.
+pub fn edit_all(policy: &Policy, path: &str, old: &str, new: &str, facts: &mut Facts) -> Result<String, String> {
+    edit_checked(policy, path, old, new, true, facts)
+}
+
+fn edit_checked(policy: &Policy, path: &str, old: &str, new: &str, all: bool, facts: &mut Facts) -> Result<String, String> {
     if old.is_empty() {
         return Err("old is empty".into());
     }
     let real = checked(policy, path, Access::Write, &mut facts.path)?;
-    edit_at(policy, &real, old, new, facts)
+    edit_at(policy, &real, old, new, all, facts)
 }
 
-/// [`edit`] after the policy check, on its realpath.
-fn edit_at(policy: &Policy, real: &Path, old: &str, new: &str, facts: &mut Facts) -> Result<String, String> {
+/// [`edit`] or [`edit_all`] after the policy check, on its realpath.
+fn edit_at(policy: &Policy, real: &Path, old: &str, new: &str, all: bool, facts: &mut Facts) -> Result<String, String> {
     let Some(mut file) = open_target(real)? else {
         return Err(format!("read {}: no such file", real.display()));
     };
@@ -667,23 +676,34 @@ fn edit_at(policy: &Policy, real: &Path, old: &str, new: &str, facts: &mut Facts
     file.read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", real.display()))?;
     facts.sha256_before = Some(hex::encode(crate::canon::sha256(&bytes)));
     let text = std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8 text", real.display()))?;
-    let found = occurrences(text, old);
-    let [pos] = found[..] else {
-        return Err(format!("old matches {} times in {}; it must match exactly once", found.len(), real.display()));
+    let (pos, edited, replaced) = if all {
+        let replaced = text.matches(old).count();
+        let Some(pos) = text.find(old) else {
+            return Err(format!("old matches 0 times in {}", real.display()));
+        };
+        (pos, text.replace(old, new), Some(replaced))
+    } else {
+        let found = occurrences(text, old);
+        let [pos] = found[..] else {
+            return Err(format!("old matches {} times in {}; it must match exactly once", found.len(), real.display()));
+        };
+        (pos, format!("{}{new}{}", &text[..pos], &text[pos + old.len()..]), None)
     };
-    let edited = format!("{}{new}{}", &text[..pos], &text[pos + old.len()..]);
     atomic_write(policy, real, edited.as_bytes(), false, Some(keep)).map_err(|e| format!("write {}: {e}", real.display()))?;
     let before = crate::canon::sha256(&bytes);
     let after = crate::canon::sha256(edited.as_bytes());
     facts.sha256_after = Some(hex::encode(after));
     let line = text[..pos].matches('\n').count() + 1;
-    Ok(json!({
+    let mut reply = json!({
         "path": show(real),
         "line": line,
         "sha256_before": hex_prefix(&before, PREFIX),
         "sha256_after": hex_prefix(&after, PREFIX),
-    })
-    .to_string())
+    });
+    if let Some(n) = replaced {
+        reply["replaced"] = n.into();
+    }
+    Ok(reply.to_string())
 }
 
 #[cfg(test)]
@@ -984,6 +1004,30 @@ mod tests {
     }
 
     #[test]
+    fn edit_all_replaces_every_match_and_counts_them() {
+        let (_t, root, p) = setup();
+        let f = root.join("e.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma beta\n").unwrap();
+        let e = edit_all(&p, &s(&f), "delta", "x", &mut Facts::default()).unwrap_err();
+        assert!(e.starts_with("old matches 0 times"), "{e}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\nbeta\ngamma beta\n");
+        assert_eq!(edit_all(&p, &s(&f), "", "x", &mut Facts::default()).unwrap_err(), "old is empty");
+
+        let mut facts = Facts::default();
+        let r = v(&edit_all(&p, &s(&f), "beta", "delta", &mut facts).unwrap());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\ndelta\ngamma delta\n");
+        assert_eq!((r["replaced"].as_i64(), r["line"].as_i64()), (Some(2), Some(2)));
+        assert_eq!(r["sha256_after"], hex_prefix(&sha256_file(&f).unwrap(), 12));
+        // Non-overlapping, left to right; a single match is fine too.
+        std::fs::write(&f, "aaa").unwrap();
+        let r = v(&edit_all(&p, &s(&f), "aa", "b", &mut Facts::default()).unwrap());
+        assert_eq!((std::fs::read_to_string(&f).unwrap().as_str(), r["replaced"].as_i64()), ("ba", Some(1)));
+        // A plain edit's reply has no count.
+        let r = v(&edit(&p, &s(&f), "ba", "c", &mut Facts::default()).unwrap());
+        assert!(r.get("replaced").is_none());
+    }
+
+    #[test]
     fn symbia_home_refuses_write_and_edit_but_evidence_reads() {
         let t = tempfile::tempdir().unwrap();
         let user = t.path().join("user");
@@ -1023,7 +1067,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &f).unwrap();
         let e = read_at(&real, None, None, &mut Facts::default()).unwrap_err();
         assert!(e.contains("is a symlink"), "{e}");
-        let e = edit_at(&p, &real, "secret", "owned", &mut Facts::default()).unwrap_err();
+        let e = edit_at(&p, &real, "secret", "owned", false, &mut Facts::default()).unwrap_err();
         assert!(e.contains("is a symlink"), "{e}");
         let e = write_at(&p, &real, "owned", false, &mut Facts::default()).unwrap_err();
         assert!(e.contains("is a symlink"), "{e}");

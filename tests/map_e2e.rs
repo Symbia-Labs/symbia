@@ -32,11 +32,11 @@ async fn map_run_prediction_then_result() {
     let client = spawn(t.path()).await;
 
     let tools: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    for name in ["symbia_status", "symbia_record", "symbia_find", "symbia_get", "symbia_seal"] {
+    for name in ["status", "record", "find", "get", "seal"] {
         assert!(tools.iter().any(|t| t == name), "missing tool {name}");
     }
 
-    let status = call(&client, "symbia_status", json!({})).await.unwrap();
+    let status = call(&client, "status", json!({})).await.unwrap();
     assert_eq!(status["retention"], "session");
     let session = status["session"].as_str().unwrap().to_string();
     assert!(Path::new(status["file"].as_str().unwrap()).starts_with(t.path()));
@@ -44,7 +44,7 @@ async fn map_run_prediction_then_result() {
     // 1. Register the prediction before measuring.
     let pred_reply = call_text(
         &client,
-        "symbia_record",
+        "record",
         json!({
             "key": "map.boiler.pressure",
             "kind": "prediction",
@@ -62,14 +62,14 @@ async fn map_run_prediction_then_result() {
     let pred_id = pred["id"].as_str().unwrap().to_string();
 
     // 2. Seal with only the prediction on the chain.
-    let seal1 = call(&client, "symbia_seal", json!({})).await.unwrap();
+    let seal1 = call(&client, "seal", json!({})).await.unwrap();
     assert_eq!(seal1["verified"], true);
     assert_eq!(seal1["chain_seq"], 1);
 
     // 3. Record the measured result, linked to the prediction.
     let res = call(
         &client,
-        "symbia_record",
+        "record",
         json!({
             "key": "map.boiler.pressure.result",
             "kind": "result",
@@ -85,24 +85,24 @@ async fn map_run_prediction_then_result() {
     let res_id = res["id"].as_str().unwrap().to_string();
 
     // 4. Seal again.
-    let seal2 = call(&client, "symbia_seal", json!({})).await.unwrap();
+    let seal2 = call(&client, "seal", json!({})).await.unwrap();
     assert_eq!(seal2["verified"], true);
     assert_eq!(seal2["chain_seq"], 2);
     assert_ne!(seal1["path"], seal2["path"]);
 
     // The prediction sits earlier on the chain than its result.
-    let p = call(&client, "symbia_get", json!({"id": pred_id})).await.unwrap();
-    let r = call(&client, "symbia_get", json!({"key": "map.boiler.pressure.result"})).await.unwrap();
+    let p = call(&client, "get", json!({"id": pred_id})).await.unwrap();
+    let r = call(&client, "get", json!({"key": "map.boiler.pressure.result"})).await.unwrap();
     assert!(p["seq"].as_i64().unwrap() < r["seq"].as_i64().unwrap());
     assert!(pred["seq"].as_i64().unwrap() < res["seq"].as_i64().unwrap());
     assert_eq!(r["links"], json!([{"to_id": pred_id, "rel": "results_of", "to_session": null}]));
     assert_eq!(p["linked_from"], json!([{"from_id": res_id, "rel": "results_of"}]));
     assert!(p["at_ms"].as_i64().unwrap() <= r["at_ms"].as_i64().unwrap());
 
-    let found = call(&client, "symbia_find", json!({"query": "pressure", "kind": "prediction"})).await.unwrap();
+    let found = call(&client, "find", json!({"query": "pressure", "kind": "prediction"})).await.unwrap();
     assert_eq!(found, json!([{"id": pred_id, "key": "map.boiler.pressure", "version": 1, "kind": "prediction", "lane": "conditional", "thread": "main"}]));
 
-    let status = call(&client, "symbia_status", json!({})).await.unwrap();
+    let status = call(&client, "status", json!({})).await.unwrap();
     // Two records and the find, which is recorded as a tool call.
     assert_eq!(status["seq"], 3);
     assert_eq!(status["last_seal"]["chain_seq"], 2);

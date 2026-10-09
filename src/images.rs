@@ -1,4 +1,4 @@
-//! Images for `symbia_fs_read`: detected by magic bytes, scaled to fit, sent as MCP image content.
+//! Images for `read`: detected by magic bytes, scaled to fit, sent as MCP image content.
 
 use std::io::Cursor;
 

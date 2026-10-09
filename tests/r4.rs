@@ -22,7 +22,7 @@ async fn an_image_read_is_image_content_on_the_wire() {
     std::fs::write(t.path().join("config.json"), json!({"roots": [root.path()]}).to_string()).unwrap();
     std::fs::write(root.path().join("shot.png"), png(32, 16)).unwrap();
     let mut m = Mcp::start(t.path()).await;
-    m.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "symbia_fs_read", "arguments": {"path": root.path().join("shot.png")}}}))
+    m.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "read", "arguments": {"path": root.path().join("shot.png")}}}))
         .await;
     let r = m.reply(1).await;
     let content = &r["result"]["content"];
@@ -40,10 +40,10 @@ async fn sigterm_kills_a_running_job_records_it_and_seals() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(t.path().join("config.json"), json!({"roots": [root.path()]}).to_string()).unwrap();
     let mut m = Mcp::start(t.path()).await;
-    let r = m.tool(1, "symbia_exec", json!({"command": "echo going; sleep 60", "cwd": root.path(), "yield_ms": 300})).await.unwrap();
+    let r = m.tool(1, "exec", json!({"command": "echo going; sleep 60", "cwd": root.path(), "yield_ms": 300})).await.unwrap();
     let job = r["job"].as_str().unwrap().to_string();
     let pid = i32::try_from(r["pid"].as_i64().unwrap()).unwrap();
-    let status = m.tool(2, "symbia_status", json!({})).await.unwrap();
+    let status = m.tool(2, "status", json!({})).await.unwrap();
     assert_eq!(status["jobs"][0]["job"], job.as_str());
 
     let server = i32::try_from(m.child.id().unwrap()).unwrap();
