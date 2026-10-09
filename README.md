@@ -28,7 +28,8 @@ The binary is `target/release/symbia`.
 | --- | --- |
 | `symbia mcp` | MCP over stdio. The session opens on the first tool call: it resumes the previous session if that one is free, unexpired and written within `resume_window_ms` (default 4 h; `0` turns resume off), otherwise a new one. The first reply says which. |
 | `symbia serve [--listen ip:port] [--allow-remote]` | MCP over streamable HTTP at `/mcp`, default `127.0.0.1:7341`. Each MCP session gets its own session file. |
-| `symbia verify <sealed.sqlite> [--trust <hex>]...` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>`, or exit 1 and the reason. |
+| `symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder>]` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>` (for a thread seal, also the thread and its kept and withheld counts), or exit 1 and the reason. With `--witness`, also check the seal against the witness file. |
+| `symbia prune-legacy [--confirm]` | Remove seals made by builds before seals recorded a reason, where a newer full seal of the same session covers them. Each is written to the witness first, so a witness must be set. A dry run unless `--confirm`. |
 | `symbia trust add <hex> <label>` / `symbia trust list` | Pin a public key, or list pinned keys. |
 | `symbia --version` | Print the build. |
 
@@ -117,7 +118,9 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 | `sessions/` | Live session files, one SQLite file per session, and a `.lock` beside each one a `symbia mcp` process holds. |
 | `seals/` | Sealed copies and their signed `.seal.json` sidecars. |
 | `evidence/` | Full stdout and stderr of `exec` runs and images as sent by `read`, named by sha256. |
-| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock`, `exec_unsandboxed` and `read_roots` tune the shell sandbox and the file tools; `resume_window_ms` sets how `symbia mcp` resumes sessions. |
+| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock`, `exec_unsandboxed` and `read_roots` tune the shell sandbox and the file tools; `resume_window_ms` sets how `symbia mcp` resumes sessions; `embed` sets up search by meaning (see Search); `witness` names the witness folder (see Auditing). |
+| `index.sqlite` | The search index across sessions and seals. Derived data: safe to delete. |
+| `ledger/` | Promoted seals and `ledger.sqlite`, the long-lived ledger. |
 
 **Path policy.** The file and shell tools accept only absolute paths inside the configured roots (default: your home folder). A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Files are opened with `O_NOFOLLOW`, and a write re-checks its folder just before the rename. These are always refused, even inside a root:
 
@@ -126,7 +129,7 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 - `~/Library/Keychains`, `~/Library/Cookies`, `~/Library/Application Support/Claude`
 - `$SYMBIA_HOME/keys`
 
-**Read-only data directory.** The tools never write under `SYMBIA_HOME`: `write`, `edit` and a `exec` working directory there are refused. `evidence/` can be read with `read`.
+**Read-only data directory.** The tools never write under `SYMBIA_HOME`: `write`, `edit` and an `exec` working directory there are refused. `evidence/` can be read with `read`.
 
 **Shell sandbox (macOS).** `exec` runs each command under the macOS sandbox. The deny list above is unreadable and unwritable, `SYMBIA_HOME` is unwritable, and by default (`"exec_read": "home"`) nothing in your home folder is readable except the roots, a few shell and toolchain files, and `evidence/`. `"exec_network": "deny"` also blocks outbound network. A command cannot start a sandbox of its own inside this one. On Linux there is no sandbox yet.
 
@@ -142,11 +145,13 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 2. The sidecar's public key is pinned.
 3. The sealed file's sha256 matches the sidecar.
 4. The signature over the file sha256 and chain head is valid.
-5. The file's retention is `seal` and its format is known.
-6. The chain walks from genesis: seqs are consecutive, each `prev_hash` matches the previous hash, and each hash is recomputed from its row.
+5. The file's retention is `seal`, its format is known, and the sidecar names the same thread as the file.
+6. The chain walks from genesis: seqs are consecutive, each `prev_hash` matches the previous hash, and each hash is recomputed from its row, thread included.
 7. Every record id is recomputed; every record's time and session match its chain row, and its cost fields are filled.
-8. No record or link sits off the chain.
-9. The sidecar's seq and head match the end of the chain.
+8. In a thread seal, every record of the sealed thread is present, no other thread's record is, and each withheld row's stored digest recomputes its chain hash.
+9. No record or link sits off the chain.
+10. The sidecar's seq and head match the end of the chain.
+11. With `--witness`, the file's chain matches every head the witness recorded for its session; a seal older than the newest witnessed one reports `behind`.
 
 ## Privacy Policy
 
