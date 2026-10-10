@@ -22,6 +22,7 @@ Both must pass; CI runs them on macOS and Linux for every pull request. On macOS
 - Retention values are `session`, `seal` and `ledger`. Lanes are `canonical`, `conditional` and `apocryphal`.
 - Tool replies stay short and return references (id, version, seq, digest prefix), not whole records, except `get`.
 - Crate versions are pinned exactly in `Cargo.toml`.
+- Docs change in the same pull request as the code: README, CHANGELOG, and a `docs/R<n>.md` for a round. A new command needs its README mention and a new tool its row in the README's Tools table; `tests/docs_sync.rs` fails without them.
 - A change to the file format bumps `FORMAT`, keeps older seals verifying, and regenerates `examples/` (see `examples/README.md`).
 
 ## Security problems

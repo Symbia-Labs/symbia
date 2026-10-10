@@ -294,6 +294,8 @@ The same queries work on your own seals in the data folder's `seals/` (see Data 
 | `report` | Sums records by thread, tool, kind, model or day: tool calls, characters returned to the model, host time, errors and refusals, estimates against actuals, and predictions with their results and verdicts. |
 | `get` | Returns one full record with its links and thread, by id or by key and version. |
 | `seal` | Seals the session into a signed, verified copy under `seals/`, or with `in_thread` seals one thread. |
+| `open` | Verifies a sealed copy against your pinned keys (and the witness, when one is set) and lists its newest records, or returns one in full. See Auditing. |
+| `promote` | Copies a verified seal into `ledger/` and records the promotion in the long-lived ledger; a dry run unless `confirm` is true. See Auditing. |
 | `read` | Reads a text file with line numbers, up to 2,000 lines and 256 KB per call. PNG, JPEG, GIF, WebP, TIFF and BMP files (detected by their bytes) come back as an image: scaled to a 1,568 px long edge unless `full: true`, never over 8,000 px or 5 MB, TIFF and BMP as PNG. The image as sent is kept as evidence. Other binary files, HEIC and audio included, are refused. |
 | `list` | Lists a folder to depth 1–5, up to 1,000 entries. |
 | `search` | Searches files for a regex or literal, respecting `.gitignore`. |
@@ -302,7 +304,7 @@ The same queries work on your own seals in the data folder's `seals/` (see Data 
 | `exec` | Runs a shell command with a timeout (up to 1 hour) and saves its full output as evidence. A command still running after `yield_ms` (default 45 s) becomes a job: the call returns its id and output so far, and the command keeps running. `tail_bytes` sizes the output tails. |
 | `job` | Follows a job: `status`, `wait` (up to 50 s), `tail` or `kill` (the whole process group). Once it ends, gives the exit and evidence paths. |
 
-`open` and `promote` are described under Auditing. That is 15 tools. Earlier builds named them `symbia_<name>` (the file tools `symbia_fs_<name>`); a client still holding those names reaches the same tools, and the calls are recorded under the new names. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
+That is 15 tools. Earlier builds named them `symbia_<name>` (the file tools `symbia_fs_<name>`); a client still holding those names reaches the same tools, and the calls are recorded under the new names. Every call to a file or shell tool writes a `tool_call` record on the `apocryphal` lane. The record holds digests of the arguments and of any file read or written, not the file contents. A job's end gets its own `tool_call` record, keyed `job.<id>`, that `revises` the record of the call that started it. Jobs belong to the server process: when it shuts down, running jobs are killed, recorded as `killed: "shutdown"`, and sealed.
 
 ## Threads
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The README's Tools table now has rows for `open` and `promote`. A new test, `tests/docs_sync.rs`, fails when a command in `symbia`'s usage text isn't named in the README, or when a tool has no row in the Tools table.
+
 ## 0.1.1
 
 - `symbia show <seal>` and `symbia get <seal> <key or id>`: read a seal from the command line without writing SQL. Both verify the seal first, as `verify` does, and refuse one that fails. `show` prints the records in chain order, each prediction with its verdict, and the commands run; `get` prints one record in full as JSON. The README walkthrough now uses them, and the SQL queries move to an "It's just SQLite" section. ([#1](https://github.com/Symbia-Labs/symbia/issues/1))
