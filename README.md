@@ -31,6 +31,8 @@ The binary is `target/release/symbia`.
 | `symbia mcp` | MCP over stdio. The session opens on the first tool call: it resumes the previous session if that one is free, unexpired and written within `resume_window_ms` (default 4 h; `0` turns resume off), otherwise a new one. The first reply says which. |
 | `symbia serve [--listen ip:port] [--allow-remote]` | MCP over streamable HTTP at `/mcp`, default `127.0.0.1:7341`. Each MCP session gets its own session file. |
 | `symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder>]` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>` (for a thread seal, also the thread and its kept and withheld counts), or exit 1 and the reason. With `--witness`, also check the seal against the witness file. |
+| `symbia show <sealed.sqlite> [--trust <hex>]...` | Verify a seal as `verify` does, then print its records in chain order, each prediction with its verdict (held, broke, mixed or open), and the commands run through `exec`. A seal that fails is not shown: exit 1 and the reason. |
+| `symbia get <sealed.sqlite> <key or id> [--trust <hex>]...` | Verify a seal, then print one record in full as JSON: by id, or the newest version of a key, with its links both ways. Exit 1 if the seal fails or holds no such record. |
 | `symbia prune-legacy [--confirm]` | Remove seals made by builds before seals recorded a reason, where a newer full seal of the same session covers them. Each is written to the witness first, so a witness must be set. A dry run unless `--confirm`. |
 | `symbia trust add <hex> <label>` / `symbia trust list` | Pin a public key, or list pinned keys. |
 | `symbia --version` | Print the build. |
@@ -60,7 +62,7 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 
 ## Try it on the example seals
 
-[`examples/`](examples/) holds real seals from a short run of two agents, signed by a throwaway example key. agent-a predicted that `orders.csv` holds 3 orders and that the amounts sum to 100, measured both with shell commands, and recorded the results: the first held and the second broke. agent-b searched the file and left a note. You can check all of it with `symbia` and `sqlite3`, without running an agent. The queries need SQLite 3.45 or later, which reads the binary JSON that record bodies are stored in.
+[`examples/`](examples/) holds real seals from a short run of two agents, signed by a throwaway example key. agent-a predicted that `orders.csv` holds 3 orders and that the amounts sum to 100, measured both with shell commands, and recorded the results: the first held and the second broke. agent-b searched the file and left a note. You can check and read all of it with `symbia` alone, without running an agent or writing any SQL.
 
 ```sh
 git clone https://github.com/Symbia-Labs/symbia && cd symbia/examples
@@ -86,16 +88,83 @@ Someone moved agent-b's note from the `conditional` lane to `canonical` after th
 ```sh
 symbia verify seals/tampered.sqlite --trust $KEY          # file sha256 mismatch          (exit 1)
 symbia verify seals/tampered-rehashed.sqlite --trust $KEY # signature invalid             (exit 1)
-
-sqlite3 -readonly seals/tampered.sqlite "SELECT lane FROM records WHERE key = 'review.orders'"   # canonical
-sqlite3 -readonly seals/session.sqlite  "SELECT lane FROM records WHERE key = 'review.orders'"   # conditional
 ```
 
 The second copy rewrote the file hash in the sidecar to match the edit. The signature covers that hash, and only the holder of the private key can sign a new one. To accept seals from another machine for good, pin its key with `symbia trust add <hex> <label>` and drop `--trust`.
 
-### Query
+### Read
 
-A seal is a SQLite file. Open it with `-readonly` or work on a copy: any write changes the file's hash, and the seal no longer verifies.
+`symbia show` verifies a seal the way `verify` does, then prints every record in chain order, each prediction with its verdict, and the commands the agents ran:
+
+```sh
+symbia show seals/session.sqlite --trust $KEY
+```
+
+```
+ok 1791560407633-0e8022e0 seq 9 head ec1ea4fc7103
+
+seq  thread   kind         lane         key
+1    agent-a  tool_call    apocryphal   tool.write
+2    agent-a  prediction   canonical    orders.rows
+3    agent-a  prediction   canonical    orders.total
+4    agent-a  tool_call    apocryphal   tool.exec
+5    agent-a  tool_call    apocryphal   tool.exec
+6    agent-a  result       canonical    orders.rows.result
+7    agent-a  result       canonical    orders.total.result
+8    agent-b  tool_call    apocryphal   tool.search
+9    agent-b  observation  conditional  review.orders
+
+prediction    verdict  claim
+orders.rows   held     orders.csv holds 3 orders
+orders.total  broke    the amounts sum to 100
+
+command                                                  exit  host_ms  chars
+tail -n +2 orders.csv | wc -l | tr -d ' '                0     61       225
+awk -F, 'NR > 1 { s += $2 } END { print s }' orders.csv  0     45       226
+```
+
+A seal that fails verification is not shown: `symbia show seals/tampered.sqlite --trust $KEY` prints `file sha256 mismatch` and exits 1. On the thread seal, the two rows agent-a's seal withholds show as `(withheld)`.
+
+`symbia get` prints one record in full as JSON, by key (the newest version) or by id, with its links both ways:
+
+```sh
+symbia get seals/session.sqlite orders.total.result --trust $KEY
+```
+
+```
+{
+  "at_ms": 1791560407772,
+  "body": {
+    "held": false,
+    "note": "the amounts sum to 90, not 100",
+    "total": 90
+  },
+  …
+  "links": [
+    {
+      "rel": "results_of",
+      "to_id": "69bb4a6b45b94211768fe30eb2a33b3a070e0e1a9c7cd647d8449a85568f2208",
+      …
+```
+
+A command's full output is in the evidence folder, named by its sha256. The record holds only the hash:
+
+```sh
+sha=$(symbia get seals/session.sqlite tool.exec --trust $KEY | jq -r .body.stdout_sha256)
+cat evidence/$sha                  # 90
+shasum -a 256 evidence/$sha        # the same sha256
+```
+
+### It's just SQLite
+
+You don't need `symbia` to read a seal. It's a SQLite file, and everything above comes from plain queries. Open it with `-readonly` or work on a copy: any write changes the file's hash, and the seal no longer verifies. The queries below need SQLite 3.45 or later, which reads the binary JSON that record bodies are stored in.
+
+The edit in the tampered copies, side by side:
+
+```sh
+sqlite3 -readonly seals/tampered.sqlite "SELECT lane FROM records WHERE key = 'review.orders'"   # canonical
+sqlite3 -readonly seals/session.sqlite  "SELECT lane FROM records WHERE key = 'review.orders'"   # conditional
+```
 
 Every record in chain order, with its thread and lane:
 

@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod keys;
 pub mod mcp;
 pub mod policy;
+pub mod read;
 pub mod record;
 pub mod rules;
 pub mod seal;

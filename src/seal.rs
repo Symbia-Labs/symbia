@@ -244,12 +244,41 @@ pub fn prune_legacy(home: &Path, witness: &Path, confirm: bool) -> anyhow::Resul
     Ok(out)
 }
 
+/// How long a seal waits for its witness line. The witness folder may sit behind a macOS
+/// privacy prompt (Documents, Desktop, iCloud Drive), and opening a file there blocks until
+/// someone answers the prompt.
+pub const WITNESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Write a new seal to the store's witness folder; a failure goes to stderr.
 fn witness(store: &Store, sidecar: &Sidecar) {
-    if let Some(dir) = store.witness()
-        && let Err(e) = crate::witness::append(dir, &crate::witness::Entry::from_sidecar(sidecar))
-    {
-        eprintln!("symbia: witness write to {} failed: {e:#}", dir.display());
+    if let Some(dir) = store.witness() {
+        witness_within(dir, sidecar, WITNESS_WAIT);
+    }
+}
+
+/// Append the seal's witness line on a thread of its own and wait at most `wait` for it. A
+/// write still blocked after that is left to finish by itself and the seal goes ahead, so one
+/// stuck folder can't hold the store. Returns whether the line landed in time.
+fn witness_within(dir: &Path, sidecar: &Sidecar, wait: std::time::Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (to, entry) = (dir.to_path_buf(), crate::witness::Entry::from_sidecar(sidecar));
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::witness::append(&to, &entry).map_err(|e| format!("{e:#}")));
+    });
+    match rx.recv_timeout(wait) {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            eprintln!("symbia: witness write to {} failed: {e}", dir.display());
+            false
+        }
+        Err(_) => {
+            eprintln!(
+                "symbia: witness write to {} did not finish within {} ms; the seal stands, and the line is written if the folder becomes writable",
+                dir.display(),
+                wait.as_millis()
+            );
+            false
+        }
     }
 }
 
@@ -1199,6 +1228,33 @@ mod tests {
         let again = seal(&s, &key).unwrap();
         assert_eq!((again.sidecar.chain_seq, again.sidecar.reason.as_deref()), (7, Some("explicit")));
         assert!(verify(&again.path).is_ok(), "the reason is not signed, so rewriting it keeps the seal valid");
+    }
+
+    /// A witness file that can't be opened yet (here a FIFO with no reader, as a privacy
+    /// prompt holds an open in a protected folder) doesn't hold the seal past the wait, and
+    /// the line still arrives once the file opens.
+    #[test]
+    fn a_blocked_witness_does_not_hold_the_seal() {
+        use std::io::Read;
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("sym");
+        let mut s = Store::create(&home).unwrap();
+        let key = crate::keys::load_or_create(&home).unwrap();
+        s.write(&input("a", json!(1)), Instant::now()).unwrap();
+        let sealed = seal(&s, &key).unwrap();
+        let wdir = t.path().join("witness");
+        std::fs::create_dir_all(&wdir).unwrap();
+        let fifo = std::ffi::CString::new(wdir.join(crate::witness::FILE).to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert!(!witness_within(&wdir, &sealed.sidecar, std::time::Duration::from_millis(200)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the seal waited {:?}", started.elapsed());
+
+        let mut line = String::new();
+        std::fs::File::open(wdir.join(crate::witness::FILE)).unwrap().read_to_string(&mut line).unwrap();
+        let e: crate::witness::Entry = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(e, crate::witness::Entry::from_sidecar(&sealed.sidecar));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use rmcp::ServiceExt;
 const USAGE: &str = "usage: symbia mcp
        symbia serve [--listen 127.0.0.1:7341] [--allow-remote]
        symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder or witness.jsonl>]
+       symbia show <sealed.sqlite> [--trust <hex>]...
+       symbia get <sealed.sqlite> <key or id> [--trust <hex>]...
        symbia prune-legacy [--confirm]
        symbia trust add <hex> <label>
        symbia trust list
@@ -25,6 +27,14 @@ fn main() -> ExitCode {
         ["verify", rest @ ..] => match parse_verify(rest) {
             Some(v) => run_verify(Path::new(v.path), &v.trust, v.witness.map(Path::new)),
             None => usage(),
+        },
+        ["show", rest @ ..] => match parse_read(rest) {
+            Some((p, trust)) if p.len() == 1 => run_show(Path::new(p[0]), &trust),
+            _ => usage(),
+        },
+        ["get", rest @ ..] => match parse_read(rest) {
+            Some((p, trust)) if p.len() == 2 => run_get(Path::new(p[0]), p[1], &trust),
+            _ => usage(),
         },
         ["prune-legacy"] => report("symbia prune-legacy", prune_legacy(false)),
         ["prune-legacy", "--confirm"] => report("symbia prune-legacy", prune_legacy(true)),
@@ -104,6 +114,25 @@ fn parse_verify<'a>(mut rest: &[&'a str]) -> Option<VerifyArgs<'a>> {
     }
 }
 
+/// Positional arguments and any number of `--trust <hex>`, in any order.
+fn parse_read<'a>(mut rest: &[&'a str]) -> Option<(Vec<&'a str>, Vec<&'a str>)> {
+    let (mut pos, mut trust) = (Vec::new(), Vec::new());
+    loop {
+        match rest {
+            [] => return Some((pos, trust)),
+            ["--trust", key, tail @ ..] => {
+                trust.push(*key);
+                rest = tail;
+            }
+            [p, tail @ ..] if !p.starts_with("--") => {
+                pos.push(*p);
+                rest = tail;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// How long in-flight tool calls get to finish before the exit seal.
 const DRAIN: Duration = Duration::from_secs(5);
 
@@ -169,14 +198,14 @@ fn run_serve(listen: String, remote: bool) -> anyhow::Result<()> {
     r
 }
 
-/// Exit 0 with `ok ...`, 1 with a one-line reason (a witness mismatch included), or 2 for a
-/// bad `--trust` key.
-fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
+/// The pinned keys plus each `--trust` key; `Err` is the exit code after the message: 1 when
+/// the pins can't be read, 2 for a bad `--trust` key.
+fn trusted_keys(extra: &[&str]) -> Result<Vec<String>, ExitCode> {
     let mut trusted = match symbia::home::from_env().and_then(|h| symbia::trust::load(&h)) {
         Ok(list) => list.into_iter().map(|t| t.public_key).collect::<Vec<_>>(),
         Err(e) => {
             eprintln!("cannot read trusted keys: {e:#}");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
     for k in extra {
@@ -184,16 +213,86 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
             Ok(k) => trusted.push(k),
             Err(e) => {
                 eprintln!("--trust: {e}");
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
         }
     }
+    Ok(trusted)
+}
+
+/// `ok <session> seq N head <12 hex>`, plus the thread and its counts for a thread seal.
+fn ok_line(v: &symbia::seal::Verified) -> String {
+    match &v.thread {
+        Some(t) => format!("ok {} seq {} head {} thread {t}: {} records, {} withheld", v.session, v.chain_seq, &v.chain_head[..12], v.records, v.withheld),
+        None => format!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]),
+    }
+}
+
+/// Verify `path` as `verify` does, then open it. `Err` is the exit code after the reason.
+fn verified(path: &Path, extra: &[&str]) -> Result<(symbia::seal::Verified, rusqlite::Connection), ExitCode> {
+    let trusted = trusted_keys(extra)?;
+    let v = symbia::seal::verify_trusted(path, &trusted).map_err(|reason| {
+        eprintln!("{reason}");
+        ExitCode::FAILURE
+    })?;
+    let conn = symbia::read::open(path).map_err(|e| {
+        eprintln!("cannot open {}: {e:#}", path.display());
+        ExitCode::FAILURE
+    })?;
+    Ok((v, conn))
+}
+
+/// Verify a seal, then print the verify line, its chain, its predictions with their verdicts
+/// and the commands it ran. A seal that fails is not read: exit 1 with the reason.
+fn run_show(path: &Path, extra: &[&str]) -> ExitCode {
+    let (v, conn) = match verified(path, extra) {
+        Ok(x) => x,
+        Err(code) => return code,
+    };
+    match symbia::read::show(&conn) {
+        Ok(text) => {
+            println!("{}\n\n{text}", ok_line(&v));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e:#}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Verify a seal, then print one record in full as JSON: by id, or the newest version of a key.
+fn run_get(path: &Path, key_or_id: &str, extra: &[&str]) -> ExitCode {
+    let (_, conn) = match verified(path, extra) {
+        Ok(x) => x,
+        Err(code) => return code,
+    };
+    match symbia::read::record(&conn, key_or_id) {
+        Ok(Some(r)) => {
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("no record {key_or_id} in this seal");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("cannot read {}: {e:#}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Exit 0 with `ok ...`, 1 with a one-line reason (a witness mismatch included), or 2 for a
+/// bad `--trust` key.
+fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
+    let trusted = match trusted_keys(extra) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
     match symbia::seal::verify_trusted(path, &trusted) {
         Ok(v) => {
-            match &v.thread {
-                Some(t) => println!("ok {} seq {} head {} thread {t}: {} records, {} withheld", v.session, v.chain_seq, &v.chain_head[..12], v.records, v.withheld),
-                None => println!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]),
-            }
+            println!("{}", ok_line(&v));
             for x in &v.external {
                 println!("external {} {} {} session {}", &x.from_id[..12], x.rel, &x.to_id[..x.to_id.len().min(12)], x.session);
             }
