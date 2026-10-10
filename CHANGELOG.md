@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
 - `symbia show <seal>` and `symbia get <seal> <key or id>`: read a seal from the command line without writing SQL. Both verify the seal first, as `verify` does, and refuse one that fails. `show` prints the records in chain order, each prediction with its verdict, and the commands run; `get` prints one record in full as JSON. The README walkthrough now uses them, and the SQL queries move to an "It's just SQLite" section. ([#1](https://github.com/Symbia-Labs/symbia/issues/1))
 - A seal no longer waits more than 5 seconds for its witness line. A witness folder behind a macOS privacy prompt (Documents, Desktop, iCloud Drive) used to block the seal, and with it every tool call, until someone answered the prompt. The write now finishes in the background once the folder opens, and the delay goes to stderr.
