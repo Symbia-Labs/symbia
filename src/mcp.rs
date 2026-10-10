@@ -1667,7 +1667,17 @@ mod tests {
             // A job's tail action takes its own size.
             let r = exec(&s, &format!("{cmd}; sleep 30"), w.path(), 300, None).await;
             let id = r["job"].as_str().unwrap();
-            assert_eq!(r["stdout"]["tail"].as_str().unwrap().len(), 2500, "all 2,500 bytes fit the default 8 KB tail");
+            // The first reply may come before the loop has printed everything on a loaded
+            // machine; wait for all of it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let full = loop {
+                let t = parse(s.symbia_job(Parameters(JobArgs { job: id.into(), action: Some(JobAction::Tail), wait_ms: None, bytes: None })).await);
+                if t["stdout"]["bytes"] == 2500 || std::time::Instant::now() > deadline {
+                    break t;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_eq!(full["stdout"]["tail"].as_str().unwrap().len(), 2500, "all 2,500 bytes fit the default 8 KB tail");
             let t = parse(s.symbia_job(Parameters(JobArgs { job: id.into(), action: Some(JobAction::Tail), wait_ms: None, bytes: Some(256) })).await);
             assert_eq!(t["stdout"]["tail"].as_str().unwrap().len(), 256);
             assert_eq!(t["running"], true);
