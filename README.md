@@ -29,8 +29,8 @@ The binary is `target/release/symbia`.
 | Command | What it does |
 | --- | --- |
 | `symbia mcp` | MCP over stdio. The session opens on the first tool call: it resumes the previous session if that one is free, unexpired and written within `resume_window_ms` (default 4 h; `0` turns resume off), otherwise a new one. The first reply says which. |
-| `symbia serve [--listen ip:port] [--allow-remote]` | MCP over streamable HTTP at `/mcp`, default `127.0.0.1:7341`. Each MCP session gets its own session file. |
-| `symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder>]` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>` (for a thread seal, also the thread and its kept and withheld counts), or exit 1 and the reason. With `--witness`, also check the seal against the witness file. |
+| `symbia serve [--listen ip:port] [--allow-remote]` | MCP over streamable HTTP at `/mcp`, default `127.0.0.1:7341`. Each MCP session gets its own session file, locked while it is served. `--allow-remote` (any address other than loopback) needs `SYMBIA_HTTP_TOKEN` set to a secret of at least 32 characters; every request must then carry `Authorization: Bearer <token>`. Set on loopback, the token is required there too. |
+| `symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder>]` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>` (for a thread seal, also the thread and its kept and withheld counts), or exit 1 and the reason. With `--witness`, also check the seal against the witness file: a seal the witness never saw, or one older than the newest it saw, exits 1 with `witness not witnessed` or `witness behind` on stderr. |
 | `symbia show <sealed.sqlite> [--trust <hex>]...` | Verify a seal as `verify` does, then print its records in chain order, each prediction with its verdict (held, broke, mixed or open), and the commands run through `exec`. A seal that fails is not shown: exit 1 and the reason. |
 | `symbia get <sealed.sqlite> <key or id> [--trust <hex>]...` | Verify a seal, then print one record in full as JSON: by id, or the newest version of a key, with its links both ways. Exit 1 if the seal fails or holds no such record. |
 | `symbia prune-legacy [--confirm]` | Remove seals made by builds before seals recorded a reason, where a newer full seal of the same session covers them. Each is written to the witness first, so a witness must be set. A dry run unless `--confirm`. |
@@ -63,6 +63,8 @@ claude mcp add --scope user symbia -- /absolute/path/to/symbia mcp
 ## Try it on the example seals
 
 [`examples/`](examples/) holds real seals from a short run of two agents, signed by a throwaway example key. agent-a predicted that `orders.csv` holds 3 orders and that the amounts sum to 100, measured both with shell commands, and recorded the results: the first held and the second broke. agent-b searched the file and left a note. You can check and read all of it with `symbia` alone, without running an agent or writing any SQL.
+
+The examples were made by 0.1.1, so they are format 3 seals with a witness from before lines were signed; current builds verify them as they are and write format 4. Their records' `expires_ms` has passed. That is the session's expiry, after which `symbia mcp` no longer resumes it; it doesn't limit the seal, which keeps its records whatever the date.
 
 ```sh
 git clone https://github.com/Symbia-Labs/symbia && cd symbia/examples
@@ -289,10 +291,10 @@ The same queries work on your own seals in the data folder's `seals/` (see Data 
 | Tool | What it does |
 | --- | --- |
 | `status` | Reports the session: build, session id, expiry, retention, file, chain seq and head, last seal, public key, running jobs, resumes, and the previous session when it was not resumed; also the caller's thread, the threads written most recently, and a fresh thread name to adopt. |
-| `record` | Writes a typed record to the ledger and returns its id, version, seq and head. |
-| `find` | Finds records by full-text query, kind, lane, key prefix or thread, in the open session or (`scope: "all"`) in every session and seal; `similar` searches by meaning. |
+| `record` | Writes a typed record to the ledger and returns its id, version, seq and head. Its description tells an agent how to score a prediction (see Report). |
+| `find` | Finds records by full-text query, kind, lane, key prefix or thread, in the open session or (`scope: "all"`) in every session and seal; `similar` searches by meaning. `tool_call` records are left out unless `kind` asks for them. |
 | `report` | Sums records by thread, tool, kind, model or day: tool calls, characters returned to the model, host time, errors and refusals, estimates against actuals, and predictions with their results and verdicts. |
-| `get` | Returns one full record with its links and thread, by id or by key and version. |
+| `get` | Returns one full record with its links and thread, by id or by key and version. A key is looked up in the open session; an id is looked up there, then in every other session file and full seal, so the ids `find` returns with `scope: "all"` work too. |
 | `seal` | Seals the session into a signed, verified copy under `seals/`, or with `in_thread` seals one thread. |
 | `open` | Verifies a sealed copy against your pinned keys (and the witness, when one is set) and lists its newest records, or returns one in full. See Auditing. |
 | `promote` | Copies a verified seal into `ledger/` and records the promotion in the long-lived ledger; a dry run unless `confirm` is true. See Auditing. |
@@ -314,28 +316,34 @@ Every chat in one Claude app shares one `symbia mcp` process, and so one session
 
 ## Search
 
-`find` searches the open session by default. With `scope: "all"` it searches every session file and full seal under the data folder, through an index kept at `index.sqlite`. The index covers each record's key and text, and for a command, the first 16 KB of its saved output. It is derived data: delete it whenever you like, and the next search rebuilds it. Each search catches it up for at most 2 seconds and says `index_behind` when there's more to read.
+`find` searches the open session by default. With `scope: "all"` it searches every session file and full seal under the data folder, through an index kept at `index.sqlite`. The index covers each record's key, text and `lane_reason`, and for a command, the first 16 KB of its saved output. It is derived data: delete it whenever you like, and the next search rebuilds it, as does a build that changes its layout. Each search catches it up for at most 2 seconds and says `index_behind` when there's more to read.
+
+`tool_call` records (one per file or shell call, most of a busy ledger) are left out of results unless `kind: "tool_call"` asks for them, so a text query finds what agents wrote rather than the commands they ran.
 
 `similar` searches by meaning. It needs embeddings from a model on your own machine, set in `config.json` one of two ways:
 
 - `{"embed": {"url": "http://127.0.0.1:8081/v1/embeddings", "model": "nomic-embed-text"}}` uses an OpenAI-style embeddings endpoint you run yourself. Only loopback addresses are accepted.
 - `{"embed": {"server": "/opt/homebrew/bin/llama-server", "model_path": "~/models/nomic-embed-text-v1.5.Q8_0.gguf"}}` has Symbia start llama.cpp's server on first use and stop it on exit.
 
-Records are embedded as searches need them, at most 256 per call; the reply says `unembedded` when some are still waiting. A search with both `query` and `similar` fuses the two rankings. Every find is recorded as a `tool_call`, with what it asked and the ids it returned.
+Records are embedded as searches need them, at most 256 per call; the reply says `unembedded` when some are still waiting. After the first search by meaning, the server also embeds new records in the background (tool calls aside), so later searches rarely wait. A search with both `query` and `similar` fuses the two rankings. Every find is recorded as a `tool_call`, with what it asked, the ids it returned, and where the time went: `index_ms` catching the index up, `embed_ms` embedding, `search_ms` the search itself.
 
 ## Report
 
-`report` sums the open session, or with `scope: "all"` everything indexed, grouped by thread, tool, kind, model or UTC day. Each group gives the record and tool-call counts, the characters returned to the model, host time, errors, refusals, and how actual cost compared with the estimate where one was given. It also counts predictions: how many have a linked result, how many are still open, and the verdicts results gave. A result states its verdict as `"held": true|false`, or as a `"verdicts"` map of `"held"` and `"broke"`.
+`report` sums the open session, or with `scope: "all"` everything indexed, grouped by thread, tool, kind, model or UTC day. Each group gives the record and tool-call counts, the characters returned to the model, host time, errors, refusals, and how actual cost compared with the estimate where one was given. It also counts predictions: how many have a linked result, how many are still open, and the verdicts results gave. A result states its verdict as `"held": true|false`, or as a `"verdicts"` map whose values start with `"held"` or `"broke"`, and links to the prediction with `results_of`. Only such results are scored; a `held` field on any other result is a note, not a verdict. `symbia show` reads verdicts the same way.
 
 ## Auditing
 
 **Opening a seal.** `open` reads a sealed copy without changing it. It verifies the copy against your pinned keys and lists its newest records, or returns one in full. It reads seals in the data folder's `seals/` and `ledger/`, and anywhere else the file tools may read. A copy that fails verification comes back as `verified: false` with the reason, and no records.
 
-**The witness.** A seal proves what a session held when it was signed. On its own it can't show that a later part of the session was deleted, or that an older seal is being passed off as the latest. Set `{"witness": "~/Documents/Symbia Witness"}` and every seal also appends one line to `witness.jsonl` in that folder: the session, chain position, chain head, file hash, key and signature. The folder must be outside the data folder. It's most useful somewhere that leaves the machine, such as iCloud Drive or a git repository you push. `symbia verify <file> --witness <folder>` then checks that the file's chain matches every head the witness saw. A mismatch fails. A file older than the newest witnessed seal reports `behind`. `open` runs the same check when a witness is set. On macOS, a witness in Documents, Desktop or iCloud Drive may bring up a privacy prompt the first time `symbia` writes there, and again after the binary changes. A seal waits at most 5 seconds for its witness line, then goes ahead; the line is written once the prompt is answered, and the delay is reported on stderr.
+**The witness.** A seal proves what a session held when it was signed. On its own it can't show that a later part of the session was deleted, or that an older seal is being passed off as the latest. Set `{"witness": "~/symbia-witness"}` and every seal also appends one line to `witness.jsonl` in that folder: the session, chain position, chain head, file hash, key and signature. Since 0.2 each line also carries `prev`, the sha256 of the line before it, and `line_sig`, a signature over the whole line, so a line can't be edited, reordered, removed from the middle or forged without the key; every line is checked when the witness is read, and an unreadable line fails rather than being skipped. Lines written before 0.2 have neither field; they still load, but only ahead of the first signed line.
 
-**The ledger.** `promote` copies a verified seal into `ledger/` and writes a `promotion` record into `ledger/ledger.sqlite`, a long-lived file with no expiry. The ledger is then sealed, so the ledger's own chain fixes which seals were promoted and in what order. It runs as a dry run unless `confirm` is true. Promoting the same file twice does nothing, and a newer seal of the same session supersedes the earlier promotion. Search reads `ledger/` too, so promoted records stay findable after their original seals are gone.
+`symbia verify <file> --witness <folder>` checks that the file's chain matches every head the witness saw. A mismatch fails. A file the witness never saw (`not witnessed`) or one older than the newest witnessed seal (`behind`) also fails, with exit 1, since either can be an older seal passed off as the latest. `open` runs the same check when a witness is set.
 
-**Pruning.** Each seal records why it was made: `explicit`, `prediction`, `checkpoint`, `exit` or `ledger`. Once a newer full seal of a session verifies, older `checkpoint` and `exit` seals of that session are deleted, because the newer one holds every record they did. Explicit, prediction and thread seals, and seals from builds that didn't record a reason, are kept. With a witness set, the deleted seals' heads and signatures remain in the witness file. The reason isn't covered by the signature: editing it can change what gets pruned, but not what a seal proves.
+Where to keep it: outside the data folder (required) and outside your roots, so the agents being witnessed can't reach it. The file and shell tools refuse to write the witness folder wherever it is, but a folder outside the roots is the stronger guard. One thing a witness can't show from its own contents is lines cut off its end; keep a copy that leaves the machine, such as a git repository you push, and compare against it. Avoid Documents, Desktop and iCloud Drive on macOS: writing there brings up a privacy prompt the first time and again after the binary changes. A seal waits at most 5 seconds for its witness line, then goes ahead; the line is written once the folder opens, and the delay is reported on stderr.
+
+**The ledger.** `promote` copies a verified seal into `ledger/` (the bytes it verified, not a second read of the path, and never over a different file of the same name) and writes a `promotion` record into `ledger/ledger.sqlite`, a long-lived file with no expiry. The ledger is then sealed, so the ledger's own chain fixes which seals were promoted and in what order. It runs as a dry run unless `confirm` is true. Promoting the same file twice does nothing, and a newer seal of the same session supersedes the earlier promotion. Search reads `ledger/` too, so promoted records stay findable after their original seals are gone.
+
+**Pruning.** Each seal records why it was made: `explicit`, `prediction`, `checkpoint`, `exit` or `ledger`. Once a newer full seal of a session verifies, older `checkpoint` and `exit` seals of that session are deleted, but only when the newer chain holds each older seal's head at its seq; a seal the newer chain contradicts is kept. Explicit, prediction and thread seals, and seals from builds that didn't record a reason, are kept. With a witness set, the deleted seals' heads and signatures remain in the witness file. The reason isn't covered by the signature: editing it can change what gets pruned, but not what a seal proves.
 
 ## Data and safety
 
@@ -352,36 +360,53 @@ Records are embedded as searches need them, at most 256 per call; the reply says
 | `index.sqlite` | The search index across sessions and seals. Derived data: safe to delete. |
 | `ledger/` | Promoted seals and `ledger.sqlite`, the long-lived ledger. |
 
-**Path policy.** The file and shell tools accept only absolute paths inside the configured roots (default: your home folder). A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Files are opened with `O_NOFOLLOW`, and a write re-checks its folder just before the rename. These are always refused, even inside a root:
+**Set `roots`.** The default root is your whole home folder, which lets the file tools and `exec` write anywhere in it outside the protected paths below. Name the folders agents work in instead, for example `{"roots": ["~/work", "~/symbia-v2"]}`. While the only root is the home folder, `symbia mcp` says so on stderr at start and `status` lists it under `warnings`.
 
-- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`
-- `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`
+**Path policy.** The file and shell tools accept only absolute paths inside the configured roots. A path is resolved lexically and through its real path, so `..` and symlinks cannot leave a root. Since 0.2 the check is repeated on the file that was actually opened (its path from the open file itself, `F_GETPATH` on macOS), so a folder swapped for a symlink between the check and the open is refused; writes create, rename and link through a handle on the checked folder. Only regular files and folders are opened, without blocking, so a FIFO can't hang a call; `edit` and `append` read at most 16 MB, image reads 64 MB. These are always refused, even inside a root:
+
+- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.azure`, `~/.config/gcloud`, `~/.config/op`, `~/.password-store`, `~/.vault-token`
+- `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.gem/credentials`, `~/.terraform.d/credentials.tfrc.json`
 - `~/Library/Keychains`, `~/Library/Cookies`, `~/Library/Application Support/Claude`
+- `~/Library/Mail`, `~/Library/Messages`, `~/Library/Safari`, and the Chrome, Firefox and Brave profiles under `~/Library/Application Support`
 - `$SYMBIA_HOME/keys`
+
+**Protected paths.** Some files run later, outside any sandbox, so they can be read but never written by the file tools or `exec`: shell startup files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, `~/.config/fish`), `~/Library/LaunchAgents`, `~/.config/autostart`, git's global config (`~/.gitconfig`, `~/.config/git`), the witness folder, and in any repository `.git/hooks` and `.git/config`. That last one means a sandboxed `git init`, `git clone` or `git config` fails writing `.git/config`; run those yourself, or through an `exec_unsandboxed` rule for `git`.
 
 **Read-only data directory.** The tools never write under `SYMBIA_HOME`: `write`, `edit` and an `exec` working directory there are refused. `evidence/` can be read with `read`.
 
-**Shell sandbox (macOS).** `exec` runs each command under the macOS sandbox. The deny list above is unreadable and unwritable, `SYMBIA_HOME` is unwritable, and by default (`"exec_read": "home"`) nothing in your home folder is readable except the roots, a few shell and toolchain files, and `evidence/`. `"exec_network": "deny"` also blocks outbound network. A command cannot start a sandbox of its own inside this one. On Linux there is no sandbox yet.
+**Shell sandbox (macOS).** `exec` runs each command under the macOS sandbox. The profile starts from `(allow default)` and takes away, so anything not listed here is allowed:
+
+- writes go only to the roots, the temporary folders (`/private/tmp`, `/private/var/folders`) and `/dev`;
+- the deny list above is neither readable nor writable, and `SYMBIA_HOME` and the protected paths are not writable;
+- with `"exec_read": "home"` (the default) nothing in your home folder is readable except the roots, a few shell and toolchain files, and `evidence/`. When the only root is the home folder, that is nearly everything, which is one more reason to set `roots`;
+- `open`, `launchctl`, `osascript` and `osacompile` can't be run, and LaunchServices opens and Apple Events are refused, so a command can't hand work to a process outside the sandbox that way;
+- `"exec_network": "deny"` blocks outbound network, DNS lookups through `mDNSResponder` included.
+
+A command cannot start a sandbox of its own inside this one. Not covered: a program of the command's own making that talks to `launchd` or another system service directly over its socket; treat code you let `exec` build and run with that in mind. On Linux there is no sandbox yet.
 
 **`exec_unlock` (a stopgap).** `{"exec_unlock": [".config/gh"]}` re-opens named deny-list entries to commands run through `exec`, so a tool such as `gh` can use its own login. Only deny-list entries are accepted, and `keys/` can never be unlocked. The file tools still refuse those paths. It re-opens the entry to every command, not just one tool, so any command could read what it holds. Each exec record made while it is set carries `unlocked`, `status` shows it, and the server notes it on stderr at start.
 
-**`exec_unsandboxed`.** Some jobs can't run in the sandbox: `gh`, `codesign` and `notarytool` need the login keychain, and a test suite that starts sandboxes of its own can't run inside one. List those programs as rules, for example `{"exec_unsandboxed": [{"program": "/opt/homebrew/bin/gh", "args": ["*"]}, {"program": "~/.cargo/bin/cargo", "args": ["test", "*"], "cwd": "~/symbia-v2"}]}`. A rule names one program by its absolute path, the arguments it takes (exact tokens, with a final `"*"` for any rest), and optionally the folder it must run in. Only a call that passes `unsandboxed: true` and matches a rule runs outside the sandbox. It runs with no shell: no pipes, redirects, variables, `~` or globs. The rule's program is started by its absolute path with a fixed `PATH`, and `exec_deny` still applies. The record carries `sandbox: "none"`, the rule and the argv; `status` lists the rules; the server names them on stderr at start. This is a short, logged list, not containment: a rule for a program that can run arbitrary code (`cargo test`, `git -c`, `gh extension`) grants exactly that.
+**`exec_unsandboxed`.** Some jobs can't run in the sandbox: `gh`, `codesign` and `notarytool` need the login keychain, and a test suite that starts sandboxes of its own can't run inside one. List those programs as rules, for example `{"exec_unsandboxed": [{"program": "/opt/homebrew/bin/gh", "args": ["*"]}, {"program": "/opt/homebrew/bin/cargo", "args": ["test", "*"], "cwd": "~/symbia-v2"}]}`. A rule names one program by its absolute path, the arguments it takes (exact tokens, with a final `"*"` for any rest), and optionally the folder it must run in. Only a call that passes `unsandboxed: true` and matches a rule runs outside the sandbox. It runs with no shell: no pipes, redirects, variables, `~` or globs. The rule's program is started by its absolute path with a fixed `PATH`, and `exec_deny` still applies. The record carries `sandbox: "none"`, the rule and the argv; `status` lists the rules; the server names them on stderr at start. This is a short, logged list, not containment: a rule for a program that can run arbitrary code (`cargo test`, `git -c`, `gh extension`) grants exactly that.
+
+Since 0.2 a rule is also refused when its program could have been swapped: the program (after symlinks) must sit where sandboxed commands can't write, outside the roots and temporary folders, and must be the same file (device, inode, size, modification time) as when the server started. After `brew upgrade` or a toolchain update, restart the server. A command line containing a newline is refused. For `git`, `--receive-pack`, `--upload-pack`, `--exec` and `ext::` URLs are refused, since each makes git run another program. `git push` and `pull` can still run the repository's hooks, which is why `.git/hooks` is protected from sandboxed writes.
 
 **Key pinning.** The device key is pinned in `keys/trusted.json` when it is created. `symbia verify` accepts only seals signed by a pinned key. Add others with `symbia trust add`, or for one run with `--trust`.
 
-**What `verify` checks**, in order:
+**Serving over HTTP.** `symbia serve` binds loopback by default. Each MCP session's file is locked while it is served, so `symbia mcp` never resumes it and cleanup never removes it. `--allow-remote` refuses to start without `SYMBIA_HTTP_TOKEN` (32 characters or more), and then every request must carry `Authorization: Bearer <token>`; the token is compared in constant time. Anyone holding it can run `exec` as you, so treat it like a password and prefer an SSH tunnel to a remote bind.
+
+**What `verify` checks**, in order. The file and sidecar are each read once; every check runs on those bytes, and `open`, `promote`, `show` and `get` read and copy from the same bytes rather than going back to the path.
 
 1. The `.seal.json` sidecar is present and well formed.
 2. The sidecar's public key is pinned.
 3. The sealed file's sha256 matches the sidecar.
 4. The signature over the file sha256 and chain head is valid.
-5. The file's retention is `seal`, its format is known, and the sidecar names the same thread as the file.
-6. The chain walks from genesis: seqs are consecutive, each `prev_hash` matches the previous hash, and each hash is recomputed from its row, thread included.
-7. Every record id is recomputed; every record's time and session match its chain row, and its cost fields are filled.
+5. The file's retention is `seal`, its format is known (1 to 4), and the sidecar names the same thread as the file, and from format 4, the same session.
+6. The chain walks from genesis: seqs are consecutive, each `prev_hash` matches the previous hash, and each hash is recomputed from its row, thread included. From format 4, genesis is a digest of the session and its HTTP binding rather than zeros.
+7. Every record id is recomputed; every record's time and session match its chain row, and its cost fields are filled. From format 4, the id and row digest also cover a per-record salt, `host_ms`, `chars` and the evidence the record names (sha256, size and type).
 8. In a thread seal, every record of the sealed thread is present, no other thread's record is, and each withheld row's stored digest recomputes its chain hash.
-9. No record or link sits off the chain.
+9. No record, link or evidence row sits off the chain, and no record appears on the chain twice.
 10. The sidecar's seq and head match the end of the chain.
-11. With `--witness`, the file's chain matches every head the witness recorded for its session; a seal older than the newest witnessed one reports `behind`.
+11. With `--witness`, every witness line is signed by a pinned key and follows the line before it, and the file's chain matches every head the witness recorded for its session. A seal older than the newest witnessed one (`behind`) or not witnessed at all exits 1.
 
 ## Privacy Policy
 

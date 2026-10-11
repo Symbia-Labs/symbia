@@ -303,7 +303,8 @@ mod tests {
 
     #[test]
     fn split_refuses_shell_syntax_and_bad_quoting() {
-        for c in ['|', '&', ';', '<', '>', '(', ')', '$', '`'] {
+        // Newlines too: exec_deny splits on them, so a second line would slip past its rules.
+        for c in ['|', '&', ';', '<', '>', '(', ')', '$', '`', '\n', '\r'] {
             assert_eq!(split(&format!("gh pr{c}x")).unwrap_err(), NO_SHELL, "{c}");
             assert_eq!(split(&format!("gh {c} x")).unwrap_err(), NO_SHELL, "{c}");
         }
