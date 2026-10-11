@@ -106,4 +106,31 @@ fn serve_refuses_non_loopback_without_allow_remote() {
     assert!(text(&out).contains("--allow-remote"), "{}", text(&out));
     assert_eq!(run(t.path(), &["serve", "--listen"]).status.code(), Some(2));
     assert_eq!(run(t.path(), &["serve", "--listen", "nonsense"]).status.code(), Some(1));
+    // Since 0.2, --allow-remote also needs a bearer token in the environment.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_symbia"))
+        .args(["serve", "--listen", "0.0.0.0:0", "--allow-remote"])
+        .env("SYMBIA_HOME", t.path())
+        .env_remove("SYMBIA_HTTP_TOKEN")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SYMBIA_HTTP_TOKEN"), "{out:?}");
+}
+
+#[test]
+fn config_prints_the_settings_in_effect_and_refuses_a_typo() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg = |args: &[&str]| Command::new(BIN).args(args).env("SYMBIA_HOME", t.path()).env("HOME", &home).output().unwrap();
+    std::fs::write(t.path().join("config.json"), r#"{"roots": ["~/work"]}"#).unwrap();
+    let out = cfg(&["config"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["settings"]["roots"], json!({"value": ["~/work"], "from": "config.json"}));
+    assert_eq!(v["settings"]["exec_read"]["from"], "default");
+    std::fs::write(t.path().join("config.json"), r#"{"root": ["~/work"]}"#).unwrap();
+    let out = cfg(&["config"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out).contains("unknown field `root`"), "{}", text(&out));
 }

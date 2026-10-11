@@ -23,6 +23,8 @@ pub const REFRESH_BUDGET: Duration = Duration::from_secs(2);
 const BATCH: i64 = 500;
 /// Reciprocal-rank fusion constant.
 pub const RRF_K: f64 = 60.0;
+/// Index layout version (`PRAGMA user_version`). 2: document text includes the lane reason.
+const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sources (path TEXT PRIMARY KEY, last_seq INTEGER NOT NULL) STRICT;
@@ -46,6 +48,8 @@ CREATE TABLE IF NOT EXISTS vectors (doc INTEGER PRIMARY KEY, model TEXT NOT NULL
 pub struct Filter {
     pub session: Option<String>,
     pub kind: Option<String>,
+    /// Leave out documents of this kind.
+    pub not_kind: Option<String>,
     pub lane: Option<String>,
     pub key_prefix: Option<String>,
     pub thread: Option<String>,
@@ -63,6 +67,10 @@ impl Filter {
                 s.push_str(&format!(" AND {col} = ?"));
                 a.push(Box::new(v.clone()));
             }
+        }
+        if let Some(k) = &self.not_kind {
+            s.push_str(" AND d.kind <> ?");
+            a.push(Box::new(k.clone()));
         }
         if let Some(p) = &self.key_prefix {
             s.push_str(" AND substr(d.key, 1, length(?)) = ?");
@@ -243,6 +251,7 @@ struct Row {
     host_ms: Option<i64>,
     body: String,
     session: String,
+    lane_reason: String,
 }
 
 impl Index {
@@ -252,7 +261,16 @@ impl Index {
         let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v != VERSION {
+            // Derived data: an index built by another version is dropped and rebuilt.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS docs_fts; DROP TABLE IF EXISTS vectors; DROP TABLE IF EXISTS links;
+                 DROP TABLE IF EXISTS docs; DROP TABLE IF EXISTS sources;",
+            )?;
+        }
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
         Ok(Self { conn, home: home.to_path_buf() })
     }
 
@@ -295,7 +313,7 @@ impl Index {
         let thread = if has_column(&src, "chain", "thread")? { "COALESCE(c.thread, 'main')" } else { "'main'" };
         let sql = format!(
             "SELECT c.seq, r.id, r.key, r.version, r.kind, r.lane, {thread}, r.at_ms, r.model, r.est_chars, r.chars, r.est_host_ms, r.host_ms,
-                    json(r.body), r.session
+                    json(r.body), r.session, r.lane_reason
              FROM chain c JOIN records r ON r.id = c.record_id WHERE c.seq > ?1 ORDER BY c.seq LIMIT ?2"
         );
         loop {
@@ -321,6 +339,7 @@ impl Index {
                         host_ms: r.get(12)?,
                         body: r.get(13)?,
                         session: r.get(14)?,
+                        lane_reason: r.get(15)?,
                     })
                 })?
                 .collect::<Result<_, _>>()?;
@@ -488,7 +507,14 @@ impl Index {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let (held, broke): (i64, i64) = self.conn.query_row(
-            &format!("SELECT COALESCE(SUM(d.held), 0), COALESCE(SUM(d.broke), 0) FROM docs d WHERE d.kind = 'result'{clauses}"),
+            // Only a result that answers a prediction carries a verdict; any other result's
+            // "held" field is a note, not a score.
+            &format!(
+                "SELECT COALESCE(SUM(d.held), 0), COALESCE(SUM(d.broke), 0) FROM docs d
+                 WHERE d.kind = 'result'
+                   AND EXISTS (SELECT 1 FROM links l JOIN docs p ON p.record_id = l.to_id
+                               WHERE l.from_doc = d.id AND l.rel = 'results_of' AND p.kind = 'prediction'){clauses}"
+            ),
             rusqlite::params_from_iter(args.iter()),
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -528,6 +554,8 @@ fn fts_query(q: &str) -> Option<String> {
 fn insert_doc(tx: &rusqlite::Transaction, home: &Path, row: &Row, links: &[(String, String)]) -> anyhow::Result<()> {
     let body: Value = serde_json::from_str(&row.body)?;
     let mut text = record_text(&row.key, &body);
+    text.push(' ');
+    text.push_str(&row.lane_reason);
     let (mut tool, mut error) = (None, None);
     if row.kind == "tool_call" {
         tool = body.get("tool").and_then(Value::as_str).map(String::from);
@@ -652,6 +680,24 @@ mod tests {
         std::fs::write(t.path().join("evidence").join(&hex_c), &s).unwrap();
         assert_eq!(evidence_text(t.path(), &hex_c).unwrap().len(), EVIDENCE_MAX - 1);
         assert_eq!(evidence_text(t.path(), "../etc"), None);
+    }
+
+    #[test]
+    fn an_index_from_another_version_is_rebuilt() {
+        let t = tempfile::tempdir().unwrap();
+        let mut a = Store::create(t.path()).unwrap();
+        a.write(&RecordInput { lane_reason: "read off the gauge".into(), ..rec("k", "observation", json!("x")) }, Instant::now()).unwrap();
+        let mut ix = Index::open(t.path()).unwrap();
+        ix.refresh(REFRESH_BUDGET).unwrap();
+        assert_eq!(ix.search_text("gauge", &Filter::default(), 5).unwrap().len(), 1);
+        // An index written by 0.1 (version 0): its rows are dropped and read again.
+        ix.conn.execute_batch("PRAGMA user_version = 0; UPDATE docs SET text = 'stale'").unwrap();
+        drop(ix);
+        let mut ix = Index::open(t.path()).unwrap();
+        assert_eq!(count(&ix, "SELECT COUNT(*) FROM docs"), 0);
+        ix.refresh(REFRESH_BUDGET).unwrap();
+        assert_eq!(ix.search_text("gauge", &Filter::default(), 5).unwrap().len(), 1);
+        assert_eq!(count(&ix, "PRAGMA user_version"), VERSION);
     }
 
     /// Two sessions, a full seal of the first, a thread seal of the second, and evidence.

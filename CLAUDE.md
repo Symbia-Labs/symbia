@@ -8,7 +8,8 @@ One Rust binary, `symbia`, on SQLite. It records work as typed records in a sign
 - Edit source files directly with the edit tool, one exact change at a time. No Python, sed or awk scripts that patch source.
 - Tests use temporary directories, never the real data directory.
 - Every behavior lands with a test. A step is done only when `cargo test` passes and `cargo clippy --all-targets -- -D warnings` is clean.
-- Every timestamp is integer UTC milliseconds. No local time anywhere.
+- Every timestamp is integer UTC milliseconds. No local time anywhere. The one exception is the version.
+- Versions are `X.Y.YYYYMMDDHHMMSS`: the third number is the release commit's UTC time, readable. Y goes up for a file format change or a breaking change. The release commit's author and committer dates are set to the time in its version, and the tag is `vX.Y.YYYYMMDDHHMMSS`.
 - Wherever a digest covers JSON, the JSON is canonical (RFC 8785).
 - Vocabulary: retention values are `session`, `seal`, `ledger`. Lanes are `canonical`, `conditional`, `apocryphal`. Never use the words imagine or durable in v2 code or docs.
 - Tool replies are terse and return references (id, version, seq, digest prefix), not whole records, except `symbia_get`.

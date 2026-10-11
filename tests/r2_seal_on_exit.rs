@@ -16,7 +16,8 @@ async fn closing_stdin_seals_a_session_with_records() {
         .unwrap();
     assert_eq!(w["seq"], 1);
     let stderr = m.close().await;
-    assert!(stderr.is_empty(), "{stderr}");
+    // The only thing said on stderr is the default-roots warning (no roots in this config).
+    assert!(stderr.lines().all(|l| l == format!("symbia: {}", symbia::mcp::ROOTS_ARE_HOME)), "{stderr}");
 
     let s = seals(t.path());
     assert_eq!(s.len(), 1, "{s:?}");

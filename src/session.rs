@@ -124,6 +124,8 @@ struct Facts {
     expires_ms: Option<i64>,
     /// `file_meta.format`; 1 for a file from before the column.
     format: i64,
+    /// Bound to an HTTP MCP session (`symbia serve`), which stdio never resumes.
+    http: bool,
 }
 
 fn facts(path: &Path) -> Option<Facts> {
@@ -131,7 +133,17 @@ fn facts(path: &Path) -> Option<Facts> {
     let (rows, last_at_ms) = conn.query_row("SELECT COUNT(*), MAX(at_ms) FROM chain", [], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
     let (retention, expires_ms) = conn.query_row("SELECT retention, expires_ms FROM file_meta", [], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
     let format = conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0)).unwrap_or(1);
-    Some(Facts { rows, last_at_ms, retention, expires_ms, format })
+    let http = conn.query_row("SELECT mcp_session_id IS NOT NULL FROM file_meta", [], |r| r.get(0)).unwrap_or(false);
+    Some(Facts { rows, last_at_ms, retention, expires_ms, format, http })
+}
+
+/// Take the lock beside a new HTTP session's file, so a `symbia mcp` started meanwhile can't
+/// resume it and cleanup can't remove it while `symbia serve` writes it.
+pub fn lock_http(store: &mut Store, me: Holder) -> anyhow::Result<()> {
+    let mut lock = Lock::try_take(&lock_path(store.home(), store.session()))?.context("new HTTP session lock is held")?;
+    lock.write(me)?;
+    store.hold(lock);
+    Ok(())
 }
 
 /// Delete session files with no chain rows whose lock is free (left by duplicate starts).
@@ -215,6 +227,7 @@ pub fn open(home: &Path, resume_window_ms: i64, me: Holder) -> anyhow::Result<(S
         .into_iter()
         .filter_map(|p| {
             let f = facts(&p)?;
+            (!f.http).then_some(())?;
             Some((f.last_at_ms?, p, f))
         })
         .max_by_key(|(at, _, _)| *at);
@@ -380,6 +393,40 @@ mod tests {
         a.conn().execute("UPDATE file_meta SET retention = 'session', expires_ms = NULL, format = 2", []).unwrap();
         assert_eq!(why(RESUME_WINDOW_DEFAULT_MS), NotResumed::OlderFormat);
         assert_eq!(NotResumed::OlderFormat.as_str(), "older file format");
+    }
+
+    /// Review finding: HTTP sessions took no lock, so `symbia mcp` could resume a session file
+    /// `symbia serve` was still writing, and cleanup could delete a fresh one.
+    #[test]
+    fn an_http_session_is_locked_and_never_resumed_by_stdio() {
+        let t = tempfile::tempdir().unwrap();
+        let mut http = Store::create_for_mcp(t.path(), Some("mcp-1")).unwrap();
+        lock_http(&mut http, Holder::this_process(1)).unwrap();
+        // Still empty and locked: cleanup leaves it.
+        assert!(clean_empty(t.path()).is_empty());
+        assert!(http.path().exists());
+        http.write(&crate::record::RecordInput {
+            key: "k".into(),
+            kind: "observation".into(),
+            lane: "canonical".into(),
+            lane_reason: "r".into(),
+            body: json!(1),
+            model: "m".into(),
+            est_host_ms: None,
+            est_chars: None,
+            links: None,
+        }, Instant::now())
+        .unwrap();
+        // A stdio start while serve runs opens its own session instead of resuming this one.
+        let (s, opened) = open(t.path(), RESUME_WINDOW_DEFAULT_MS, Holder::this_process(2)).unwrap();
+        assert_ne!(s.session(), http.session());
+        assert_eq!(opened, Opened::New { previous: None });
+        // And after serve is gone, stdio still doesn't take it over.
+        let http_session = http.session().to_string();
+        drop(http);
+        drop(s);
+        let (s, _) = open(t.path(), RESUME_WINDOW_DEFAULT_MS, Holder::this_process(3)).unwrap();
+        assert_ne!(s.session(), http_session);
     }
 
     #[test]

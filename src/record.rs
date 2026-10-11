@@ -45,9 +45,42 @@ pub fn record_id(f: &IdFields) -> anyhow::Result<String> {
     Ok(hex::encode(sha256(canonical(&doc)?.as_bytes())))
 }
 
+/// Format 4: as [`record_id`], with the record's random 32-byte salt as lowercase hex under
+/// `salt`. A thread seal keeps the ids of the records it withholds; without the salt, anyone
+/// who could guess a withheld record's content could confirm the guess against its id.
+pub fn record_id_v4(f: &IdFields, salt: &[u8; 32]) -> anyhow::Result<String> {
+    let doc = json!({
+        "key": f.key,
+        "version": f.version,
+        "kind": f.kind,
+        "lane": f.lane,
+        "body": f.body,
+        "model": f.model,
+        "session": f.session,
+        "salt": hex::encode(salt),
+    });
+    Ok(hex::encode(sha256(canonical(&doc)?.as_bytes())))
+}
+
+/// 32 random bytes for a format 4 record.
+pub fn new_salt() -> anyhow::Result<[u8; 32]> {
+    let mut s = [0u8; 32];
+    getrandom::fill(&mut s).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    Ok(s)
+}
+
 /// Chain format written by this build. Format 1 chained only the record id; format 2 chained
-/// the row digest; format 3 adds the thread's digest to each chain row.
-pub const FORMAT: i64 = 3;
+/// the row digest; format 3 adds the thread's digest to each chain row; format 4 salts each
+/// record, adds its measured cost and its evidence to the row digest, and starts the chain
+/// from a digest of the file's session instead of zeros.
+pub const FORMAT: i64 = 4;
+
+/// Format 4 chain start: sha256 of the RFC 8785 JSON of `{format: 4, session, mcp_session_id}`.
+/// It ties the file's session and HTTP session binding to every hash after it.
+pub fn genesis_v4(session: &str, mcp_session_id: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    let doc = json!({"format": 4, "session": session, "mcp_session_id": mcp_session_id});
+    Ok(sha256(canonical(&doc)?.as_bytes()))
+}
 
 /// The thread a record goes in when the caller names none.
 pub const MAIN_THREAD: &str = "main";
@@ -103,6 +136,36 @@ pub type Link = (String, String, Option<String>);
 /// to_session)`. A link's `to_session` is hashed when set and left out when null, so digests
 /// of files written before it existed are unchanged.
 pub fn row_digest(f: &RowFields) -> anyhow::Result<[u8; 32]> {
+    Ok(sha256(canonical(&row_doc(f))?.as_bytes()))
+}
+
+/// What format 4 adds to a row digest: the salt, the measured cost of the call and the
+/// evidence files the record names.
+pub struct RowV4<'a> {
+    pub salt: &'a [u8; 32],
+    pub host_ms: i64,
+    pub chars: i64,
+    /// `(sha256, bytes, media)` of each evidence file, in any order.
+    pub evidence: &'a [([u8; 32], i64, String)],
+}
+
+/// Format 4: the format 2 document plus `salt` (hex), `host_ms`, `chars` and `evidence`, a
+/// list of `{sha256, bytes, media}` sorted by sha256. Measured cost and evidence were
+/// written after the hash in earlier formats, so an edit to them went unnoticed.
+pub fn row_digest_v4(f: &RowFields, v4: &RowV4) -> anyhow::Result<[u8; 32]> {
+    let mut evidence = v4.evidence.to_vec();
+    evidence.sort();
+    evidence.dedup();
+    let evidence: Vec<Value> = evidence.into_iter().map(|(sha, bytes, media)| json!({"sha256": hex::encode(sha), "bytes": bytes, "media": media})).collect();
+    let mut doc = row_doc(f);
+    doc["salt"] = hex::encode(v4.salt).into();
+    doc["host_ms"] = v4.host_ms.into();
+    doc["chars"] = v4.chars.into();
+    doc["evidence"] = evidence.into();
+    Ok(sha256(canonical(&doc)?.as_bytes()))
+}
+
+fn row_doc(f: &RowFields) -> Value {
     let mut links = f.links.to_vec();
     links.sort();
     let links: Vec<Value> = links
@@ -112,7 +175,7 @@ pub fn row_digest(f: &RowFields) -> anyhow::Result<[u8; 32]> {
             Some(s) => json!({"to_id": to_id, "rel": rel, "to_session": s}),
         })
         .collect();
-    let doc = json!({
+    json!({
         "id": f.id,
         "key": f.key,
         "version": f.version,
@@ -127,8 +190,7 @@ pub fn row_digest(f: &RowFields) -> anyhow::Result<[u8; 32]> {
         "est_host_ms": f.est_host_ms,
         "est_chars": f.est_chars,
         "links": links,
-    });
-    Ok(sha256(canonical(&doc)?.as_bytes()))
+    })
 }
 
 /// Format 2: `sha256(prev_hash || row_digest || at_ms as 8-byte big-endian)`.
@@ -355,6 +417,47 @@ mod tests {
         for v in &variants {
             assert_ne!(row_digest(v).unwrap(), a);
         }
+    }
+
+    #[test]
+    fn format4_digests_match_hand_computed_text() {
+        let salt = [0xab; 32];
+        let body = json!({"x": 1});
+        let f = IdFields { key: "k", version: 1, kind: "prediction", lane: "canonical", body: &body, model: "m", session: "s" };
+        let text = format!(r#"{{"body":{{"x":1}},"key":"k","kind":"prediction","lane":"canonical","model":"m","salt":"{}","session":"s","version":1}}"#, "ab".repeat(32));
+        assert_eq!(record_id_v4(&f, &salt).unwrap(), hex::encode(sha256(text.as_bytes())));
+        assert_ne!(record_id_v4(&f, &salt).unwrap(), record_id_v4(&f, &[0xac; 32]).unwrap());
+        assert_ne!(record_id_v4(&f, &salt).unwrap(), record_id(&f).unwrap());
+
+        let links = [link("a", "cites")];
+        let ev = [([2u8; 32], 7, "text/plain".to_string()), ([1u8; 32], 3, "image/png".to_string())];
+        let v4 = RowV4 { salt: &salt, host_ms: 12, chars: 34, evidence: &ev };
+        let text = format!(
+            concat!(
+                r#"{{"at_ms":5,"body":{{"x":1}},"chars":34,"est_chars":null,"est_host_ms":1,"evidence":[{{"bytes":3,"media":"image/png","sha256":"{}"}},"#,
+                r#"{{"bytes":7,"media":"text/plain","sha256":"{}"}}],"expires_ms":null,"host_ms":12,"id":"i","key":"k","kind":"result","lane":"canonical","#,
+                r#""lane_reason":"r","links":[{{"rel":"cites","to_id":"a"}}],"model":"m","salt":"{}","session":"s","version":1}}"#
+            ),
+            "01".repeat(32),
+            "02".repeat(32),
+            "ab".repeat(32)
+        );
+        let f = row(&body, &links);
+        assert_eq!(row_digest_v4(&f, &v4).unwrap(), sha256(text.as_bytes()));
+        let other_ev = [([2u8; 32], 8, "text/plain".to_string())];
+        for v in [
+            RowV4 { salt: &[0; 32], ..v4 },
+            RowV4 { host_ms: 13, ..v4 },
+            RowV4 { chars: 35, ..v4 },
+            RowV4 { evidence: &other_ev, ..v4 },
+            RowV4 { evidence: &[], ..v4 },
+        ] {
+            assert_ne!(row_digest_v4(&f, &v).unwrap(), row_digest_v4(&f, &v4).unwrap());
+        }
+
+        let g = r#"{"format":4,"mcp_session_id":null,"session":"s1"}"#;
+        assert_eq!(genesis_v4("s1", None).unwrap(), sha256(g.as_bytes()));
+        assert_ne!(genesis_v4("s1", Some("m")).unwrap(), genesis_v4("s1", None).unwrap());
     }
 
     #[test]

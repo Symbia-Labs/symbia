@@ -16,6 +16,9 @@ use crate::record::{LinkInput, RecordInput};
 /// At shutdown, how long a killed job's task gets to finish it before it is finished as is.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
+/// Finished jobs kept for `job` to look up, newest first.
+pub const KEEP_FINISHED: usize = 200;
+
 struct Entry {
     job: Arc<Job>,
     /// The `tool_call` record of the call that started it.
@@ -60,9 +63,31 @@ impl Jobs {
         tokio::spawn(async move {
             entry.job.wait(None).await;
             if let Some(jobs) = jobs.upgrade() {
-                jobs.record_end(&id, &entry);
+                crate::blocking(|| jobs.record_end(&id, &entry));
             }
         });
+        self.prune();
+    }
+
+    /// Forget the oldest finished jobs whose end is recorded, beyond [`KEEP_FINISHED`], so a
+    /// long session's job list doesn't grow without bound.
+    fn prune(&self) {
+        self.prune_to(KEEP_FINISHED);
+    }
+
+    fn prune_to(&self, keep: usize) {
+        let mut map = self.entries();
+        let mut done: Vec<(i64, String)> = map
+            .iter()
+            .filter(|(_, e)| !e.job.running() && *e.recorded.lock().unwrap_or_else(|p| p.into_inner()))
+            .map(|(id, e)| (e.job.started_ms, id.clone()))
+            .collect();
+        if done.len() > keep {
+            done.sort();
+            for (_, id) in done.iter().take(done.len() - keep) {
+                map.remove(id);
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -208,5 +233,41 @@ mod tests {
         let store = slot.as_ref().unwrap();
         assert!(store.id_for_key("job.a", None).unwrap().is_some());
         assert_eq!(store.id_for_key("job.a", Some(2)).unwrap(), None);
+    }
+
+    /// Review finding: finished jobs were never forgotten, so a long session's job map grew
+    /// without bound. Finished, recorded jobs beyond a cap are dropped, oldest first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_jobs_are_forgotten_beyond_the_cap() {
+        let t = tempfile::tempdir().unwrap();
+        let (home, root) = (t.path().join("sym"), t.path().join("root"));
+        std::fs::create_dir_all(&root).unwrap();
+        crate::home::ensure(&home).unwrap();
+        let policy = crate::policy::Policy::new(std::slice::from_ref(&root), &home, t.path()).unwrap();
+        let mut store = Store::create(&home).unwrap();
+        let start = RecordInput {
+            key: "tool.exec".into(),
+            kind: "tool_call".into(),
+            lane: "apocryphal".into(),
+            lane_reason: "test".into(),
+            body: json!({"tool": "exec"}),
+            model: "m".into(),
+            est_host_ms: None,
+            est_chars: None,
+            links: None,
+        };
+        let start_id = store.write(&start, Instant::now()).unwrap().id;
+        let slot: Slot = Arc::new(Mutex::new(Some(store)));
+        let jobs = Arc::new(Jobs::new(slot, Arc::new(crate::keys::load_or_create(&home).unwrap()), Arc::default()));
+        for id in ["j1", "j2", "j3"] {
+            let job = crate::exec::start(&policy, &home, "true", &root.display().to_string(), None, None, &mut crate::files::Facts::default()).unwrap();
+            job.wait(None).await;
+            jobs.insert(id, job, start_id.clone(), "main".into());
+            jobs.settle(id);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(jobs.entries().len(), 3);
+        jobs.prune_to(1);
+        assert_eq!(jobs.entries().keys().collect::<Vec<_>>(), ["j3"]);
     }
 }

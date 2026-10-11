@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// Denied even inside a root, relative to the user's home directory. These hold keys and
 /// credentials and stay refused in every mode, for the file tools and exec alike.
-pub const DENY_IN_HOME: [&str; 13] = [
+pub const DENY_IN_HOME: [&str; 29] = [
     ".ssh",
     ".gnupg",
     ".aws",
@@ -22,7 +22,60 @@ pub const DENY_IN_HOME: [&str; 13] = [
     ".pypirc",
     ".git-credentials",
     "Library/Cookies",
+    // Added in 0.2: more credential stores and private mail, messages and browser data.
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".config/git/credentials",
+    ".config/gcloud",
+    ".azure",
+    ".password-store",
+    ".config/op",
+    ".gem/credentials",
+    ".terraform.d/credentials.tfrc.json",
+    ".vault-token",
+    "Library/Mail",
+    "Library/Messages",
+    "Library/Safari",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/BraveSoftware",
 ];
+
+/// Readable but never writable by the file tools or exec, relative to the user's home: files
+/// that run later outside the sandbox (shell startup files, launch agents) and git's global
+/// config, which can name hooks, aliases and helpers that `git` runs.
+pub const PROTECT_IN_HOME: [&str; 14] = [
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".config/fish",
+    "Library/LaunchAgents",
+    ".gitconfig",
+    ".config/git",
+    ".config/autostart",
+];
+
+/// Folders exec may write besides the roots: temporary files and devices. Off macOS there is
+/// no sandbox, so these only mark where a rule's program must not sit.
+#[cfg(target_os = "macos")]
+pub const EXEC_WRITE_ALWAYS: &[&str] = &["/private/tmp", "/private/var/folders", "/dev"];
+#[cfg(not(target_os = "macos"))]
+pub const EXEC_WRITE_ALWAYS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/dev"];
+
+/// Inside any repository, git runs `.git/hooks/*` and reads commands from `.git/config`
+/// (`core.hooksPath`, aliases, filters, `core.sshCommand`). Neither may be written.
+pub fn git_protected(p: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = p.iter().collect();
+    let Some(g) = parts.iter().position(|c| *c == ".git") else { return false };
+    let after = &parts[g + 1..];
+    after.iter().any(|c| *c == "hooks") || after.last().is_some_and(|c| *c == "config")
+}
 
 /// Default `read_roots`: toolchain source the file tools may read but not write.
 pub const READ_ROOTS_DEFAULT: [&str; 2] = ["~/.cargo/registry", "~/.rustup/toolchains"];
@@ -104,21 +157,24 @@ pub enum ExecRead {
     DenyList,
 }
 
-/// `$SYMBIA_HOME/config.json`. Every key is optional.
+/// `$SYMBIA_HOME/config.json`. Every key is optional; an unknown key is an error, so a typo
+/// can't leave a setting at its default unnoticed. `read_roots` and `exec_read_allow` add to
+/// their defaults.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Read-write roots for the tools; default the user's home.
     pub roots: Option<Vec<String>>,
     pub exec_network: Network,
     pub exec_read: ExecRead,
-    /// Paths under the home exec may still read with `exec_read: "home"`.
+    /// Paths under the home exec may still read with `exec_read: "home"`, besides
+    /// [`EXEC_READ_ALLOW_DEFAULT`].
     pub exec_read_allow: Vec<String>,
     /// Exec command rules in Claude Code's syntax: `"chmod:*"` or an exact command.
     pub exec_deny: Vec<String>,
     /// Also load `Bash(...)` deny rules from Claude Code's settings files.
     pub exec_import_claude_rules: bool,
-    /// Read-only roots for the file tools.
+    /// Read-only roots for the file tools, besides [`READ_ROOTS_DEFAULT`].
     pub read_roots: Vec<String>,
     /// Deny-list entries re-opened for exec only (a logged stopgap, e.g. `".config/gh"`).
     pub exec_unlock: Vec<String>,
@@ -138,10 +194,10 @@ impl Default for Config {
             roots: None,
             exec_network: Network::Allow,
             exec_read: ExecRead::Home,
-            exec_read_allow: EXEC_READ_ALLOW_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            exec_read_allow: Vec::new(),
             exec_deny: Vec::new(),
             exec_import_claude_rules: true,
-            read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            read_roots: Vec::new(),
             exec_unlock: Vec::new(),
             resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
             exec_unsandboxed: Vec::new(),
@@ -159,6 +215,8 @@ pub struct Policy {
     /// Extra roots for the file tools, reads only.
     read_roots: Vec<Spelled>,
     deny: Vec<Spelled>,
+    /// [`PROTECT_IN_HOME`] and the witness folder: readable, never writable.
+    protected: Vec<Spelled>,
     /// `$SYMBIA_HOME`: readable where a root covers it, never writable.
     own: Spelled,
     user_home: Spelled,
@@ -234,6 +292,47 @@ impl Policy {
         Self::load(symbia_home, Path::new(&home))
     }
 
+    /// The settings in effect for `symbia config`: each key's value and whether it came from
+    /// the defaults, `config.json`, or both (the lists that add to their defaults). The file
+    /// is checked as the server checks it at start, so a file that would fail start fails here.
+    pub fn effective(symbia_home: &Path, user_home: &Path) -> anyhow::Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        Self::load(symbia_home, user_home)?;
+        let cfg = symbia_home.join("config.json");
+        let raw: serde_json::Map<String, Value> = match std::fs::read(&cfg) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(_) => serde_json::Map::new(),
+        };
+        let defaults = json!({
+            "roots": [user_home.display().to_string()],
+            "read_roots": READ_ROOTS_DEFAULT,
+            "exec_read": "home",
+            "exec_read_allow": EXEC_READ_ALLOW_DEFAULT,
+            "exec_network": "allow",
+            "exec_deny": [],
+            "exec_import_claude_rules": true,
+            "exec_unlock": [],
+            "exec_unsandboxed": [],
+            "resume_window_ms": crate::session::RESUME_WINDOW_DEFAULT_MS,
+            "embed": null,
+            "witness": null,
+        });
+        let mut settings = serde_json::Map::new();
+        for (key, default) in defaults.as_object().into_iter().flatten() {
+            let entry = match (raw.get(key), key.as_str()) {
+                (None, _) => json!({"value": default, "from": "default"}),
+                (Some(Value::Array(yours)), "read_roots" | "exec_read_allow") => {
+                    let mut all = default.as_array().cloned().unwrap_or_default();
+                    all.extend(yours.iter().cloned());
+                    json!({"value": all, "from": "default + config.json"})
+                }
+                (Some(v), _) => json!({"value": v, "from": "config.json"}),
+            };
+            settings.insert(key.clone(), entry);
+        }
+        Ok(json!({"file": cfg.display().to_string(), "exists": cfg.is_file(), "settings": settings}))
+    }
+
     /// A policy with these roots and every other setting at its default.
     pub fn new(roots: &[PathBuf], symbia_home: &Path, user_home: &Path) -> anyhow::Result<Self> {
         Self::with_config(roots, symbia_home, user_home, &Config::default())
@@ -241,7 +340,10 @@ impl Policy {
 
     /// A policy with these roots and the rest of `c` (its `roots` key is ignored).
     pub fn with_config(roots: &[PathBuf], symbia_home: &Path, user_home: &Path, c: &Config) -> anyhow::Result<Self> {
-        let spell = |list: &[String]| -> anyhow::Result<Vec<Spelled>> { list.iter().map(|p| Spelled::new(&expand(p, user_home)?)).collect() };
+        // The defaults are always kept; the config adds to them.
+        let spell = |defaults: &[&str], list: &[String]| -> anyhow::Result<Vec<Spelled>> {
+            defaults.iter().copied().chain(list.iter().map(String::as_str)).map(|p| Spelled::new(&expand(p, user_home)?)).collect()
+        };
         let roots = roots.iter().map(|r| Spelled::new(r)).collect::<anyhow::Result<_>>()?;
         let deny = DENY_IN_HOME
             .iter()
@@ -274,16 +376,22 @@ impl Policy {
             }
             None => None,
         };
-        Ok(Self {
+        // The witness is checked against what agents did, so agents can't write it.
+        let mut protected: Vec<Spelled> = PROTECT_IN_HOME.iter().map(|p| Spelled::lenient(&user_home.join(p))).collect::<anyhow::Result<_>>()?;
+        if let Some(w) = &witness {
+            protected.push(Spelled::lenient(w)?);
+        }
+        let policy = Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
-            read_roots: spell(&c.read_roots)?,
+            read_roots: spell(&READ_ROOTS_DEFAULT, &c.read_roots)?,
             deny,
+            protected,
             own,
             user_home: Spelled::new(user_home)?,
             network: c.exec_network,
             exec_read: c.exec_read,
-            exec_read_allow: spell(&c.exec_read_allow)?,
+            exec_read_allow: spell(&EXEC_READ_ALLOW_DEFAULT, &c.exec_read_allow)?,
             exec_deny: c.exec_deny.clone(),
             import_claude_rules: c.exec_import_claude_rules,
             exec_unlock: c.exec_unlock.clone(),
@@ -297,7 +405,15 @@ impl Policy {
                 .map(|e| (e.document_prefix.clone().unwrap_or_default(), e.query_prefix.clone().unwrap_or_default()))
                 .unwrap_or_default(),
             witness,
-        })
+        };
+        // Symbia starts the embedding server itself, outside the sandbox: like a rule's
+        // program, it must not sit where a sandboxed command could replace it.
+        if let Some(crate::embed::EmbedSpec::Server { program, .. }) = &policy.embed
+            && policy.exec_writable(program)
+        {
+            anyhow::bail!("embed server {} is where sandboxed commands can write; move it outside the roots", program.display());
+        }
+        Ok(policy)
     }
 
     /// Prefixes for record texts and queries sent to the embedding model.
@@ -390,6 +506,34 @@ impl Policy {
         self.own.both().collect()
     }
 
+    /// Write-protected paths ([`PROTECT_IN_HOME`] and the witness folder), both spellings.
+    pub fn protected_paths(&self) -> Vec<&Path> {
+        self.protected.iter().flat_map(Spelled::both).collect()
+    }
+
+    /// Whether `p` may not be written: a protected path, or a repository's hooks or config.
+    pub fn write_protected(&self, p: &Path) -> bool {
+        self.protected.iter().any(|s| s.holds(p)) || git_protected(p)
+    }
+
+    /// Where exec may write: the roots (both spellings) and [`EXEC_WRITE_ALWAYS`]. Everything
+    /// else is read-only to it, and the deny list, `$SYMBIA_HOME` and protected paths stay
+    /// unwritable inside these.
+    pub fn exec_write_paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().flat_map(Spelled::both).map(Path::to_path_buf).chain(EXEC_WRITE_ALWAYS.iter().map(PathBuf::from)).collect()
+    }
+
+    /// Whether `p` (a realpath) is somewhere exec may write, so a program there could have been
+    /// put there by a command run in the sandbox.
+    pub fn exec_writable(&self, p: &Path) -> bool {
+        self.exec_write_paths().iter().any(|w| p.starts_with(w)) && !self.write_protected(p) && !self.own.holds(p) && !self.denied(p)
+    }
+
+    /// True when the only root is the user's whole home folder, the default.
+    pub fn roots_are_home(&self) -> bool {
+        self.roots.iter().any(|r| r.lex == self.user_home.lex || r.real == self.user_home.real)
+    }
+
     /// The user's home, both spellings.
     pub fn home_paths(&self) -> Vec<&Path> {
         self.user_home.both().collect()
@@ -431,6 +575,9 @@ impl Policy {
         }
         if access == Access::Write && (self.own.holds(&lex) || self.own.holds(&resolved)) {
             return Err(format!("denied: {} is inside $SYMBIA_HOME, which the tools may not write", lex.display()));
+        }
+        if access == Access::Write && (self.write_protected(&lex) || self.write_protected(&resolved)) {
+            return Err(format!("denied: {} is write-protected (it runs outside the sandbox later, or is the witness)", lex.display()));
         }
         let extra: &[Spelled] = if access == Access::Read { &self.read_roots } else { &[] };
         let evidence = (access == Access::Read).then_some(&self.evidence);
@@ -557,6 +704,58 @@ mod tests {
         assert!(p.check("~/.aws/credentials", Access::Read).unwrap_err().contains("deny list"));
     }
 
+    /// Review finding: with the home as the root, the file tools could write files that later
+    /// run outside the sandbox, a repository's hooks and config, and the witness.
+    #[test]
+    fn protected_paths_are_readable_but_never_writable() {
+        let (t, user, sym, _) = setup();
+        let w = t.path().join("witness");
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(sym.join("config.json"), serde_json::json!({"witness": w, "roots": [user, w]}).to_string()).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        let mut targets: Vec<PathBuf> = PROTECT_IN_HOME.iter().map(|d| user.join(d)).collect();
+        targets.extend([
+            user.join("Library/LaunchAgents/evil.plist"),
+            user.join("work/repo/.git/hooks/pre-push"),
+            user.join("work/repo/.git/config"),
+            user.join("work/repo/.git/modules/sub/hooks/post-checkout"),
+            w.join("witness.jsonl"),
+        ]);
+        for d in &targets {
+            let e = p.check(&s(d), Access::Write).unwrap_err();
+            assert!(e.contains("write-protected"), "{}: {e}", d.display());
+            assert!(p.check(&s(d), Access::Read).is_ok(), "{}", d.display());
+        }
+        // Ordinary repository files stay writable.
+        for ok in ["work/repo/.git/objects/ab/cd", "work/repo/src/config", "work/repo/hooks/x", "work/.gitignore"] {
+            assert!(p.check(&s(&user.join(ok)), Access::Write).is_ok(), "{ok}");
+        }
+        // A link inside the root that points at a protected file is refused through its realpath.
+        std::fs::write(user.join(".zshrc"), "").unwrap();
+        std::os::unix::fs::symlink(user.join(".zshrc"), user.join("work/rc")).unwrap();
+        assert!(p.check(&s(&user.join("work/rc")), Access::Write).unwrap_err().contains("write-protected"));
+        assert!(p.roots_are_home());
+    }
+
+    #[test]
+    fn exec_writes_go_only_to_roots_and_temp() {
+        let (_t, user, sym, home_root) = setup();
+        assert!(home_root.roots_are_home());
+        let p = Policy::new(&[user.join("work")], &sym, &user).unwrap();
+        assert!(!p.roots_are_home());
+        let w: Vec<PathBuf> = p.exec_write_paths();
+        assert!(w.iter().any(|x| x.ends_with("work")));
+        for always in EXEC_WRITE_ALWAYS {
+            assert!(w.contains(&PathBuf::from(always)), "{always}");
+        }
+        assert!(p.exec_writable(&std::fs::canonicalize(user.join("work")).unwrap().join("bin/tool")));
+        // The platform's temp folder, where tests and scripts put programs, counts on every OS.
+        assert!(p.exec_writable(&std::fs::canonicalize(std::env::temp_dir()).unwrap().join("bin/tool")));
+        for not in ["/opt/homebrew/bin/gh", "/usr/bin/git", "/Users/Shared/x"] {
+            assert!(!p.exec_writable(Path::new(not)), "{not}");
+        }
+    }
+
     #[test]
     fn evidence_is_readable_but_not_writable_outside_roots() {
         let (_t, _user, sym, p) = setup();
@@ -665,8 +864,44 @@ mod tests {
         assert_eq!((p.exec_read(), p.import_claude_rules(), p.exec_deny()), (ExecRead::DenyList, false, &["chmod:*".to_string()][..]));
         assert!(p.exec_read_paths().contains(&user.join(".tool").as_path()));
         assert!(!p.exec_read_paths().contains(&user.join(".zshrc").as_path()));
+        // An entry of your own adds to the defaults rather than replacing them.
+        assert!(p.exec_read_paths().contains(&user.join(".cargo").as_path()));
+        assert!(p.exec_read_paths().contains(&user.join(".zprofile").as_path()));
         std::fs::write(sym.join("config.json"), r#"{"exec_read": "everything"}"#).unwrap();
         assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_not_a_default() {
+        let (_t, user, sym, _p) = setup();
+        // "root" for "roots" used to leave the whole home as the root without a word.
+        std::fs::write(sym.join("config.json"), r#"{"root": ["~/work"]}"#).unwrap();
+        let e = format!("{:#}", Policy::load(&sym, &user).unwrap_err());
+        assert!(e.contains("unknown field `root`") && e.contains("config.json"), "{e}");
+        std::fs::write(sym.join("config.json"), r#"{"exec_unsandboxed": [{"program": "/usr/bin/git", "arg": ["push"]}]}"#).unwrap();
+        assert!(format!("{:#}", Policy::load(&sym, &user).unwrap_err()).contains("unknown field `arg`"));
+    }
+
+    #[test]
+    fn effective_settings_say_where_each_came_from() {
+        let (_t, user, sym, _p) = setup();
+        let e = Policy::effective(&sym, &user).unwrap();
+        assert_eq!(e["exists"], false);
+        assert_eq!(e["settings"]["roots"], serde_json::json!({"value": [user.display().to_string()], "from": "default"}));
+        std::fs::write(sym.join("config.json"), serde_json::json!({"roots": ["~/work"], "read_roots": ["~/ref"], "exec_network": "deny"}).to_string()).unwrap();
+        let e = Policy::effective(&sym, &user).unwrap();
+        let s = &e["settings"];
+        assert_eq!((s["roots"]["from"].as_str(), s["exec_network"]["value"].as_str()), (Some("config.json"), Some("deny")));
+        assert_eq!(s["read_roots"], serde_json::json!({"value": ["~/.cargo/registry", "~/.rustup/toolchains", "~/ref"], "from": "default + config.json"}));
+        assert_eq!(s["exec_read_allow"]["from"], "default");
+        // Every key the file accepts is listed, and nothing else.
+        let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
+        let all: serde_json::Map<String, serde_json::Value> = keys.iter().map(|k| ((*k).clone(), s[k.as_str()]["value"].clone())).collect();
+        assert!(serde_json::from_value::<Config>(serde_json::Value::Object(all)).is_ok());
+        assert_eq!(keys.len(), 12);
+        // A file the server would refuse is refused here too.
+        std::fs::write(sym.join("config.json"), r#"{"witnes": "~/w"}"#).unwrap();
+        assert!(Policy::effective(&sym, &user).is_err());
     }
 
     #[test]

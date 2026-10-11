@@ -185,11 +185,22 @@ fn sbpl_rule(rule: &str, filter: &str, paths: &[&Path]) -> Result<String, String
     Ok(s)
 }
 
+/// Programs a sandboxed command may not start: each hands work to a process outside the sandbox
+/// (LaunchServices, launchd, Apple Events).
+pub const EXEC_NO_LAUNCH: [&str; 4] = ["/usr/bin/open", "/bin/launchctl", "/usr/bin/osascript", "/usr/bin/osacompile"];
+
 /// The seatbelt profile for one call. With `exec_read: "home"` the user's home is unreadable
 /// except its roots, read allowances and the evidence folder (metadata of the home and of the
-/// folders leading to them stays readable). In every mode deny-list paths are neither readable
-/// nor writable, `$SYMBIA_HOME` is not writable, and with `exec_network: "deny"` no outbound IP
-/// traffic leaves. SBPL takes the last matching rule, so the deny list comes after the allows.
+/// folders leading to them stays readable). In every mode:
+/// - writes go only to the roots, temporary folders and `/dev`;
+/// - deny-list paths are neither readable nor writable;
+/// - `$SYMBIA_HOME`, protected paths (shell startup files, launch agents, git config, the
+///   witness) and any repository's `.git/hooks` and `.git/config` are not writable;
+/// - [`EXEC_NO_LAUNCH`] programs, LaunchServices opens and Apple Events are refused;
+/// - with `exec_network: "deny"` no outbound traffic leaves, DNS lookups through
+///   mDNSResponder included.
+///
+/// SBPL takes the last matching rule, so each deny comes after the allows it narrows.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn profile(policy: &Policy) -> Result<String, String> {
     let mut p = String::from("(version 1)\n(allow default)\n");
@@ -200,14 +211,22 @@ pub fn profile(policy: &Policy) -> Result<String, String> {
         p.push_str(&sbpl_rule("allow file-read-metadata", "literal", &meta)?);
         p.push_str(&sbpl_rule("allow file-read*", "subpath", &policy.exec_read_paths())?);
     }
+    p.push_str("(deny file-write* (subpath \"/\"))\n");
+    let writable = policy.exec_write_paths();
+    p.push_str(&sbpl_rule("allow file-write*", "subpath", &writable.iter().map(PathBuf::as_path).collect::<Vec<_>>())?);
     for d in policy.exec_deny_paths() {
         p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(d)?));
     }
-    for o in policy.own_paths() {
+    for o in policy.own_paths().into_iter().chain(policy.protected_paths()) {
         p.push_str(&format!("(deny file-write* (subpath {}))\n", sbpl_str(o)?));
     }
+    p.push_str("(deny file-write* (regex #\"/\\.git/(.+/)?hooks(/|$)\") (regex #\"/\\.git/(.+/)?config$\"))\n");
+    let launch: Vec<&Path> = EXEC_NO_LAUNCH.iter().map(Path::new).collect();
+    p.push_str(&sbpl_rule("deny process-exec*", "literal", &launch)?);
+    p.push_str("(deny lsopen)\n(deny appleevent-send)\n");
     if policy.network() == Network::Deny {
         p.push_str("(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n");
+        p.push_str("(deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\n");
     }
     Ok(p)
 }
@@ -478,6 +497,17 @@ fn unsandboxed(policy: &Policy, command: &str, dir: &Path, facts: &mut Facts) ->
     let words = crate::unsandboxed::split(command)?;
     let rules = policy.exec_unsandboxed();
     let (i, rule) = crate::unsandboxed::find(rules, command, &words, dir)?;
+    // The program must be the file the rule named at start, somewhere a sandboxed command
+    // can't write: otherwise the sandbox could swap in its own program and have it run outside.
+    let real = rule.unchanged()?;
+    if policy.exec_writable(&real) {
+        return Err(format!(
+            "refused: {} resolves to {}, where sandboxed commands can write; move the program or narrow roots in config.json",
+            rule.program.display(),
+            real.display()
+        ));
+    }
+    crate::unsandboxed::check_args(&rule.program, &words[1..])?;
     facts.unsandboxed = Some(json!({"rule": i, "program": rule.program.display().to_string(), "argv": words}));
     let mut c = tokio::process::Command::new(&rule.program);
     c.args(&words[1..]).env("PATH", crate::unsandboxed::path_env(rules));
@@ -615,45 +645,61 @@ mod tests {
         Ok((serde_json::from_str(&ran.reply).unwrap(), facts))
     }
 
+    // Rule programs must sit where sandboxed commands can't write, which rules out the temp
+    // folders tests run in; these tests use system programs.
     #[tokio::test]
     async fn unsandboxed_runs_the_rules_program_without_a_shell() {
-        let t0 = tempfile::tempdir().unwrap();
-        let tool = script(&t0.path().join("bin"), "tool", r#"echo "real $# $1|$2"; echo "PATH=$PATH""#);
-        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": tool, "args": ["*"]}]), &[]);
-        let (r, facts) = run_req(&p, &sym, r#"tool 'a b' "c""#, &root, true).await.unwrap();
-        let out = r["stdout"]["tail"].as_str().unwrap();
-        assert!(out.starts_with("real 2 a b|c\n"), "{r}");
-        // PATH is the fixed one, not the server's.
-        let path = crate::unsandboxed::path_env(p.exec_unsandboxed());
-        assert!(out.contains(&format!("PATH={}\n", path.to_str().unwrap())), "{r}");
+        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": "/usr/bin/printf", "args": ["*"]}, {"program": "/usr/bin/env", "args": []}]), &[]);
+        let (r, facts) = run_req(&p, &sym, r#"printf '%s|%s\n' 'a b' "c""#, &root, true).await.unwrap();
+        assert_eq!(r["stdout"]["tail"], "a b|c\n", "{r}");
         assert_eq!(r["sandbox"], "none");
         assert_eq!((facts.sandbox, facts.network), (Some("none"), Some("unrestricted")));
-        assert_eq!(facts.unsandboxed, Some(json!({"rule": 0, "program": tool.display().to_string(), "argv": ["tool", "a b", "c"]})));
+        assert_eq!(facts.unsandboxed, Some(json!({"rule": 0, "program": "/usr/bin/printf", "argv": ["printf", "%s|%s\\n", "a b", "c"]})));
         assert_eq!(facts.unlocked, None);
-        // The same command without the flag goes through the sandboxed shell, which has no `tool`.
-        let (r, facts) = run_req(&p, &sym, "tool x", &root, false).await.unwrap();
-        assert_eq!(r["exit"], 127, "{r}");
+        // PATH is the fixed one, not the server's.
+        let (r, _) = run_req(&p, &sym, "env", &root, true).await.unwrap();
+        let path = crate::unsandboxed::path_env(p.exec_unsandboxed());
+        assert!(r["stdout"]["tail"].as_str().unwrap().contains(&format!("PATH={}\n", path.to_str().unwrap())), "{r}");
+        // The same command without the flag goes through the sandboxed shell.
+        let (r, facts) = run_req(&p, &sym, "printf x", &root, false).await.unwrap();
         assert!(r.get("sandbox").is_none(), "{r}");
         assert_eq!((facts.sandbox, facts.unsandboxed), (Some(SANDBOX), None));
     }
 
     #[tokio::test]
     async fn unsandboxed_refusals() {
+        let (t, root, sym, p) = unsandboxed_setup(json!([{"program": "/usr/bin/printf", "args": ["push", "*"]}]), &["printf push --force:*"]);
+        let e = run_req(&p, &sym, "printf pull", &root, true).await.unwrap_err();
+        assert!(e.starts_with("refused: no exec_unsandboxed rule matches \"printf pull\"; rules:"), "{e}");
+        assert!(e.contains("/usr/bin/printf push *"), "{e}");
+        assert_eq!(run_req(&p, &sym, "printf push; id", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
+        assert_eq!(run_req(&p, &sym, "printf push $(id)", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
+        // exec_deny is checked first and still refuses.
+        let e = run_req(&p, &sym, "printf push --force origin", &root, true).await.unwrap_err();
+        assert!(e.contains("matches exec rule"), "{e}");
+        // Review finding: a newline split the command for exec_deny but not for the rule, so
+        // the denied command ran. A newline is now refused like any other shell syntax.
+        assert_eq!(run_req(&p, &sym, "printf push\n--force origin", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
+        // A cwd outside the roots is refused as always.
+        assert!(run_req(&p, &sym, "printf push", t.path(), true).await.is_err());
+        let (r, _) = run_req(&p, &sym, "printf push origin", &root, true).await.unwrap();
+        assert_eq!(r["stdout"]["tail"], "push");
+    }
+
+    /// Review finding: a rule's program could be replaced from inside the sandbox (it sat in a
+    /// folder sandboxed commands could write) and would then run outside it.
+    #[tokio::test]
+    async fn a_rule_program_the_sandbox_could_write_or_that_changed_is_refused() {
         let t0 = tempfile::tempdir().unwrap();
         let tool = script(&t0.path().join("bin"), "tool", "echo ran");
-        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": tool, "args": ["push", "*"]}]), &["tool push --force:*"]);
-        let e = run_req(&p, &sym, "tool pull", &root, true).await.unwrap_err();
-        assert!(e.starts_with("refused: no exec_unsandboxed rule matches \"tool pull\"; rules:"), "{e}");
-        assert!(e.contains(&format!("{} push *", tool.display())), "{e}");
-        assert_eq!(run_req(&p, &sym, "tool push; id", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
-        assert_eq!(run_req(&p, &sym, "tool push $(id)", &root, true).await.unwrap_err(), crate::unsandboxed::NO_SHELL);
-        // exec_deny is checked first and still refuses.
-        let e = run_req(&p, &sym, "tool push --force origin", &root, true).await.unwrap_err();
-        assert!(e.contains("matches exec rule"), "{e}");
-        // A cwd outside the roots is refused as always.
-        assert!(run_req(&p, &sym, "tool push", t0.path(), true).await.is_err());
-        let (r, _) = run_req(&p, &sym, "tool push origin", &root, true).await.unwrap();
-        assert_eq!(r["stdout"]["tail"], "ran\n");
+        let (_t, root, sym, p) = unsandboxed_setup(json!([{"program": tool, "args": ["*"]}]), &[]);
+        let e = run_req(&p, &sym, "tool x", &root, true).await.unwrap_err();
+        assert!(e.contains("where sandboxed commands can write"), "{e}");
+        // Replaced after the rule loaded: refused before anything else is checked.
+        std::thread::sleep(Duration::from_millis(1100));
+        script(&t0.path().join("bin"), "tool", "echo swapped; id");
+        let e = run_req(&p, &sym, "tool x", &root, true).await.unwrap_err();
+        assert!(e.contains("changed since symbia started"), "{e}");
     }
 
     #[tokio::test]
@@ -785,8 +831,19 @@ mod tests {
         assert!(prof.contains("we\\\"ird \\\\home/.ssh"), "{prof}");
         assert!(prof.contains(&format!("(deny file-write* (subpath {}))", quoted(&sym))));
         assert!(!prof.contains("network"));
+        // 0.2: writes only inside the roots and temp folders; protected paths, git hooks and
+        // config, and launching things outside the sandbox are refused.
+        assert!(prof.contains("(deny file-write* (subpath \"/\"))\n(allow file-write* "), "{prof}");
+        for p in crate::policy::PROTECT_IN_HOME.iter().map(|d| user.join(d)) {
+            assert!(prof.contains(&format!("(deny file-write* (subpath {}))", quoted(&p))), "{prof}");
+        }
+        assert!(prof.contains("(deny file-write* (regex #\"/\\.git/(.+/)?hooks(/|$)\") (regex #\"/\\.git/(.+/)?config$\"))"), "{prof}");
+        assert!(prof.contains("(deny process-exec* (literal \"/usr/bin/open\") (literal \"/bin/launchctl\")"), "{prof}");
+        assert!(prof.contains("(deny lsopen)\n(deny appleevent-send)\n"), "{prof}");
         let prof = profile(&p.with_network(Network::Deny)).unwrap();
-        assert!(prof.ends_with("(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n"));
+        assert!(prof.ends_with(
+            "(deny network-outbound)\n(allow network-outbound (remote unix-socket))\n(deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\n"
+        ));
     }
 
     #[test]
@@ -809,14 +866,18 @@ mod tests {
             assert!(lines[4].contains(&format!("(subpath {})", q(&allowed))), "{}: {prof}", allowed.display());
         }
         assert!(!lines[4].contains(".npmrc"));
-        // The deny list follows every allow, so it wins; then the data directory's write deny.
+        // Then writes: denied everywhere, allowed in the roots and temp folders.
+        assert_eq!(lines[5], "(deny file-write* (subpath \"/\"))", "{prof}");
+        assert!(lines[6].starts_with("(allow file-write* (subpath ") && lines[6].contains(&format!("(subpath {})", q(&root))) && lines[6].contains(&format!("\"{}\"", crate::policy::EXEC_WRITE_ALWAYS[0])), "{prof}");
+        // The deny list follows every allow, so it wins; then the write denies.
         let first_deny = lines.iter().position(|l| l.starts_with("(deny file-read* file-write*")).unwrap();
-        assert_eq!(first_deny, 5, "{prof}");
-        assert!(lines.last().unwrap().starts_with("(deny file-write* (subpath "), "{prof}");
+        assert_eq!(first_deny, 7, "{prof}");
+        let last_list = lines.iter().rposition(|l| l.starts_with("(deny file-read* file-write*")).unwrap();
+        assert!(lines[last_list + 1].starts_with("(deny file-write* (subpath "), "{prof}");
         // `deny_list` drops the home rules.
         let c = crate::policy::Config { exec_read: ExecRead::DenyList, ..Default::default() };
         let prof = profile(&Policy::with_config(std::slice::from_ref(&root), &sym, &user, &c).unwrap()).unwrap();
-        assert!(!prof.contains("allow file-read") && prof.lines().nth(2).unwrap().starts_with("(deny file-read* file-write*"), "{prof}");
+        assert!(!prof.contains("allow file-read") && prof.lines().nth(2).unwrap() == "(deny file-write* (subpath \"/\"))", "{prof}");
     }
 
     #[tokio::test]
@@ -863,6 +924,12 @@ mod tests {
         use super::*;
 
         const SECRET: &str = "SECRET-7c1f-not-for-exec";
+
+        /// The running macOS major version, from `sw_vers`.
+        fn macos_major() -> u32 {
+            let out = std::process::Command::new("/usr/bin/sw_vers").arg("-productVersion").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().split('.').next().and_then(|m| m.parse().ok()).unwrap_or(0)
+        }
 
         /// A user home named `user` holding `.ssh/id_test`, a root beside it and `SYMBIA_HOME`
         /// with a key file. The policy's user home is the temp one, not the real `$HOME`.
@@ -912,6 +979,47 @@ mod tests {
                 let (r, _, _) = run(&p, &sym, "echo ok", &root, None).await;
                 assert_eq!((r["exit"].clone(), r["stdout"]["tail"].clone()), (json!(0), json!("ok\n")), "{user}");
             }
+        }
+
+        /// Review findings: sandboxed commands could write anywhere outside the deny list, start
+        /// programs that run outside the sandbox, and look up names with the network denied.
+        #[tokio::test]
+        async fn the_sandbox_writes_only_roots_and_temp_and_launches_nothing_outside() {
+            let (_t, home, root, sym, p) = setup("user");
+            let probe = PathBuf::from(format!("/Users/Shared/symbia-probe-{}", std::process::id()));
+            let denied = [
+                format!("touch {}", quote(&probe)),
+                format!("echo evil >> {}", quote(&home.join(".zshrc"))),
+                format!("mkdir -p {}", quote(&home.join("Library/LaunchAgents/x"))),
+                format!("mkdir -p {}", quote(&root.join("repo/.git/hooks"))),
+                format!("mkdir -p {} && echo x > {}", quote(&root.join("repo2/.git")), quote(&root.join("repo2/.git/config"))),
+                "/usr/bin/open -h".into(),
+                "/bin/launchctl version".into(),
+                "/usr/bin/osascript -e 'return 1'".into(),
+            ];
+            for cmd in &denied {
+                let (r, _, _) = run(&p, &sym, cmd, &root, None).await;
+                assert_ne!(r["exit"], 0, "{cmd}: {r}");
+            }
+            assert!(!probe.exists(), "wrote outside the roots");
+            assert!(!home.join(".zshrc").exists() && !home.join("Library/LaunchAgents/x").exists());
+            assert!(!root.join("repo/.git/hooks").exists() && !root.join("repo2/.git/config").exists());
+            // Inside the root, the temp folder and ordinary repository files are fine.
+            let (r, _, _) = run(&p, &sym, "mkdir -p repo/.git/objects && touch repo/.git/objects/x a.txt /private/tmp/symbia-probe-ok && rm /private/tmp/symbia-probe-ok", &root, None).await;
+            assert_eq!(r["exit"], 0, "{r}");
+            // Control: outside the sandbox the same launchers run, so the refusal above is the sandbox's.
+            for (prog, args) in [("/bin/launchctl", &["version"][..]), ("/usr/bin/osascript", &["-e", "return 1"][..])] {
+                assert!(std::process::Command::new(prog).args(args).output().unwrap().status.success(), "{prog}");
+            }
+            // A copy of a launcher is not caught by the path rule. macOS 26 kills such a copy itself
+            // (137); on macOS 15 (CI, October 11) the copy ran. Documented in SECURITY.md.
+            let (r, _, _) = run(&p, &sym, "cp /bin/launchctl lc && ./lc version; e=$?; rm -f lc; exit $e", &root, None).await;
+            if macos_major() >= 26 {
+                assert_ne!(r["exit"], 0, "{r}");
+            }
+            // With the network denied, names don't resolve either.
+            let (r, _, _) = run(&p.clone().with_network(Network::Deny), &sym, "/sbin/ping -c 1 -t 2 example.com", &root, None).await;
+            assert_ne!(r["exit"], 0, "{r}");
         }
 
         #[tokio::test]

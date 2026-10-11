@@ -13,10 +13,10 @@ fn key() -> Vec<String> {
 
 #[test]
 fn the_session_and_thread_seals_verify_against_the_example_key_and_witness() {
-    let entries = symbia::witness::read(&symbia::witness::file_of(&ex("witness"))).unwrap();
-    let full = symbia::seal::verify_trusted(&ex("seals/session.sqlite"), &key()).unwrap();
+    let entries = symbia::witness::load(&symbia::witness::file_of(&ex("witness")), &key()).unwrap();
+    let (full, snap) = symbia::seal::open_trusted(&ex("seals/session.sqlite"), &key()).unwrap();
     assert_eq!((full.thread.as_deref(), full.records, full.withheld), (None, 9, 0));
-    let w = symbia::witness::check(&ex("seals/session.sqlite"), &full.session, full.chain_seq, &entries).unwrap();
+    let w = symbia::witness::check(snap.conn(), &full.session, full.chain_seq, &entries).unwrap();
     assert_eq!(w.describe(), format!("ok ({} entries)", entries.len()));
 
     let thread = symbia::seal::verify_trusted(&ex("seals/agent-a.sqlite"), &key()).unwrap();
