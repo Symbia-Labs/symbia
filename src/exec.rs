@@ -868,7 +868,7 @@ mod tests {
         assert!(!lines[4].contains(".npmrc"));
         // Then writes: denied everywhere, allowed in the roots and temp folders.
         assert_eq!(lines[5], "(deny file-write* (subpath \"/\"))", "{prof}");
-        assert!(lines[6].starts_with("(allow file-write* (subpath ") && lines[6].contains(&format!("(subpath {})", q(&root))) && lines[6].contains("\"/private/tmp\""), "{prof}");
+        assert!(lines[6].starts_with("(allow file-write* (subpath ") && lines[6].contains(&format!("(subpath {})", q(&root))) && lines[6].contains(&format!("\"{}\"", crate::policy::EXEC_WRITE_ALWAYS[0])), "{prof}");
         // The deny list follows every allow, so it wins; then the write denies.
         let first_deny = lines.iter().position(|l| l.starts_with("(deny file-read* file-write*")).unwrap();
         assert_eq!(first_deny, 7, "{prof}");
