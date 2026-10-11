@@ -30,6 +30,10 @@ use crate::seal;
 use crate::store::{Evidence, FIND_LIMIT_MAX, FindQuery, Store};
 
 const PREFIX: usize = 12;
+
+/// Said at start and in `status` while the only root is the whole home folder (the default).
+pub const ROOTS_ARE_HOME: &str =
+    "roots is your whole home folder, so the file tools and exec can write anywhere in it outside the protected paths; set roots in config.json to the folders agents work in";
 const SESSION_HEADER: &str = "mcp-session-id";
 const NO_SESSION: &str = "no session: initialize an MCP session first (Mcp-Session-Id, protocol 2025-11-25 or earlier)";
 pub(crate) const TOOL_LANE_REASON: &str = "tool output, not verified";
@@ -335,6 +339,9 @@ impl SymbiaServer {
         if !policy.exec_unsandboxed().is_empty() {
             let programs: Vec<String> = policy.exec_unsandboxed().iter().map(|r| r.program.display().to_string()).collect();
             eprintln!("symbia: exec_unsandboxed is on; exec may run without the sandbox: {}", programs.join(", "));
+        }
+        if policy.roots_are_home() {
+            eprintln!("symbia: {ROOTS_ARE_HOME}");
         }
         crate::session::clean_empty(home);
         let stdio = Stdio { started_ms: crate::now_ms(), ..Stdio::default() };
@@ -915,6 +922,7 @@ impl SymbiaServer {
                 "jobs": jobs,
                 "exec_unlock": self.policy.exec_unlock(),
                 "exec_unsandboxed": self.policy.exec_unsandboxed().iter().map(|r| r.describe()).collect::<Vec<_>>(),
+                "warnings": if self.policy.roots_are_home() { vec![ROOTS_ARE_HOME] } else { Vec::new() },
                 "resumes": crate::session::resumes(store).map_err(err)?,
                 "previous_session": self.previous_session(),
                 "thread": current_thread(),
@@ -2140,6 +2148,8 @@ mod tests {
         assert_eq!(v["build"], crate::BUILD);
         assert_eq!(v["retention"], "session");
         assert_eq!(v["seq"], 0);
+        // With no roots set, the home folder is the root, and status says so.
+        assert_eq!(v["warnings"], json!([ROOTS_ARE_HOME]), "{v}");
         assert_eq!(v["last_seal"], Value::Null);
         assert_eq!(v["mcp_session_id"], Value::Null);
         assert!(v["expires_ms"].as_i64().unwrap() > crate::now_ms());

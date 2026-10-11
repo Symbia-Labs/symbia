@@ -37,9 +37,32 @@ pub struct Rule {
     pub program: PathBuf,
     /// Its realpath at load, for matching a command word that is a path.
     real: PathBuf,
+    /// Device, inode, size and modification time of `real` at load.
+    identity: Option<(u64, u64, u64, i64)>,
     pub args: Vec<String>,
     /// Realpath of the folder the call must run in, if the rule sets one.
     pub cwd: Option<PathBuf>,
+}
+
+fn identity(p: &Path) -> Option<(u64, u64, u64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime()))
+}
+
+/// Arguments that make `git` run a command of the caller's choosing: a pack program on a local
+/// remote, or the `ext::` transport.
+pub const GIT_EXEC_ARGS: [&str; 3] = ["--receive-pack", "--upload-pack", "--exec"];
+
+/// Refuse arguments that turn a narrow rule into a way to run anything; today, `git`'s.
+pub fn check_args(program: &Path, args: &[String]) -> Result<(), String> {
+    if program.file_name().is_some_and(|n| n == "git") {
+        for a in args {
+            if GIT_EXEC_ARGS.iter().any(|f| a.starts_with(f)) || a.contains("ext::") {
+                return Err(format!("refused: {a:?} makes git run another program, outside the sandbox"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An executable regular file.
@@ -79,7 +102,18 @@ impl Rule {
             }
             None => None,
         };
-        Ok(Self { program, real, args: c.args.clone(), cwd })
+        Ok(Self { identity: identity(&real), program, real, args: c.args.clone(), cwd })
+    }
+
+    /// The program's realpath, if it is still the file this rule resolved to at load: same
+    /// path, device, inode, size and modification time. A program replaced since is refused
+    /// until the server restarts and loads the rule again.
+    pub fn unchanged(&self) -> Result<PathBuf, String> {
+        let now = std::fs::canonicalize(&self.program).map_err(|e| format!("refused: {}: {e}", self.program.display()))?;
+        if now != self.real || identity(&now) != self.identity {
+            return Err(format!("refused: {} changed since symbia started; restart it to load the rule again", self.program.display()));
+        }
+        Ok(now)
     }
 
     /// `<program> <args>[ (in <cwd>)]`, as listed in status and refusals.
@@ -106,6 +140,19 @@ impl Rule {
         };
         program && args_match && self.cwd.as_ref().is_none_or(|d| cwd.starts_with(d))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn git_arguments_that_run_another_program_are_refused() {
+    let git = Path::new("/usr/bin/git");
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for bad in [&["push", "--receive-pack=sh -c id", "/tmp/r"][..], &["fetch", "--upload-pack", "x"], &["push", "--exec=x"], &["fetch", "ext::sh -c id"]] {
+        assert!(check_args(git, &args(bad)).unwrap_err().contains("makes git run another program"), "{bad:?}");
+    }
+    assert!(check_args(git, &args(&["push", "origin", "main"])).is_ok());
+    // Other programs are left to their rules.
+    assert!(check_args(Path::new("/opt/homebrew/bin/gh"), &args(&["--exec=x"])).is_ok());
 }
 
 /// Split `command` into words without a shell. Single quotes are literal; double quotes
@@ -155,7 +202,8 @@ pub fn split(command: &str) -> Result<Vec<String>, String> {
                     None => return Err("refused: trailing backslash in an unsandboxed command".into()),
                 }
             }
-            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' => return Err(NO_SHELL.into()),
+            // A newline would end the command for the exec_deny check but not here.
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '\n' | '\r' => return Err(NO_SHELL.into()),
             c if c.is_whitespace() => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));

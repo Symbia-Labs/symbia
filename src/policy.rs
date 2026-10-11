@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// Denied even inside a root, relative to the user's home directory. These hold keys and
 /// credentials and stay refused in every mode, for the file tools and exec alike.
-pub const DENY_IN_HOME: [&str; 13] = [
+pub const DENY_IN_HOME: [&str; 29] = [
     ".ssh",
     ".gnupg",
     ".aws",
@@ -22,7 +22,56 @@ pub const DENY_IN_HOME: [&str; 13] = [
     ".pypirc",
     ".git-credentials",
     "Library/Cookies",
+    // Added in 0.2: more credential stores and private mail, messages and browser data.
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".config/git/credentials",
+    ".config/gcloud",
+    ".azure",
+    ".password-store",
+    ".config/op",
+    ".gem/credentials",
+    ".terraform.d/credentials.tfrc.json",
+    ".vault-token",
+    "Library/Mail",
+    "Library/Messages",
+    "Library/Safari",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/BraveSoftware",
 ];
+
+/// Readable but never writable by the file tools or exec, relative to the user's home: files
+/// that run later outside the sandbox (shell startup files, launch agents) and git's global
+/// config, which can name hooks, aliases and helpers that `git` runs.
+pub const PROTECT_IN_HOME: [&str; 14] = [
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".config/fish",
+    "Library/LaunchAgents",
+    ".gitconfig",
+    ".config/git",
+    ".config/autostart",
+];
+
+/// Folders exec may write besides the roots: temporary files and devices.
+pub const EXEC_WRITE_ALWAYS: [&str; 3] = ["/private/tmp", "/private/var/folders", "/dev"];
+
+/// Inside any repository, git runs `.git/hooks/*` and reads commands from `.git/config`
+/// (`core.hooksPath`, aliases, filters, `core.sshCommand`). Neither may be written.
+pub fn git_protected(p: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = p.iter().collect();
+    let Some(g) = parts.iter().position(|c| *c == ".git") else { return false };
+    let after = &parts[g + 1..];
+    after.iter().any(|c| *c == "hooks") || after.last().is_some_and(|c| *c == "config")
+}
 
 /// Default `read_roots`: toolchain source the file tools may read but not write.
 pub const READ_ROOTS_DEFAULT: [&str; 2] = ["~/.cargo/registry", "~/.rustup/toolchains"];
@@ -159,6 +208,8 @@ pub struct Policy {
     /// Extra roots for the file tools, reads only.
     read_roots: Vec<Spelled>,
     deny: Vec<Spelled>,
+    /// [`PROTECT_IN_HOME`] and the witness folder: readable, never writable.
+    protected: Vec<Spelled>,
     /// `$SYMBIA_HOME`: readable where a root covers it, never writable.
     own: Spelled,
     user_home: Spelled,
@@ -274,11 +325,17 @@ impl Policy {
             }
             None => None,
         };
-        Ok(Self {
+        // The witness is checked against what agents did, so agents can't write it.
+        let mut protected: Vec<Spelled> = PROTECT_IN_HOME.iter().map(|p| Spelled::lenient(&user_home.join(p))).collect::<anyhow::Result<_>>()?;
+        if let Some(w) = &witness {
+            protected.push(Spelled::lenient(w)?);
+        }
+        let policy = Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
             read_roots: spell(&c.read_roots)?,
             deny,
+            protected,
             own,
             user_home: Spelled::new(user_home)?,
             network: c.exec_network,
@@ -297,7 +354,15 @@ impl Policy {
                 .map(|e| (e.document_prefix.clone().unwrap_or_default(), e.query_prefix.clone().unwrap_or_default()))
                 .unwrap_or_default(),
             witness,
-        })
+        };
+        // Symbia starts the embedding server itself, outside the sandbox: like a rule's
+        // program, it must not sit where a sandboxed command could replace it.
+        if let Some(crate::embed::EmbedSpec::Server { program, .. }) = &policy.embed
+            && policy.exec_writable(program)
+        {
+            anyhow::bail!("embed server {} is where sandboxed commands can write; move it outside the roots", program.display());
+        }
+        Ok(policy)
     }
 
     /// Prefixes for record texts and queries sent to the embedding model.
@@ -390,6 +455,34 @@ impl Policy {
         self.own.both().collect()
     }
 
+    /// Write-protected paths ([`PROTECT_IN_HOME`] and the witness folder), both spellings.
+    pub fn protected_paths(&self) -> Vec<&Path> {
+        self.protected.iter().flat_map(Spelled::both).collect()
+    }
+
+    /// Whether `p` may not be written: a protected path, or a repository's hooks or config.
+    pub fn write_protected(&self, p: &Path) -> bool {
+        self.protected.iter().any(|s| s.holds(p)) || git_protected(p)
+    }
+
+    /// Where exec may write: the roots (both spellings) and [`EXEC_WRITE_ALWAYS`]. Everything
+    /// else is read-only to it, and the deny list, `$SYMBIA_HOME` and protected paths stay
+    /// unwritable inside these.
+    pub fn exec_write_paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().flat_map(Spelled::both).map(Path::to_path_buf).chain(EXEC_WRITE_ALWAYS.iter().map(PathBuf::from)).collect()
+    }
+
+    /// Whether `p` (a realpath) is somewhere exec may write, so a program there could have been
+    /// put there by a command run in the sandbox.
+    pub fn exec_writable(&self, p: &Path) -> bool {
+        self.exec_write_paths().iter().any(|w| p.starts_with(w)) && !self.write_protected(p) && !self.own.holds(p) && !self.denied(p)
+    }
+
+    /// True when the only root is the user's whole home folder, the default.
+    pub fn roots_are_home(&self) -> bool {
+        self.roots.iter().any(|r| r.lex == self.user_home.lex || r.real == self.user_home.real)
+    }
+
     /// The user's home, both spellings.
     pub fn home_paths(&self) -> Vec<&Path> {
         self.user_home.both().collect()
@@ -431,6 +524,9 @@ impl Policy {
         }
         if access == Access::Write && (self.own.holds(&lex) || self.own.holds(&resolved)) {
             return Err(format!("denied: {} is inside $SYMBIA_HOME, which the tools may not write", lex.display()));
+        }
+        if access == Access::Write && (self.write_protected(&lex) || self.write_protected(&resolved)) {
+            return Err(format!("denied: {} is write-protected (it runs outside the sandbox later, or is the witness)", lex.display()));
         }
         let extra: &[Spelled] = if access == Access::Read { &self.read_roots } else { &[] };
         let evidence = (access == Access::Read).then_some(&self.evidence);
@@ -555,6 +651,56 @@ mod tests {
         assert!(p.check(&s(&user.join("work/ssh/id_ed25519")), Access::Read).unwrap_err().contains("deny list"));
         // `~` expands to the user's home.
         assert!(p.check("~/.aws/credentials", Access::Read).unwrap_err().contains("deny list"));
+    }
+
+    /// Review finding: with the home as the root, the file tools could write files that later
+    /// run outside the sandbox, a repository's hooks and config, and the witness.
+    #[test]
+    fn protected_paths_are_readable_but_never_writable() {
+        let (t, user, sym, _) = setup();
+        let w = t.path().join("witness");
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(sym.join("config.json"), serde_json::json!({"witness": w, "roots": [user, w]}).to_string()).unwrap();
+        let p = Policy::load(&sym, &user).unwrap();
+        let mut targets: Vec<PathBuf> = PROTECT_IN_HOME.iter().map(|d| user.join(d)).collect();
+        targets.extend([
+            user.join("Library/LaunchAgents/evil.plist"),
+            user.join("work/repo/.git/hooks/pre-push"),
+            user.join("work/repo/.git/config"),
+            user.join("work/repo/.git/modules/sub/hooks/post-checkout"),
+            w.join("witness.jsonl"),
+        ]);
+        for d in &targets {
+            let e = p.check(&s(d), Access::Write).unwrap_err();
+            assert!(e.contains("write-protected"), "{}: {e}", d.display());
+            assert!(p.check(&s(d), Access::Read).is_ok(), "{}", d.display());
+        }
+        // Ordinary repository files stay writable.
+        for ok in ["work/repo/.git/objects/ab/cd", "work/repo/src/config", "work/repo/hooks/x", "work/.gitignore"] {
+            assert!(p.check(&s(&user.join(ok)), Access::Write).is_ok(), "{ok}");
+        }
+        // A link inside the root that points at a protected file is refused through its realpath.
+        std::fs::write(user.join(".zshrc"), "").unwrap();
+        std::os::unix::fs::symlink(user.join(".zshrc"), user.join("work/rc")).unwrap();
+        assert!(p.check(&s(&user.join("work/rc")), Access::Write).unwrap_err().contains("write-protected"));
+        assert!(p.roots_are_home());
+    }
+
+    #[test]
+    fn exec_writes_go_only_to_roots_and_temp() {
+        let (_t, user, sym, home_root) = setup();
+        assert!(home_root.roots_are_home());
+        let p = Policy::new(&[user.join("work")], &sym, &user).unwrap();
+        assert!(!p.roots_are_home());
+        let w: Vec<PathBuf> = p.exec_write_paths();
+        assert!(w.iter().any(|x| x.ends_with("work")));
+        for always in EXEC_WRITE_ALWAYS {
+            assert!(w.contains(&PathBuf::from(always)), "{always}");
+        }
+        assert!(p.exec_writable(&std::fs::canonicalize(user.join("work")).unwrap().join("bin/tool")));
+        for not in ["/opt/homebrew/bin/gh", "/usr/bin/git", "/Users/Shared/x"] {
+            assert!(!p.exec_writable(Path::new(not)), "{not}");
+        }
     }
 
     #[test]
