@@ -175,6 +175,39 @@ pub fn check_listen(addr: SocketAddr, allow_remote: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The environment variable holding the bearer token `symbia serve` requires when set.
+pub const TOKEN_ENV: &str = "SYMBIA_HTTP_TOKEN";
+pub const TOKEN_MIN: usize = 32;
+
+/// The token for `serve`: required with `--allow-remote` (the tools include `exec`, so an open
+/// port would run commands for anyone who reaches it), optional on loopback.
+pub fn token_for(allow_remote: bool, from_env: Option<String>) -> anyhow::Result<Option<String>> {
+    let token = from_env.filter(|t| !t.is_empty());
+    if let Some(t) = &token
+        && t.len() < TOKEN_MIN
+    {
+        bail!("{TOKEN_ENV} must be at least {TOKEN_MIN} characters");
+    }
+    if allow_remote && token.is_none() {
+        bail!("--allow-remote needs {TOKEN_ENV} set to a secret of at least {TOKEN_MIN} characters; clients send it as Authorization: Bearer <token>");
+    }
+    Ok(token)
+}
+
+/// Whether `headers` carry `Authorization: Bearer <token>`, compared in constant time.
+fn authorized(headers: &http::HeaderMap, token: &str) -> bool {
+    let Some(got) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    got.len() == token.len() && got.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+fn unauthorized() -> Response<BoxBody<Bytes, Infallible>> {
+    let mut r = Response::new(Full::new(Bytes::from_static(b"Unauthorized")).boxed());
+    *r.status_mut() = StatusCode::UNAUTHORIZED;
+    r
+}
+
 /// `Host` headers accepted: loopback names, plus the bound address when remote.
 /// A wildcard bind accepts any host.
 fn allowed_hosts(addr: SocketAddr) -> Vec<String> {
@@ -197,7 +230,8 @@ fn not_found() -> Response<BoxBody<Bytes, Infallible>> {
 /// Serve MCP over streamable HTTP on `listener` until `shutdown` completes, then kill and
 /// record running jobs and seal every live session that has unsealed records. Seal failures
 /// go to stderr.
-pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
+pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<Output = ()>, token: Option<String>) -> anyhow::Result<()> {
+    let token: Option<Arc<str>> = token.map(Into::into);
     crate::home::ensure(&home)?;
     let key = Arc::new(crate::keys::load_or_create(&home)?);
     let sessions = Arc::new(Sessions::default());
@@ -215,11 +249,16 @@ pub async fn serve(home: PathBuf, listener: TcpListener, shutdown: impl Future<O
             },
             () = &mut shutdown => break Ok(()),
         };
-        let service = service.clone();
+        let (service, token) = (service.clone(), token.clone());
         tokio::spawn(async move {
             let handler = hyper::service::service_fn(move |req: Request<Incoming>| {
-                let service = service.clone();
+                let (service, token) = (service.clone(), token.clone());
                 async move {
+                    if let Some(t) = &token
+                        && !authorized(req.headers(), t)
+                    {
+                        return Ok::<_, Infallible>(unauthorized());
+                    }
                     if req.uri().path() != PATH {
                         return Ok::<_, Infallible>(not_found());
                     }
@@ -253,6 +292,25 @@ mod tests {
         assert!(check_listen(any, false).is_err());
         assert!(check_listen(lan, true).is_ok());
         assert_eq!(DEFAULT_LISTEN.parse::<SocketAddr>().unwrap(), lo);
+    }
+
+    /// Review finding: `--allow-remote` served `exec` to anyone who could reach the port.
+    #[test]
+    fn remote_serving_needs_a_token_and_requests_must_carry_it() {
+        let t = "x".repeat(TOKEN_MIN);
+        assert!(token_for(true, None).unwrap_err().to_string().contains(TOKEN_ENV));
+        assert!(token_for(true, Some(String::new())).is_err());
+        assert!(token_for(true, Some("short".into())).unwrap_err().to_string().contains("at least"));
+        assert_eq!(token_for(true, Some(t.clone())).unwrap().as_deref(), Some(t.as_str()));
+        assert_eq!(token_for(false, None).unwrap(), None);
+        let mut h = http::HeaderMap::new();
+        assert!(!authorized(&h, &t));
+        h.insert(http::header::AUTHORIZATION, format!("Bearer {t}").parse().unwrap());
+        assert!(authorized(&h, &t));
+        h.insert(http::header::AUTHORIZATION, format!("Bearer {t}y").parse().unwrap());
+        assert!(!authorized(&h, &t));
+        h.insert(http::header::AUTHORIZATION, t.parse().unwrap());
+        assert!(!authorized(&h, &t), "the Bearer scheme is required");
     }
 
     #[test]

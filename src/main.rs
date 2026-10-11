@@ -188,12 +188,14 @@ fn run_mcp() -> anyhow::Result<()> {
 fn run_serve(listen: String, remote: bool) -> anyhow::Result<()> {
     let addr: SocketAddr = listen.parse().map_err(|_| anyhow::anyhow!("--listen wants ip:port, got {listen:?}"))?;
     symbia::http::check_listen(addr, remote)?;
+    let token = symbia::http::token_for(remote, std::env::var(symbia::http::TOKEN_ENV).ok())?;
     let home = symbia::home::from_env()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let r = rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        eprintln!("symbia serve: http://{}{}", listener.local_addr()?, symbia::http::PATH);
-        symbia::http::serve(home, listener, shutdown_signal()).await
+        let auth = if token.is_some() { "; requests need the bearer token" } else { "" };
+        eprintln!("symbia serve: http://{}{}{auth}", listener.local_addr()?, symbia::http::PATH);
+        symbia::http::serve(home, listener, shutdown_signal(), token).await
     });
     rt.shutdown_timeout(DRAIN);
     r

@@ -106,4 +106,13 @@ fn serve_refuses_non_loopback_without_allow_remote() {
     assert!(text(&out).contains("--allow-remote"), "{}", text(&out));
     assert_eq!(run(t.path(), &["serve", "--listen"]).status.code(), Some(2));
     assert_eq!(run(t.path(), &["serve", "--listen", "nonsense"]).status.code(), Some(1));
+    // Since 0.2, --allow-remote also needs a bearer token in the environment.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_symbia"))
+        .args(["serve", "--listen", "0.0.0.0:0", "--allow-remote"])
+        .env("SYMBIA_HOME", t.path())
+        .env_remove("SYMBIA_HTTP_TOKEN")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SYMBIA_HTTP_TOKEN"), "{out:?}");
 }

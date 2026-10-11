@@ -378,7 +378,7 @@ impl SymbiaServer {
     fn slot(&self) -> Result<MutexGuard<'_, Option<Store>>, String> {
         let mut slot = self.lock()?;
         if let (None, Some(stdio)) = (slot.as_ref(), &self.stdio) {
-            let mut st = stdio.lock().map_err(|_| "state lock poisoned")?;
+            let mut st = stdio.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !st.opened {
                 let me = crate::session::Holder::this_process(st.started_ms);
                 let (mut store, opened) = crate::session::open(&self.home, self.policy.resume_window_ms(), me).map_err(err)?;
@@ -750,8 +750,11 @@ impl SymbiaServer {
         }
     }
 
+    /// The store lock. A panic while it was held poisons it; the store's open transaction was
+    /// rolled back when the panic unwound, so the store is taken back rather than every later
+    /// call (and the seal on exit) failing.
     fn lock(&self) -> Result<MutexGuard<'_, Option<Store>>, String> {
-        self.store.lock().map_err(|_| "state lock poisoned".to_string())
+        Ok(self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     fn model(&self) -> String {
@@ -855,10 +858,14 @@ impl SymbiaServer {
         }
     }
 
+    /// Run `f` on the open store. Writes can seal (a prediction, a checkpoint) and sealing reads
+    /// and hashes whole files, so this runs as blocking work, not on an async worker as is.
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
-        let mut slot = self.slot()?;
-        let store = slot.as_mut().ok_or(NO_SESSION)?;
-        f(store)
+        crate::blocking(|| {
+            let mut slot = self.slot()?;
+            let store = slot.as_mut().ok_or(NO_SESSION)?;
+            f(store)
+        })
     }
 
     /// Over streamable HTTP, tie this server to the request's `Mcp-Session-Id`, creating its
@@ -881,6 +888,8 @@ impl SymbiaServer {
             }
             None => {
                 let mut store = Store::create_for_mcp(&self.home, Some(id)).map_err(err)?;
+                let me = crate::session::Holder::this_process(store.started_ms());
+                crate::session::lock_http(&mut store, me).map_err(err)?;
                 store.set_witness(self.policy.witness().map(Path::to_path_buf));
                 sessions.insert(id, store.expires_ms().map_err(err)?.unwrap_or(i64::MAX));
                 sessions.track(&self.store);
@@ -906,7 +915,7 @@ impl SymbiaServer {
         self.with_store(|store| {
             let (seq, head) = store.head().map_err(err)?;
             let last = seal::last_seal(store.home(), store.session())
-                .map(|(_, s)| json!({"chain_seq": s.chain_seq, "file_sha256": &s.file_sha256[..PREFIX]}));
+                .map(|(_, s)| json!({"chain_seq": s.chain_seq, "file_sha256": crate::canon::short(&s.file_sha256, PREFIX)}));
             Ok(json!({
                 "build": crate::BUILD,
                 "session": store.session(),
@@ -2149,6 +2158,21 @@ mod tests {
         assert_eq!(v["seq"], 1);
         assert_eq!(v["head"].as_str().unwrap().len(), 12);
         assert_eq!(v.as_object().unwrap().len(), 4);
+    }
+
+    /// Review finding: one panic while the store lock was held poisoned it, and every later call
+    /// (and the seal on exit) failed for the rest of the session.
+    #[tokio::test]
+    async fn a_panic_under_the_store_lock_does_not_end_the_session() {
+        let (_t, s) = server();
+        s.symbia_record(Parameters(rec("a"))).await.unwrap();
+        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s.with_store(|_| -> Result<(), String> { panic!("boom") });
+        }));
+        assert!(hit.is_err() && s.store.is_poisoned());
+        let w: Value = serde_json::from_str(&s.symbia_record(Parameters(rec("b"))).await.unwrap()).unwrap();
+        assert_eq!(w["seq"], 2, "{w}");
+        assert!(s.seal_pending().unwrap().is_some_and(|x| x.verified));
     }
 
     #[tokio::test]
