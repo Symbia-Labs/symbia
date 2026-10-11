@@ -1549,7 +1549,7 @@ mod tests {
     }
 
     /// Review finding: a record kept off the chain, hidden behind a second chain row for an
-    /// existing record so the counts agree, verified before 0.1.2.
+    /// existing record so the counts agree, verified before 0.2.
     #[test]
     fn a_repeated_chain_row_cannot_hide_an_off_chain_record() {
         let t = tempfile::tempdir().unwrap();

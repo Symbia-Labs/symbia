@@ -61,8 +61,12 @@ pub const PROTECT_IN_HOME: [&str; 14] = [
     ".config/autostart",
 ];
 
-/// Folders exec may write besides the roots: temporary files and devices.
-pub const EXEC_WRITE_ALWAYS: [&str; 3] = ["/private/tmp", "/private/var/folders", "/dev"];
+/// Folders exec may write besides the roots: temporary files and devices. Off macOS there is
+/// no sandbox, so these only mark where a rule's program must not sit.
+#[cfg(target_os = "macos")]
+pub const EXEC_WRITE_ALWAYS: &[&str] = &["/private/tmp", "/private/var/folders", "/dev"];
+#[cfg(not(target_os = "macos"))]
+pub const EXEC_WRITE_ALWAYS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/dev"];
 
 /// Inside any repository, git runs `.git/hooks/*` and reads commands from `.git/config`
 /// (`core.hooksPath`, aliases, filters, `core.sshCommand`). Neither may be written.
@@ -698,6 +702,8 @@ mod tests {
             assert!(w.contains(&PathBuf::from(always)), "{always}");
         }
         assert!(p.exec_writable(&std::fs::canonicalize(user.join("work")).unwrap().join("bin/tool")));
+        // The platform's temp folder, where tests and scripts put programs, counts on every OS.
+        assert!(p.exec_writable(&std::fs::canonicalize(std::env::temp_dir()).unwrap().join("bin/tool")));
         for not in ["/opt/homebrew/bin/gh", "/usr/bin/git", "/Users/Shared/x"] {
             assert!(!p.exec_writable(Path::new(not)), "{not}");
         }
