@@ -325,6 +325,38 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+fn elapsed_ms(t: Instant) -> i64 {
+    i64::try_from(t.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Background embedding: the pause between batches while documents wait, and when none do.
+const EMBED_BUSY: Duration = Duration::from_secs(1);
+const EMBED_IDLE: Duration = Duration::from_secs(60);
+
+/// Embed one batch of the index's documents that have no vector from `e`, tool calls left out
+/// (as `find` leaves them out). Returns how many still wait.
+async fn embed_backlog(home: PathBuf, e: Arc<Embedder>) -> Result<i64, String> {
+    let model = e.model_name();
+    let filter = crate::index::Filter { not_kind: Some("tool_call".into()), ..Default::default() };
+    let (h, m) = (home.clone(), model.clone());
+    let (todo, total) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<(i64, String)>, i64)> {
+        let mut ix = Index::open(&h)?;
+        ix.refresh(crate::index::REFRESH_BUDGET)?;
+        ix.unembedded(&m, &filter, crate::embed::PER_CALL)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    let (docs, texts): (Vec<i64>, Vec<String>) = todo.into_iter().unzip();
+    let vectors = e.embed_documents(&texts).await?;
+    let done = i64::try_from(docs.len()).map_err(err)?;
+    tokio::task::spawn_blocking(move || Index::open(&home)?.store_vectors(&model, &docs, &vectors)).await.map_err(err)?.map_err(err)?;
+    Ok(total - done)
+}
+
 impl SymbiaServer {
     /// A stdio server under `home`, creating the layout and device key as needed and removing
     /// empty session files nobody holds. The session is opened (resumed or new) on the first
@@ -418,6 +450,30 @@ impl SymbiaServer {
         self.with_store(|s| Ok(s.session().to_string()))
     }
 
+    /// After the first vector search, keep embedding new documents in the background so later
+    /// searches do not wait on them. Once per process.
+    fn start_background_embedding(&self) {
+        static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(e) = self.embedder.clone() else { return };
+        if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let home = self.home.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = match embed_backlog(home.clone(), e.clone()).await {
+                    Ok(0) => EMBED_IDLE,
+                    Ok(_) => EMBED_BUSY,
+                    Err(msg) => {
+                        eprintln!("symbia: background embedding: {msg}");
+                        EMBED_IDLE
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        });
+    }
+
     /// Open the index and bring it up to date; true when the refresh ran out of time.
     async fn index(&self) -> Result<(Index, bool), String> {
         let home = self.home.clone();
@@ -452,17 +508,25 @@ impl SymbiaServer {
                 retrieval[k] = v.as_str().into();
             }
         }
+        // Tool calls outnumber everything else; they are found only when asked for by kind.
+        let not_kind = args.kind.is_none().then(|| "tool_call".to_string());
+        if let Some(k) = &not_kind {
+            retrieval["excluded_kind"] = k.as_str().into();
+        }
         facts.retrieval = Some(retrieval.clone());
         if !all && args.similar.is_none() {
+            let t = Instant::now();
             let q = FindQuery {
                 query: args.query.clone(),
                 kind: args.kind.clone(),
+                not_kind: not_kind.clone(),
                 lane: args.lane.clone(),
                 key_prefix: args.key_prefix.clone(),
                 limit: args.limit,
                 thread: args.in_thread.clone(),
             };
             let hits = self.with_store(|store| store.find(&q).map_err(err))?;
+            retrieval["search_ms"] = elapsed_ms(t).into();
             retrieval["hits"] = hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>().into();
             facts.retrieval = Some(retrieval);
             return serde_json::to_string(&hits).map_err(err);
@@ -475,20 +539,27 @@ impl SymbiaServer {
         let filter = crate::index::Filter {
             session: if all { None } else { Some(self.session_id()?) },
             kind: args.kind.clone(),
+            not_kind,
             lane: args.lane.clone(),
             key_prefix: args.key_prefix.clone(),
             thread: args.in_thread.clone(),
             ..Default::default()
         };
+        // Where the time goes: catching the index up, embedding, and the search itself.
+        let t = Instant::now();
         let (mut ix, behind) = self.index().await?;
+        retrieval["index_ms"] = elapsed_ms(t).into();
+        let t = Instant::now();
         let text = match &args.query {
             Some(q) => ix.search_text(q, &filter, limit).map_err(err)?,
             None => Vec::new(),
         };
+        let mut search_ms = elapsed_ms(t);
         let mut unembedded = 0;
         let vector = match (&args.similar, embedder) {
             (Some(similar), Some(e)) => {
                 let model = e.model_name();
+                let t = Instant::now();
                 let (todo, total) = ix.unembedded(&model, &filter, crate::embed::PER_CALL).map_err(err)?;
                 if !todo.is_empty() {
                     let (docs, texts): (Vec<i64>, Vec<String>) = todo.into_iter().unzip();
@@ -497,16 +568,23 @@ impl SymbiaServer {
                     unembedded = total - i64::try_from(docs.len()).map_err(err)?;
                 }
                 let q = e.embed_query(similar).await?;
-                ix.search_vector(&q, &model, &filter, limit).map_err(err)?
+                retrieval["embed_ms"] = elapsed_ms(t).into();
+                self.start_background_embedding();
+                let t = Instant::now();
+                let hits = ix.search_vector(&q, &model, &filter, limit).map_err(err)?;
+                search_ms += elapsed_ms(t);
+                hits
             }
             _ => Vec::new(),
         };
+        let t = Instant::now();
         let hits = match (args.query.is_some(), args.similar.is_some()) {
             (true, true) => crate::index::fuse(&text, &vector, limit as usize),
             (false, true) => vector,
             (true, false) => text,
             (false, false) => ix.recent(&filter, limit).map_err(err)?,
         };
+        retrieval["search_ms"] = (search_ms + elapsed_ms(t)).into();
         let mut out: Vec<serde_json::Value> = hits.iter().map(|h| serde_json::to_value(h).unwrap_or_default()).collect();
         if !all {
             for h in &mut out {
@@ -946,7 +1024,7 @@ impl SymbiaServer {
         name = "record",
         title = "Write a record",
         annotations(title = "Write a record", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
-        description = "Write a record to the ledger. links is a list of {\"to_id\": \"<record id>\", \"rel\": \"<rel>\"}, rel one of results_of, revises, supersedes, cites; the target may be in an earlier session. A prediction is sealed at once. Returns {id, version, seq, head}."
+        description = "Write a record to the ledger. links is a list of {\"to_id\": \"<record id>\", \"rel\": \"<rel>\"}, rel one of results_of, revises, supersedes, cites; the target may be in an earlier session. A prediction is sealed at once. To score a prediction, write a result linked results_of to it whose body has \"held\": true|false, or \"verdicts\": {\"<name>\": \"held ...\"|\"broke ...\"}; report counts only those. Returns {id, version, seq, head}."
     )]
     pub async fn symbia_record(&self, Parameters(args): Parameters<RecordInput>) -> Result<String, String> {
         let started = Instant::now();
@@ -961,7 +1039,7 @@ impl SymbiaServer {
         name = "find",
         title = "Find records",
         annotations(title = "Find records", read_only_hint = true, open_world_hint = false),
-        description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]. scope all searches every session and full seal, and each hit adds session and score. similar searches by meaning (needs embed in config.json); with query too, the rankings are fused. When the index is still catching up or vectors are pending, the reply is {hits, index_behind, unembedded}. Every find is recorded with its hit ids."
+        description = "Find records by full-text query, kind, lane, key prefix or thread (in_thread). Returns [{id, key, version, kind, lane, thread}]. scope all searches every session and full seal, and each hit adds session and score. similar searches by meaning (needs embed in config.json); with query too, the rankings are fused. Text matches key, body and lane_reason. tool_call records are left out unless kind is tool_call. When the index is still catching up or vectors are pending, the reply is {hits, index_behind, unembedded}. Every find is recorded with its hit ids and timings."
     )]
     pub async fn symbia_find(&self, Parameters(args): Parameters<FindArgs>) -> Result<String, String> {
         const TOOL: &str = "find";
@@ -1021,7 +1099,7 @@ impl SymbiaServer {
         name = "get",
         title = "Get a record",
         annotations(title = "Get a record", read_only_hint = true, open_world_hint = false),
-        description = "Get one full record with its links, by id or by key and optional version."
+        description = "Get one full record with its links, by id or by key and optional version. Keys are looked up in the open session; an id is looked up there, then in every other session file and full seal under the data folder (the reply then adds file)."
     )]
     pub async fn symbia_get(&self, Parameters(args): Parameters<GetArgs>) -> Result<String, String> {
         self.with_store(|store| {
@@ -1030,7 +1108,14 @@ impl SymbiaServer {
                 (None, Some(key)) => store.id_for_key(&key, args.version).map_err(err)?.ok_or("no such record")?,
                 _ => return Err("give either id, or key with an optional version".into()),
             };
-            let rec = store.get(&id).map_err(err)?.ok_or("no such record")?;
+            if let Some(rec) = store.get(&id).map_err(err)? {
+                return Ok(rec.to_string());
+            }
+            // Ids from find with scope all name records in other files.
+            let (path, _) = crate::store::locate_elsewhere(store.home(), store.path(), &id).ok_or("no such record")?;
+            let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+            let mut rec = crate::store::get_in(&conn, &id).map_err(err)?.ok_or("no such record")?;
+            rec["file"] = path.display().to_string().into();
             Ok(rec.to_string())
         })
     }
@@ -1866,7 +1951,11 @@ mod tests {
         // Every find is recorded with what it asked and the ids it returned, refusals included.
         let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|r| r["body"]["tool"] == "find").collect();
         assert_eq!(calls.len(), 5);
-        assert_eq!(calls[0]["body"]["retrieval"], json!({"scope": "session", "query": "condensate", "hits": []}));
+        let mut first = calls[0]["body"]["retrieval"].clone();
+        assert!(first.as_object_mut().unwrap().remove("search_ms").unwrap().is_i64());
+        assert_eq!(first, json!({"scope": "session", "query": "condensate", "excluded_kind": "tool_call", "hits": []}));
+        // Index scope says where the time went.
+        assert!(calls[1]["body"]["retrieval"]["index_ms"].is_i64() && calls[1]["body"]["retrieval"]["search_ms"].is_i64());
         assert_eq!(calls[1]["body"]["retrieval"]["hits"][0], all[0]["id"]);
         assert_eq!(calls[4]["body"]["error"], crate::embed::NOT_CONFIGURED);
         assert_eq!(calls[4]["body"]["retrieval"]["similar"], "leaky trap");
@@ -1892,6 +1981,85 @@ mod tests {
         // Fused with a query: both lists agree on h.note.
         let r: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { similar: Some("hhh".into()), query: Some("note".into()), ..Default::default() })).await.unwrap()).unwrap();
         assert_eq!(r[0]["key"], "h.note", "{r}");
+        let calls: Vec<Value> = tool_calls(&s).into_iter().filter(|r| r["body"]["tool"] == "find").collect();
+        assert!(calls[0]["body"]["retrieval"]["embed_ms"].is_i64(), "{}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn background_embedding_drains_the_backlog_and_skips_tool_calls() {
+        let (port, _) = crate::embed::fake::serve().await;
+        let t = tempfile::tempdir().unwrap();
+        let c = crate::policy::Config {
+            embed: Some(serde_json::from_value(json!({"url": format!("http://127.0.0.1:{port}/v1/embeddings"), "model": "fake-8"})).unwrap()),
+            ..Default::default()
+        };
+        let s = SymbiaServer::new(t.path()).unwrap().with_policy(Policy::with_config(&[t.path().to_path_buf()], t.path(), t.path(), &c).unwrap());
+        let n = usize::try_from(crate::embed::PER_CALL).unwrap() + 3;
+        for i in 0..n {
+            s.symbia_record(Parameters(RecordInput { body: json!({"text": "abc"}), ..rec(&format!("n{i}")) })).await.unwrap();
+        }
+        s.symbia_status().await.unwrap();
+        let e = s.embedder.clone().unwrap();
+        assert_eq!(embed_backlog(t.path().to_path_buf(), e.clone()).await.unwrap(), 3);
+        assert_eq!(embed_backlog(t.path().to_path_buf(), e.clone()).await.unwrap(), 0);
+        let ix = Index::open(t.path()).unwrap();
+        let (vectors, tool_calls_embedded): (i64, i64) = ix
+            .conn()
+            .query_row("SELECT COUNT(*), COALESCE(SUM(d.kind = 'tool_call'), 0) FROM vectors v JOIN docs d ON d.id = v.doc", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((vectors, tool_calls_embedded), (i64::try_from(n).unwrap(), 0));
+    }
+
+    #[tokio::test]
+    async fn find_leaves_out_tool_calls_and_matches_lane_reasons() {
+        let (_t, s) = server();
+        s.symbia_record(Parameters(RecordInput { lane_reason: "measured on the bench rig".into(), ..rec("a") })).await.unwrap();
+        s.symbia_status().await.unwrap();
+        let find = |a: FindArgs| s.symbia_find(Parameters(a));
+        let kinds = |v: &Value| v.as_array().unwrap().iter().map(|h| h["kind"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        for scope in [None, Some("all".to_string())] {
+            let r: Value = serde_json::from_str(&find(FindArgs { scope: scope.clone(), ..Default::default() }).await.unwrap()).unwrap();
+            assert_eq!(kinds(&r), ["claim"], "{scope:?} {r}");
+            let r: Value = serde_json::from_str(&find(FindArgs { scope: scope.clone(), kind: Some("tool_call".into()), ..Default::default() }).await.unwrap()).unwrap();
+            assert!(!kinds(&r).is_empty() && kinds(&r).iter().all(|k| k == "tool_call"), "{scope:?} {r}");
+            let r: Value = serde_json::from_str(&find(FindArgs { scope: scope.clone(), query: Some("bench rig".into()), ..Default::default() }).await.unwrap()).unwrap();
+            assert_eq!(r[0]["key"], "a", "{scope:?} {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_reads_a_record_from_another_session() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("config.json"), r#"{"resume_window_ms": 0}"#).unwrap();
+        let earlier = {
+            let mut a = Store::create(t.path()).unwrap();
+            a.write(&rec("old.note"), Instant::now()).unwrap().id
+        };
+        let s = SymbiaServer::new(t.path()).unwrap();
+        s.symbia_record(Parameters(rec("new.note"))).await.unwrap();
+        let r: Value = serde_json::from_str(&s.symbia_get(Parameters(GetArgs { id: Some(earlier.clone()), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!((r["key"].as_str(), r["id"].as_str()), (Some("old.note"), Some(earlier.as_str())));
+        assert!(r["file"].as_str().unwrap().contains("sessions"), "{r}");
+        // Keys stay in the open session.
+        let e = s.symbia_get(Parameters(GetArgs { key: Some("old.note".into()), ..Default::default() })).await.unwrap_err();
+        assert_eq!(e, "no such record");
+        let e = s.symbia_get(Parameters(GetArgs { id: Some("nope".into()), ..Default::default() })).await.unwrap_err();
+        assert_eq!(e, "no such record");
+    }
+
+    #[tokio::test]
+    async fn report_scores_only_results_of_a_prediction() {
+        let (_t, s) = server();
+        let p: Value = serde_json::from_str(&s.symbia_record(Parameters(RecordInput { kind: "prediction".into(), ..rec("p") })).await.unwrap()).unwrap();
+        let o: Value = serde_json::from_str(&s.symbia_record(Parameters(rec("o"))).await.unwrap()).unwrap();
+        let link = |id: &Value| Some(vec![crate::record::LinkInput { to_id: id["id"].as_str().unwrap().into(), rel: "results_of".into() }]);
+        // Scored: answers the prediction.
+        s.symbia_record(Parameters(RecordInput { kind: "result".into(), body: json!({"held": true}), links: link(&p), ..rec("r1") })).await.unwrap();
+        // Not scored: a result of a claim, and a result with no link, both saying held.
+        s.symbia_record(Parameters(RecordInput { kind: "result".into(), body: json!({"held": true}), links: link(&o), ..rec("r2") })).await.unwrap();
+        s.symbia_record(Parameters(RecordInput { kind: "result".into(), body: json!({"verdicts": {"x": "broke"}}), ..rec("r3") })).await.unwrap();
+        let r: Value = serde_json::from_str(&s.symbia_report(Parameters(ReportArgs::default())).await.unwrap()).unwrap();
+        assert_eq!(r["predictions"], json!({"records": 1, "with_results": 1, "open": 0, "held": 1, "broke": 0}), "{r}");
     }
 
     #[tokio::test]
@@ -2223,9 +2391,12 @@ mod tests {
     async fn find_rejects_limit_over_50() {
         let (_t, s) = server();
         assert!(s.symbia_find(Parameters(FindArgs { limit: Some(51), ..Default::default() })).await.is_err());
-        // The refused find is itself recorded, so it is the one record found.
-        let hits: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { limit: Some(50), ..Default::default() })).await.unwrap()).unwrap();
+        // The refused find is itself recorded, so it is the one tool call found; without a kind
+        // tool calls are left out.
+        let hits: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { limit: Some(50), kind: Some("tool_call".into()), ..Default::default() })).await.unwrap()).unwrap();
         assert_eq!((hits.as_array().unwrap().len(), hits[0]["key"].as_str()), (1, Some("tool.find")));
+        let hits: Value = serde_json::from_str(&s.symbia_find(Parameters(FindArgs { limit: Some(50), ..Default::default() })).await.unwrap()).unwrap();
+        assert_eq!(hits, json!([]));
     }
 
     #[tokio::test]

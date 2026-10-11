@@ -106,6 +106,8 @@ pub struct Evidence {
 pub struct FindQuery {
     pub query: Option<String>,
     pub kind: Option<String>,
+    /// Leave out records of this kind.
+    pub not_kind: Option<String>,
     pub lane: Option<String>,
     pub key_prefix: Option<String>,
     pub limit: Option<u32>,
@@ -154,6 +156,11 @@ pub fn chain_head(conn: &Connection) -> anyhow::Result<(i64, [u8; 32])> {
 /// The session holding record `id` in another session file or seal under `home`, newest file
 /// first; `own` (the current session file) is skipped. Files that cannot be read are skipped.
 pub fn find_elsewhere(home: &Path, own: &Path, id: &str) -> Option<String> {
+    locate_elsewhere(home, own, id).map(|(_, session)| session)
+}
+
+/// The file and session holding record `id` outside `own`, as [`find_elsewhere`] searches.
+pub fn locate_elsewhere(home: &Path, own: &Path, id: &str) -> Option<(PathBuf, String)> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for dir in ["sessions", "seals"] {
         let Ok(entries) = std::fs::read_dir(home.join(dir)) else { continue };
@@ -168,7 +175,8 @@ pub fn find_elsewhere(home: &Path, own: &Path, id: &str) -> Option<String> {
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().find_map(|(_, p)| {
         let conn = Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
-        conn.query_row("SELECT session FROM records WHERE id = ?1", [id], |r| r.get(0)).optional().ok()?
+        let session: String = conn.query_row("SELECT session FROM records WHERE id = ?1", [id], |r| r.get(0)).optional().ok()??;
+        Some((p, session))
     })
 }
 
@@ -405,7 +413,9 @@ impl Store {
         for (to_id, rel, to_session) in &links {
             tx.execute("INSERT INTO links (from_id, to_id, rel, to_session) VALUES (?1, ?2, ?3, ?4)", params![id, to_id, rel, to_session])?;
         }
-        tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, body_text])?;
+        // The lane reason is searchable with the body; the index is not part of any digest.
+        let fts_text = format!("{body_text} {}", input.lane_reason);
+        tx.execute("INSERT INTO records_fts (id, key, body) VALUES (?1, ?2, ?3)", params![id, input.key, fts_text])?;
         for e in evidence {
             tx.execute(
                 "INSERT OR IGNORE INTO evidence (sha256, bytes, media) VALUES (?1, ?2, ?3)",
@@ -442,6 +452,10 @@ impl Store {
         }
         if let Some(k) = &q.kind {
             sql.push_str(" AND r.kind = ?");
+            args.push(Box::new(k.clone()));
+        }
+        if let Some(k) = &q.not_kind {
+            sql.push_str(" AND r.kind <> ?");
             args.push(Box::new(k.clone()));
         }
         if let Some(l) = &q.lane {
