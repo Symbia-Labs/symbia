@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.2)
+## 0.2.20261011174853
 
 A security release. Versions now read `X.Y.YYYYMMDDHHMMSS`: the third number is the release commit's time in UTC. The second number goes up for a file format change or a breaking change, and this release has both.
 
