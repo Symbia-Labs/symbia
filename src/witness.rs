@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::record::GENESIS;
@@ -90,14 +90,13 @@ impl Check {
     }
 }
 
-/// Check the sealed file at `path` (already verified) against `entries`. `Err` is a mismatch:
-/// the file's chain hash at some witnessed seq differs from what the witness recorded.
-pub fn check(path: &Path, session: &str, file_seq: i64, entries: &[Entry]) -> Result<Check, String> {
+/// Check a verified sealed copy, open as `conn`, against `entries`. `Err` is a mismatch: the
+/// file's chain hash at some witnessed seq differs from what the witness recorded.
+pub fn check(conn: &Connection, session: &str, file_seq: i64, entries: &[Entry]) -> Result<Check, String> {
     let mine: Vec<&Entry> = entries.iter().filter(|e| e.session == session).collect();
     if mine.is_empty() {
         return Ok(Check::NotWitnessed);
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e| e.to_string())?;
     let mut seen = 0usize;
     let mut max_seq = i64::MIN;
     for e in &mine {

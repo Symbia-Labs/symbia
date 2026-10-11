@@ -19,10 +19,27 @@ pub fn hex_prefix(bytes: &[u8], n: usize) -> String {
     s
 }
 
+/// At most the first `n` characters of `s`. Safe on short or non-ASCII text, unlike `&s[..n]`,
+/// so a malformed id or key read from a file can't panic the caller.
+pub fn short(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn short_never_panics() {
+        assert_eq!(short("abcdef", 3), "abc");
+        assert_eq!(short("ab", 12), "ab");
+        assert_eq!(short("", 12), "");
+        assert_eq!(short("éé€x", 2), "éé");
+    }
 
     #[test]
     fn canonical_sorts_keys_and_strips_whitespace() {

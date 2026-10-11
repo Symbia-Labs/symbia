@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use rmcp::ServiceExt;
+use symbia::canon::short;
 
 const USAGE: &str = "usage: symbia mcp
        symbia serve [--listen 127.0.0.1:7341] [--allow-remote]
@@ -223,33 +224,29 @@ fn trusted_keys(extra: &[&str]) -> Result<Vec<String>, ExitCode> {
 /// `ok <session> seq N head <12 hex>`, plus the thread and its counts for a thread seal.
 fn ok_line(v: &symbia::seal::Verified) -> String {
     match &v.thread {
-        Some(t) => format!("ok {} seq {} head {} thread {t}: {} records, {} withheld", v.session, v.chain_seq, &v.chain_head[..12], v.records, v.withheld),
-        None => format!("ok {} seq {} head {}", v.session, v.chain_seq, &v.chain_head[..12]),
+        Some(t) => format!("ok {} seq {} head {} thread {t}: {} records, {} withheld", v.session, v.chain_seq, short(&v.chain_head, 12), v.records, v.withheld),
+        None => format!("ok {} seq {} head {}", v.session, v.chain_seq, short(&v.chain_head, 12)),
     }
 }
 
-/// Verify `path` as `verify` does, then open it. `Err` is the exit code after the reason.
-fn verified(path: &Path, extra: &[&str]) -> Result<(symbia::seal::Verified, rusqlite::Connection), ExitCode> {
+/// Verify `path` as `verify` does and keep the bytes that were checked, so what is printed is
+/// what was verified. `Err` is the exit code after the reason.
+fn verified(path: &Path, extra: &[&str]) -> Result<(symbia::seal::Verified, symbia::seal::Snapshot), ExitCode> {
     let trusted = trusted_keys(extra)?;
-    let v = symbia::seal::verify_trusted(path, &trusted).map_err(|reason| {
+    symbia::seal::open_trusted(path, &trusted).map_err(|reason| {
         eprintln!("{reason}");
         ExitCode::FAILURE
-    })?;
-    let conn = symbia::read::open(path).map_err(|e| {
-        eprintln!("cannot open {}: {e:#}", path.display());
-        ExitCode::FAILURE
-    })?;
-    Ok((v, conn))
+    })
 }
 
 /// Verify a seal, then print the verify line, its chain, its predictions with their verdicts
 /// and the commands it ran. A seal that fails is not read: exit 1 with the reason.
 fn run_show(path: &Path, extra: &[&str]) -> ExitCode {
-    let (v, conn) = match verified(path, extra) {
+    let (v, snap) = match verified(path, extra) {
         Ok(x) => x,
         Err(code) => return code,
     };
-    match symbia::read::show(&conn) {
+    match symbia::read::show(snap.conn()) {
         Ok(text) => {
             println!("{}\n\n{text}", ok_line(&v));
             ExitCode::SUCCESS
@@ -263,11 +260,11 @@ fn run_show(path: &Path, extra: &[&str]) -> ExitCode {
 
 /// Verify a seal, then print one record in full as JSON: by id, or the newest version of a key.
 fn run_get(path: &Path, key_or_id: &str, extra: &[&str]) -> ExitCode {
-    let (_, conn) = match verified(path, extra) {
+    let (_, snap) = match verified(path, extra) {
         Ok(x) => x,
         Err(code) => return code,
     };
-    match symbia::read::record(&conn, key_or_id) {
+    match symbia::read::record(snap.conn(), key_or_id) {
         Ok(Some(r)) => {
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
             ExitCode::SUCCESS
@@ -290,11 +287,11 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
         Ok(t) => t,
         Err(code) => return code,
     };
-    match symbia::seal::verify_trusted(path, &trusted) {
-        Ok(v) => {
+    match symbia::seal::open_trusted(path, &trusted) {
+        Ok((v, snap)) => {
             println!("{}", ok_line(&v));
             for x in &v.external {
-                println!("external {} {} {} session {}", &x.from_id[..12], x.rel, &x.to_id[..x.to_id.len().min(12)], x.session);
+                println!("external {} {} {} session {}", short(&x.from_id, 12), x.rel, short(&x.to_id, 12), x.session);
             }
             if let Some(w) = witness {
                 let entries = match symbia::witness::read(&symbia::witness::file_of(w)) {
@@ -304,7 +301,7 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                match symbia::witness::check(path, &v.session, v.chain_seq, &entries) {
+                match symbia::witness::check(snap.conn(), &v.session, v.chain_seq, &entries) {
                     Ok(c) => println!("witness {}", c.describe()),
                     Err(reason) => {
                         eprintln!("{reason}");
@@ -347,7 +344,7 @@ fn trust_add(key: &str, label: &str) -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let (t, added) = symbia::trust::add(&home, key, label)?;
     let state = if added { "added" } else { "already trusted" };
-    println!("{state} {} {}", &t.public_key[..12], t.label);
+    println!("{state} {} {}", short(&t.public_key, 12), t.label);
     Ok(())
 }
 

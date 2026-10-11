@@ -173,7 +173,7 @@ pub fn seal_for(store: &Store, key: &SigningKey, reason: Reason) -> anyhow::Resu
     let verified = verify(&path).is_ok();
     witness(store, &sidecar);
     if verified {
-        prune_superseded(store.home(), store.session(), seq);
+        prune_superseded(store.home(), store.session(), seq, &path);
     }
     Ok(Sealed { path, sidecar, verified })
 }
@@ -282,11 +282,14 @@ fn witness_within(dir: &Path, sidecar: &Sidecar, wait: std::time::Duration) -> b
     }
 }
 
-/// Remove full seals of `session` older than `seq` whose reason is checkpoint or exit. Explicit,
-/// prediction, thread and reason-less seals stay. Returns the files removed.
-pub fn prune_superseded(home: &Path, session: &str, seq: i64) -> Vec<PathBuf> {
+/// Remove full seals of `session` older than `seq` whose reason is checkpoint or exit, where the
+/// newer seal at `newer` (already verified) holds each one's head at its seq. A seal the newer
+/// chain contradicts is kept, so a rewritten session can't prune away the evidence against it.
+/// Explicit, prediction, thread and reason-less seals stay. Returns the files removed.
+pub fn prune_superseded(home: &Path, session: &str, seq: i64, newer: &Path) -> Vec<PathBuf> {
     let prefix = format!("{session}-");
     let Ok(entries) = std::fs::read_dir(home.join("seals")) else { return Vec::new() };
+    let Ok(conn) = Connection::open_with_flags(newer, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) else { return Vec::new() };
     let mut removed = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
@@ -295,13 +298,24 @@ pub fn prune_superseded(home: &Path, session: &str, seq: i64) -> Vec<PathBuf> {
         if n >= seq {
             continue;
         }
-        let prunable = read_sidecar(&path).ok().and_then(|s| s.reason).is_some_and(|r| PRUNABLE.contains(&r.as_str()));
-        if prunable && std::fs::remove_file(&path).is_ok() {
+        let Ok(sc) = read_sidecar(&path) else { continue };
+        let prunable = sc.reason.as_deref().is_some_and(|r| PRUNABLE.contains(&r));
+        if prunable && chain_holds(&conn, sc.chain_seq, &sc.chain_head) && std::fs::remove_file(&path).is_ok() {
             let _ = std::fs::remove_file(sidecar_path(&path));
             removed.push(path);
         }
     }
     removed
+}
+
+/// Whether the chain in `conn` has `head` (lowercase hex) at `seq`; seq 0 is the genesis.
+fn chain_holds(conn: &Connection, seq: i64, head: &str) -> bool {
+    let at: Option<Vec<u8>> = if seq == 0 {
+        Some(GENESIS.to_vec())
+    } else {
+        conn.query_row("SELECT hash FROM chain WHERE seq = ?1", [seq], |r| r.get(0)).optional().ok().flatten()
+    };
+    at.is_some_and(|h| hex::encode(h) == head.to_ascii_lowercase())
 }
 
 /// The format 2 row digest of record `rid`, read from `conn`, with `at_ms` from its chain row.
@@ -483,21 +497,71 @@ fn file_format(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0))
 }
 
+/// A sealed copy and its sidecar, each read from disk exactly once. Verification and every
+/// later read use these bytes, so the file can't be swapped between the check and the use.
+pub struct Snapshot {
+    pub sidecar: Sidecar,
+    /// The sidecar exactly as read.
+    pub sidecar_text: String,
+    /// The sealed file exactly as read and hashed.
+    pub bytes: Vec<u8>,
+    conn: Connection,
+}
+
+impl Snapshot {
+    /// Read `path` and its sidecar once and open the bytes as a read-only in-memory database.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let p = sidecar_path(path);
+        let sidecar_text = std::fs::read_to_string(&p).map_err(|e| format!("sidecar unreadable: read {}: {e}", p.display()))?;
+        let sidecar: Sidecar = serde_json::from_str(&sidecar_text).map_err(|e| format!("sidecar unreadable: {e}"))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read sealed file: {e}"))?;
+        let db = |e: rusqlite::Error| format!("sealed file unreadable: {e}");
+        let mut conn = Connection::open_in_memory().map_err(db)?;
+        conn.deserialize_read_exact(rusqlite::MAIN_DB, bytes.as_slice(), bytes.len(), true).map_err(db)?;
+        Ok(Self { sidecar, sidecar_text, bytes, conn })
+    }
+
+    /// The verified bytes as a read-only database.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Refuse a sidecar key that is not in `trusted` (lowercase hex).
+    pub fn check_key(&self, trusted: &[String]) -> Result<(), String> {
+        let pk = self.sidecar.public_key.to_ascii_lowercase();
+        if trusted.contains(&pk) {
+            return Ok(());
+        }
+        Err(format!("untrusted key {}", crate::canon::short(&pk, 12)))
+    }
+
+    /// Verify the snapshot against its own sidecar.
+    pub fn verify(&self) -> Result<Verified, String> {
+        verify_loaded(self)
+    }
+}
+
+/// Load `path` once, accept only a sidecar key in `trusted`, and verify. The snapshot is what
+/// the caller reads afterwards.
+pub fn open_trusted(path: &Path, trusted: &[String]) -> Result<(Verified, Snapshot), String> {
+    let snap = Snapshot::load(path)?;
+    snap.check_key(trusted)?;
+    let v = snap.verify()?;
+    Ok((v, snap))
+}
+
 /// Verify a sealed copy, accepting only a sidecar key in `trusted` (lowercase hex).
 pub fn verify_trusted(path: &Path, trusted: &[String]) -> Result<Verified, String> {
-    let sc = read_sidecar(path).map_err(|e| format!("sidecar unreadable: {e}"))?;
-    let pk = sc.public_key.to_ascii_lowercase();
-    if !trusted.contains(&pk) {
-        let mut short = pk;
-        short.truncate(12);
-        return Err(format!("untrusted key {short}"));
-    }
-    verify(path)
+    open_trusted(path, trusted).map(|(v, _)| v)
 }
 
 /// Verify a sealed copy against its sidecar, whatever key signed it. `Err` carries a one-line reason.
 pub fn verify(path: &Path) -> Result<Verified, String> {
-    let sc = read_sidecar(path).map_err(|e| format!("sidecar unreadable: {e}"))?;
+    Snapshot::load(path)?.verify()
+}
+
+fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
+    let sc = &snap.sidecar;
     let want_sha = hex32(&sc.file_sha256, "file_sha256")?;
     let want_head = hex32(&sc.chain_head, "chain_head")?;
     let pk = hex32(&sc.public_key, "public_key")?;
@@ -506,8 +570,7 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         .and_then(|b| <[u8; 64]>::try_from(b).ok())
         .ok_or("sidecar signature is malformed")?;
 
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read sealed file: {e}"))?;
-    if sha256(&bytes) != want_sha {
+    if sha256(&snap.bytes) != want_sha {
         return Err("file sha256 mismatch".into());
     }
     let vk = VerifyingKey::from_bytes(&pk).map_err(|_| "sidecar public_key is not a valid ed25519 key")?;
@@ -515,13 +578,13 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         .map_err(|_| "signature invalid")?;
 
     let db = |e: rusqlite::Error| format!("sealed file unreadable: {e}");
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(db)?;
+    let conn = snap.conn();
     let retention: String = conn.query_row("SELECT retention FROM file_meta", [], |r| r.get(0)).map_err(db)?;
     if retention != "seal" {
         return Err(format!("retention is {retention:?}, not \"seal\""));
     }
 
-    let format = file_format(&conn).map_err(db)?;
+    let format = file_format(conn).map_err(db)?;
     if !(1..=FORMAT).contains(&format) {
         return Err(format!("unknown file format {format}"));
     }
@@ -720,6 +783,14 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
         prev = computed;
         seq_expected += 1;
     }
+    // Each record sits on the chain once: a repeated record id could stand in for a record kept
+    // off the chain and make the counts below agree.
+    let repeated: i64 = conn
+        .query_row("SELECT COUNT(record_id) - COUNT(DISTINCT record_id) FROM chain WHERE record_id IS NOT NULL", [], |r| r.get(0))
+        .map_err(db)?;
+    if repeated != 0 {
+        return Err(format!("{repeated} chain row(s) repeat a record"));
+    }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).map_err(db)?;
     if total != on_chain {
         return Err(format!("{} record(s) not on the chain", total - on_chain));
@@ -737,7 +808,7 @@ pub fn verify(path: &Path) -> Result<Verified, String> {
     if prev != want_head {
         return Err("chain head mismatch".into());
     }
-    Ok(Verified { session: sc.session, chain_seq: last_seq, chain_head: sc.chain_head, external, thread: scope, records: on_chain, withheld })
+    Ok(Verified { session: sc.session.clone(), chain_seq: last_seq, chain_head: sc.chain_head.clone(), external, thread: scope, records: on_chain, withheld })
 }
 
 /// One chain row as read for verification; the last three columns are format 3 only.
@@ -1277,11 +1348,12 @@ mod tests {
         assert_eq!((entries[1].thread.as_deref(), entries[2].reason.as_deref()), (Some("chat"), Some("checkpoint")));
         use crate::witness::{Check, check};
         let sid = s.session().to_string();
-        assert_eq!(check(&second.path, &sid, 3, &entries), Ok(Check::Ok { entries: 3 }));
+        let at = |p: &Path| Snapshot::load(p).unwrap();
+        assert_eq!(check(at(&second.path).conn(), &sid, 3, &entries), Ok(Check::Ok { entries: 3 }));
         // The earlier seal is behind what the witness saw: a rollback, if offered as the latest.
-        assert_eq!(check(&first.path, &sid, 1, &entries), Ok(Check::Behind { entries: 1, seen_seq: 3 }));
-        assert_eq!(check(&ts.sealed.path, &sid, 2, &entries), Ok(Check::Behind { entries: 2, seen_seq: 3 }));
-        assert_eq!(check(&second.path, "other", 3, &entries), Ok(Check::NotWitnessed));
+        assert_eq!(check(at(&first.path).conn(), &sid, 1, &entries), Ok(Check::Behind { entries: 1, seen_seq: 3 }));
+        assert_eq!(check(at(&ts.sealed.path).conn(), &sid, 2, &entries), Ok(Check::Behind { entries: 2, seen_seq: 3 }));
+        assert_eq!(check(at(&second.path).conn(), "other", 3, &entries), Ok(Check::NotWitnessed));
         // Rewrite a record and its chain from there on, then re-sign: the file is consistent and
         // verifies on its own, but the witness remembers the old heads.
         let copy = t.path().join("rewritten.sqlite");
@@ -1305,7 +1377,7 @@ mod tests {
         }
         resign(&copy, &key);
         assert!(verify(&copy).is_ok(), "re-signed with the device key, the rewrite is self-consistent");
-        assert_eq!(check(&copy, &sid, 3, &entries), Err("witness mismatch at seq 1".into()));
+        assert_eq!(check(at(&copy).conn(), &sid, 3, &entries), Err("witness mismatch at seq 1".into()));
     }
 
     #[test]
@@ -1353,7 +1425,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!((lines[0].chain_seq, lines[0].reason.as_deref(), lines[0].signature.as_str()), (2, Some("legacy"), legacy[1].sidecar.signature.as_str()));
         // The kept seal still checks out against the lines written for the removed ones.
-        assert_eq!(crate::witness::check(&kept.path, s.session(), 4, &lines), Ok(crate::witness::Check::Ok { entries: 2 }));
+        assert_eq!(crate::witness::check(Snapshot::load(&kept.path).unwrap().conn(), s.session(), 4, &lines), Ok(crate::witness::Check::Ok { entries: 2 }));
         // Running again finds nothing more.
         assert!(prune_legacy(&home, &wdir, true).unwrap()[0].superseded.is_empty());
     }
@@ -1391,5 +1463,81 @@ mod tests {
         }
         store.write(&input("b", json!(0)), Instant::now()).unwrap();
         assert_eq!(checkpoint(&store, &key, "observation").unwrap().unwrap().sidecar.chain_seq, 171);
+    }
+
+    /// Review finding: a record kept off the chain, hidden behind a second chain row for an
+    /// existing record so the counts agree, verified before 0.1.2.
+    #[test]
+    fn a_repeated_chain_row_cannot_hide_an_off_chain_record() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        let x = s.write(&input("x", json!(1)), Instant::now()).unwrap();
+        let path = s.path().to_path_buf();
+        drop(s);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute(
+                "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, host_ms, chars)
+                 SELECT 'f00d', 'x', 2, 'result', 'canonical', 'forged', jsonb('{\"held\":true}'), model, session, at_ms, expires_ms, 1, 1 FROM records WHERE id = ?1",
+                [&x.id],
+            )
+            .unwrap();
+            let (prev, at_ms, tsha): (Vec<u8>, i64, Vec<u8>) =
+                c.query_row("SELECT hash, at_ms, thread_sha256 FROM chain WHERE seq = 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            let prev: [u8; 32] = prev.try_into().unwrap();
+            let tsha: [u8; 32] = tsha.try_into().unwrap();
+            let h = chain_hash_v3(&prev, &stored_row_digest(&c, &x.id, at_ms).unwrap(), at_ms, &tsha);
+            c.execute(
+                "INSERT INTO chain (seq, prev_hash, hash, at_ms, record_id, thread, thread_sha256) VALUES (2, ?1, ?2, ?3, ?4, 'main', ?5)",
+                rusqlite::params![prev.as_slice(), h.as_slice(), at_ms, x.id, tsha.as_slice()],
+            )
+            .unwrap();
+        }
+        let s = Store::open(t.path(), &path).unwrap();
+        let sealed = seal(&s, &key).unwrap();
+        assert!(!sealed.verified);
+        assert_eq!(verify(&sealed.path).unwrap_err(), "1 chain row(s) repeat a record");
+    }
+
+    /// Review finding: verify read the sealed file and its sidecar more than once, so a file
+    /// swapped after the check was what callers then read. A snapshot keeps the checked bytes.
+    #[test]
+    fn a_snapshot_keeps_the_bytes_it_verified() {
+        let f = fx();
+        let s = seal(&f.store, &f.key).unwrap();
+        let snap = Snapshot::load(&s.path).unwrap();
+        // Replace the file and sidecar on disk with something else entirely.
+        std::fs::write(&s.path, b"not a database").unwrap();
+        std::fs::write(sidecar_path(&s.path), "{}").unwrap();
+        assert!(snap.verify().is_ok());
+        let n: i64 = snap.conn().query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3);
+        assert!(verify(&s.path).is_err());
+        // The key is checked on the same sidecar that is verified.
+        assert!(snap.check_key(std::slice::from_ref(&snap.sidecar.public_key)).is_ok());
+        assert!(snap.check_key(&["00".repeat(32)]).unwrap_err().starts_with("untrusted key "));
+    }
+
+    /// Review finding: pruning removed older checkpoint seals without checking that the newer
+    /// chain holds their heads, so a rewritten session could clear the seals that contradict it.
+    #[test]
+    fn pruning_keeps_a_seal_the_newer_chain_contradicts() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        s.write(&input("a", json!(1)), Instant::now()).unwrap();
+        let first = seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        s.write(&input("b", json!(2)), Instant::now()).unwrap();
+        let second = seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        // A checkpoint whose head the newer chain doesn't hold: it stands for evidence of a rewrite.
+        let mut sc = second.sidecar.clone();
+        sc.chain_head = "ab".repeat(32);
+        std::fs::write(sidecar_path(&second.path), canonical(&sc).unwrap()).unwrap();
+        assert!(!first.path.exists(), "the first was covered and pruned by the second");
+        s.write(&input("c", json!(3)), Instant::now()).unwrap();
+        let third = seal_for(&s, &key, Reason::Checkpoint).unwrap();
+        assert!(third.verified);
+        assert!(second.path.exists(), "a contradicted seal is kept");
     }
 }

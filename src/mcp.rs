@@ -534,18 +534,19 @@ impl SymbiaServer {
         self.policy.check(path, crate::policy::Access::Read)
     }
 
-    /// Verify `path` against the pinned keys and, when one is configured, the witness.
-    fn verify_audited(&self, path: &Path) -> Result<(seal::Verified, Option<String>), String> {
+    /// Verify `path` against the pinned keys and, when one is configured, the witness. The
+    /// snapshot holds the bytes that were checked; callers read and copy from it, never the path.
+    fn verify_audited(&self, path: &Path) -> Result<(seal::Verified, Option<String>, seal::Snapshot), String> {
         let trusted: Vec<String> = crate::trust::load(&self.home).map_err(err)?.into_iter().map(|t| t.public_key).collect();
-        let v = seal::verify_trusted(path, &trusted)?;
+        let (v, snap) = seal::open_trusted(path, &trusted)?;
         let w = match self.policy.witness() {
             Some(dir) => {
                 let entries = crate::witness::read(&crate::witness::file_of(dir)).map_err(err)?;
-                Some(crate::witness::check(path, &v.session, v.chain_seq, &entries)?.describe())
+                Some(crate::witness::check(snap.conn(), &v.session, v.chain_seq, &entries)?.describe())
             }
             None => None,
         };
-        Ok((v, w))
+        Ok((v, w, snap))
     }
 
     fn open_seal(&self, args: &OpenArgs, facts: &mut Facts) -> Result<String, String> {
@@ -554,7 +555,7 @@ impl SymbiaServer {
         if limit > FIND_LIMIT_MAX {
             return Err(format!("limit must be at most {FIND_LIMIT_MAX}"));
         }
-        let (v, witness) = match self.verify_audited(&path) {
+        let (v, witness, snap) = match self.verify_audited(&path) {
             Ok(x) => x,
             Err(reason) => {
                 facts.retrieval = Some(json!({"verified": false, "reason": reason}));
@@ -574,10 +575,10 @@ impl SymbiaServer {
         if let Some(w) = &witness {
             reply["witness"] = w.as_str().into();
         }
-        let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+        let conn = snap.conn();
         let mut retrieval = json!({"verified": true, "session": reply["session"], "chain_seq": v.chain_seq});
         if let Some(id) = &args.id {
-            let rec = crate::store::get_in(&conn, id).map_err(err)?.ok_or("no such record in this seal")?;
+            let rec = crate::store::get_in(conn, id).map_err(err)?.ok_or("no such record in this seal")?;
             retrieval["hits"] = json!([id]);
             reply["record"] = rec;
         } else {
@@ -609,11 +610,11 @@ impl SymbiaServer {
             None => self.with_store(|s| seal::seal(s, &self.key).map(|x| x.path).map_err(err))?,
         };
         facts.path = Some(path.display().to_string());
-        let (v, witness) = self.verify_audited(&path)?;
+        let (v, witness, snap) = self.verify_audited(&path)?;
         if v.session == crate::store::LEDGER {
             return Err("a seal of the ledger itself is not promoted".into());
         }
-        let sc = seal::read_sidecar(&path).map_err(err)?;
+        let sc = snap.sidecar.clone();
         let confirm = args.confirm.unwrap_or(false);
         // A dry run only reads the ledger, and leaves it uncreated when there is none yet.
         let exists = self.home.join("ledger").join("ledger.sqlite").exists();
@@ -663,10 +664,17 @@ impl SymbiaServer {
             reply["promoted"] = false.into();
             return Ok(reply.to_string());
         };
+        // Copy the verified bytes, not the path, which may have changed since. A file already
+        // in ledger/ under this name must be the same file.
         let dest = self.home.join("ledger").join(&name);
-        if !dest.exists() {
-            std::fs::copy(&path, &dest).map_err(err)?;
-            std::fs::copy(seal::sidecar_path(&path), seal::sidecar_path(&dest)).map_err(err)?;
+        if dest.exists() {
+            let there = std::fs::read(&dest).map_err(err)?;
+            if crate::canon::sha256(&there) != crate::canon::sha256(&snap.bytes) {
+                return Err(format!("ledger/{name} already holds a different file"));
+            }
+        } else {
+            std::fs::write(&dest, &snap.bytes).map_err(err)?;
+            std::fs::write(seal::sidecar_path(&dest), &snap.sidecar_text).map_err(err)?;
         }
         let mut body = json!({
             "session": v.session,
@@ -697,7 +705,7 @@ impl SymbiaServer {
         reply["promoted"] = true.into();
         reply["ledger_seq"] = w.seq.into();
         reply["ledger_seal_verified"] = sealed.verified.into();
-        facts.retrieval = Some(json!({"promoted": true, "file_sha256": &sc.file_sha256[..PREFIX], "ledger_seq": w.seq}));
+        facts.retrieval = Some(json!({"promoted": true, "file_sha256": crate::canon::short(&sc.file_sha256, PREFIX), "ledger_seq": w.seq}));
         Ok(reply.to_string())
     }
 
@@ -1976,6 +1984,24 @@ mod tests {
         ix.refresh(crate::index::REFRESH_BUDGET).unwrap();
         let n: i64 = ix.conn().query_row("SELECT COUNT(*) FROM docs WHERE key = 'a'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Review finding: a second, different seal under a promoted seal's file name got a ledger
+    /// record whose hash didn't match the file kept in ledger/.
+    #[tokio::test]
+    async fn promote_refuses_a_different_file_under_a_promoted_name() {
+        let (_t, _wdir, s) = audited();
+        s.symbia_record(Parameters(rec("a"))).await.unwrap();
+        let promote = |a: PromoteArgs| s.symbia_promote(Parameters(a));
+        let first: Value = serde_json::from_str(&promote(PromoteArgs { confirm: Some(true), ..Default::default() }).await.unwrap()).unwrap();
+        let first_path = first["seal"].as_str().unwrap().to_string();
+        s.symbia_record(Parameters(rec("b"))).await.unwrap();
+        let later: Value = serde_json::from_str(&s.symbia_seal(Parameters(SealArgs::default())).await.unwrap()).unwrap();
+        let later_path = later["path"].as_str().unwrap().to_string();
+        std::fs::copy(&later_path, &first_path).unwrap();
+        std::fs::copy(seal::sidecar_path(Path::new(&later_path)), seal::sidecar_path(Path::new(&first_path))).unwrap();
+        let e = promote(PromoteArgs { seal: Some(first_path.clone()), confirm: Some(true) }).await.unwrap_err();
+        assert!(e.ends_with("already holds a different file"), "{e}");
     }
 
     #[test]
