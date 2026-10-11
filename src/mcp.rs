@@ -541,7 +541,7 @@ impl SymbiaServer {
         let (v, snap) = seal::open_trusted(path, &trusted)?;
         let w = match self.policy.witness() {
             Some(dir) => {
-                let entries = crate::witness::read(&crate::witness::file_of(dir)).map_err(err)?;
+                let entries = crate::witness::load(&crate::witness::file_of(dir), &trusted)?;
                 Some(crate::witness::check(snap.conn(), &v.session, v.chain_seq, &entries)?.describe())
             }
             None => None,

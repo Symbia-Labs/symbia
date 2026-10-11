@@ -294,15 +294,21 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
                 println!("external {} {} {} session {}", short(&x.from_id, 12), x.rel, short(&x.to_id, 12), x.session);
             }
             if let Some(w) = witness {
-                let entries = match symbia::witness::read(&symbia::witness::file_of(w)) {
+                let entries = match symbia::witness::load(&symbia::witness::file_of(w), &trusted) {
                     Ok(e) => e,
                     Err(e) => {
-                        eprintln!("cannot read witness {}: {e:#}", w.display());
+                        eprintln!("witness {}: {e}", w.display());
                         return ExitCode::FAILURE;
                     }
                 };
+                // Behind or not witnessed at all is a failure: offered as the latest, an older
+                // seal or an unwitnessed rewrite is exactly what the witness exists to catch.
                 match symbia::witness::check(snap.conn(), &v.session, v.chain_seq, &entries) {
-                    Ok(c) => println!("witness {}", c.describe()),
+                    Ok(c @ symbia::witness::Check::Ok { .. }) => println!("witness {}", c.describe()),
+                    Ok(c) => {
+                        eprintln!("witness {}", c.describe());
+                        return ExitCode::FAILURE;
+                    }
                     Err(reason) => {
                         eprintln!("{reason}");
                         return ExitCode::FAILURE;
@@ -325,7 +331,8 @@ fn prune_legacy(confirm: bool) -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let policy = symbia::policy::Policy::from_env(&home)?;
     let witness = policy.witness().ok_or_else(|| anyhow::anyhow!("set \"witness\" in config.json first: each removed seal is written there before it goes"))?;
-    let report = symbia::seal::prune_legacy(&home, witness, confirm)?;
+    let key = symbia::keys::load_or_create(&home)?;
+    let report = symbia::seal::prune_legacy(&home, witness, &key, confirm)?;
     let (mut sessions, mut files) = (0, 0);
     for r in &report {
         if let Some(why) = &r.skipped {

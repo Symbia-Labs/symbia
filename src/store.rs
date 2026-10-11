@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use crate::canon::{canonical, hex_prefix};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, Link, MAIN_THREAD, RecordInput, RowFields, chain_hash_v3, check_thread, record_id, row_digest, thread_sha256};
+use crate::record::{
+    FORMAT, GENESIS, IdFields, Link, MAIN_THREAD, RecordInput, RowFields, RowV4, chain_hash_v3, check_thread, genesis_v4, new_salt, record_id, record_id_v4, row_digest, row_digest_v4,
+    thread_sha256,
+};
 use crate::session::Lock;
 
 pub const DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -18,24 +21,47 @@ pub const LEDGER: &str = "ledger";
 pub const FIND_LIMIT_MAX: u32 = 50;
 const FIND_LIMIT_DEFAULT: u32 = 20;
 
+/// Format 4 adds `file_meta.session`, `records.salt` and `record_evidence`, and makes
+/// `chain.record_id` unique.
 pub const SCHEMA: &str = "
-CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT, format INTEGER NOT NULL, mcp_session_id TEXT, thread TEXT) STRICT;
+CREATE TABLE file_meta (retention TEXT NOT NULL, expires_ms INTEGER, embed_runtime TEXT, format INTEGER NOT NULL, mcp_session_id TEXT, thread TEXT,
+  session TEXT) STRICT;
 CREATE TABLE chain (seq INTEGER PRIMARY KEY, prev_hash BLOB NOT NULL, hash BLOB NOT NULL, at_ms INTEGER NOT NULL, record_id TEXT,
   thread TEXT, thread_sha256 BLOB NOT NULL, row_digest BLOB) STRICT;
 CREATE TABLE records (
   id TEXT PRIMARY KEY, key TEXT NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL,
   lane TEXT NOT NULL, lane_reason TEXT NOT NULL, body BLOB NOT NULL, model TEXT NOT NULL,
   session TEXT NOT NULL, at_ms INTEGER NOT NULL, expires_ms INTEGER,
-  est_host_ms INTEGER, est_chars INTEGER, host_ms INTEGER, chars INTEGER,
+  est_host_ms INTEGER, est_chars INTEGER, host_ms INTEGER, chars INTEGER, salt BLOB,
   UNIQUE (key, version)) STRICT;
 CREATE TABLE links (from_id TEXT NOT NULL, to_id TEXT NOT NULL, rel TEXT NOT NULL, to_session TEXT) STRICT;
 CREATE TABLE evidence (sha256 BLOB PRIMARY KEY, bytes INTEGER NOT NULL, media TEXT NOT NULL) STRICT;
+CREATE TABLE record_evidence (record_id TEXT NOT NULL, sha256 BLOB NOT NULL, bytes INTEGER NOT NULL, media TEXT NOT NULL,
+  PRIMARY KEY (record_id, sha256)) STRICT;
 CREATE VIRTUAL TABLE records_fts USING fts5(id UNINDEXED, key, body);
 CREATE INDEX links_from ON links (from_id);
 CREATE INDEX links_to ON links (to_id);
-CREATE INDEX chain_record ON chain (record_id);
+CREATE UNIQUE INDEX chain_record ON chain (record_id);
 CREATE INDEX chain_thread ON chain (thread);
 ";
+
+/// `file_meta.format`; a file without the column predates it and is format 1.
+pub fn file_format(conn: &Connection) -> rusqlite::Result<i64> {
+    let has: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('file_meta') WHERE name = 'format'", [], |r| r.get(0))?;
+    if has == 0 {
+        return Ok(1);
+    }
+    conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0))
+}
+
+/// The hash before the first chain row: zeros up to format 3, [`genesis_v4`] from format 4.
+pub fn chain_genesis(conn: &Connection) -> anyhow::Result<[u8; 32]> {
+    if file_format(conn)? < 4 {
+        return Ok(GENESIS);
+    }
+    let (session, mcp): (Option<String>, Option<String>) = conn.query_row("SELECT session, mcp_session_id FROM file_meta", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    genesis_v4(&session.context("format 4 file without a session")?, mcp.as_deref())
+}
 
 pub struct Store {
     conn: Connection,
@@ -43,6 +69,8 @@ pub struct Store {
     session: String,
     path: PathBuf,
     started_ms: i64,
+    /// The file's format; writes follow it, so an older ledger file stays in its own format.
+    format: i64,
     /// Where each seal of this file is also written down (config `witness`).
     witness: Option<PathBuf>,
     /// The stdio session lock; last, so it is released after the connection closes.
@@ -115,7 +143,7 @@ pub fn chain_head(conn: &Connection) -> anyhow::Result<(i64, [u8; 32])> {
         .query_row("SELECT seq, hash FROM chain ORDER BY seq DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     match row {
-        None => Ok((0, GENESIS)),
+        None => Ok((0, chain_genesis(conn)?)),
         Some((seq, hash)) => {
             let hash = <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| anyhow::anyhow!("chain hash at seq {seq} is not 32 bytes"))?;
             Ok((seq, hash))
@@ -175,10 +203,10 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute(
-            "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('session', ?1, NULL, ?2, ?3)",
-            params![expires_ms, FORMAT, mcp_session_id],
+            "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id, session) VALUES ('session', ?1, NULL, ?2, ?3, ?4)",
+            params![expires_ms, FORMAT, mcp_session_id, session],
         )?;
-        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms(), witness: None, lock: None })
+        Ok(Self { conn, home: home.to_path_buf(), session: session.to_string(), path, started_ms: now_ms(), format: FORMAT, witness: None, lock: None })
     }
 
     /// `home/ledger/ledger.sqlite`: the long-lived ledger, opened or created. Its records are
@@ -193,8 +221,11 @@ impl Store {
         let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute("INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id) VALUES ('ledger', NULL, NULL, ?1, NULL)", [FORMAT])?;
-        Ok(Self { conn, home: home.to_path_buf(), session: LEDGER.to_string(), path, started_ms: now_ms(), witness: None, lock: None })
+        conn.execute(
+            "INSERT INTO file_meta (retention, expires_ms, embed_runtime, format, mcp_session_id, session) VALUES ('ledger', NULL, NULL, ?1, NULL, ?2)",
+            params![FORMAT, LEDGER],
+        )?;
+        Ok(Self { conn, home: home.to_path_buf(), session: LEDGER.to_string(), path, started_ms: now_ms(), format: FORMAT, witness: None, lock: None })
     }
 
     /// Also write each seal of this file to the witness folder.
@@ -216,7 +247,9 @@ impl Store {
         if !mode.eq_ignore_ascii_case("wal") {
             bail!("could not enable WAL (got {mode})");
         }
-        Ok(Self { conn, home: home.to_path_buf(), session, path: path.to_path_buf(), started_ms, witness: None, lock: None })
+        let format = file_format(&conn)?;
+        anyhow::ensure!((3..=FORMAT).contains(&format), "{} is file format {format}; this build writes formats 3 and {FORMAT}", path.display());
+        Ok(Self { conn, home: home.to_path_buf(), session, path: path.to_path_buf(), started_ms, format, witness: None, lock: None })
     }
 
     /// Keep `lock` for as long as this store is open.
@@ -276,9 +309,10 @@ impl Store {
     pub fn write_in(&mut self, thread: &str, input: &RecordInput, started: Instant, reply_chars: Option<usize>, evidence: &[Evidence]) -> anyhow::Result<Written> {
         check_thread(thread).map_err(anyhow::Error::msg)?;
         input.validate()?;
+        let v4 = self.format >= 4;
         let tx = self.conn.transaction()?;
         let version: i64 = tx.query_row("SELECT COALESCE(MAX(version), 0) + 1 FROM records WHERE key = ?1", [&input.key], |r| r.get(0))?;
-        let id = record_id(&IdFields {
+        let id_fields = IdFields {
             key: &input.key,
             version,
             kind: &input.kind,
@@ -286,7 +320,12 @@ impl Store {
             body: &input.body,
             model: &input.model,
             session: &self.session,
-        })?;
+        };
+        let salt = if v4 { Some(new_salt()?) } else { None };
+        let id = match &salt {
+            Some(s) => record_id_v4(&id_fields, s)?,
+            None => record_id(&id_fields)?,
+        };
         let mut links: Vec<Link> = Vec::new();
         for l in input.links.iter().flatten() {
             let found: Option<i64> = tx.query_row("SELECT 1 FROM records WHERE id = ?1", [&l.to_id], |r| r.get(0)).optional()?;
@@ -303,7 +342,7 @@ impl Store {
         let at_ms = now_ms();
         let seq = prev_seq + 1;
         let expires_ms: Option<i64> = tx.query_row("SELECT expires_ms FROM file_meta", [], |r| r.get(0))?;
-        let digest = row_digest(&RowFields {
+        let row = RowFields {
             id: &id,
             key: &input.key,
             version,
@@ -318,13 +357,28 @@ impl Store {
             est_host_ms: input.est_host_ms,
             est_chars: input.est_chars,
             links: &links,
-        })?;
+        };
+        // Format 4 hashes the measured cost, so it is measured now: the reply's length is the
+        // same whatever the head turns out to be, and the time runs to just before the hash.
+        let measure = |head: String| -> anyhow::Result<(i64, i64)> {
+            let reply = Written { id: id.clone(), version, seq, head };
+            let chars = i64::try_from(reply_chars.unwrap_or_else(|| reply.reply().chars().count()))?;
+            Ok((i64::try_from(started.elapsed().as_millis())?, chars))
+        };
+        let evidence_rows: Vec<([u8; 32], i64, String)> = evidence.iter().map(|e| (e.sha256, e.bytes, e.media.to_string())).collect();
+        let (digest, cost) = match &salt {
+            Some(s) => {
+                let (host_ms, chars) = measure("0".repeat(12))?;
+                (row_digest_v4(&row, &RowV4 { salt: s, host_ms, chars, evidence: &evidence_rows })?, Some((host_ms, chars)))
+            }
+            None => (row_digest(&row)?, None),
+        };
         let thread_digest = thread_sha256(thread);
         let hash = chain_hash_v3(&prev_hash, &digest, at_ms, &thread_digest);
         let body_text = canonical(&input.body)?;
         tx.execute(
-            "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, est_host_ms, est_chars)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars, salt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 input.key,
@@ -338,7 +392,10 @@ impl Store {
                 at_ms,
                 expires_ms,
                 input.est_host_ms,
-                input.est_chars
+                input.est_chars,
+                cost.map(|c| c.0),
+                cost.map(|c| c.1),
+                salt.as_ref().map(|s| s.as_slice())
             ],
         )?;
         tx.execute(
@@ -354,13 +411,20 @@ impl Store {
                 "INSERT OR IGNORE INTO evidence (sha256, bytes, media) VALUES (?1, ?2, ?3)",
                 params![e.sha256.as_slice(), e.bytes, e.media],
             )?;
+            if v4 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO record_evidence (record_id, sha256, bytes, media) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, e.sha256.as_slice(), e.bytes, e.media],
+                )?;
+            }
         }
-        let written = Written { id, version, seq, head: hex_prefix(&hash, 12) };
-        let chars = i64::try_from(reply_chars.unwrap_or_else(|| written.reply().chars().count()))?;
-        let host_ms = i64::try_from(started.elapsed().as_millis())?;
-        tx.execute("UPDATE records SET host_ms = ?1, chars = ?2 WHERE id = ?3", params![host_ms, chars, written.id])?;
+        let head = hex_prefix(&hash, 12);
+        if cost.is_none() {
+            let (host_ms, chars) = measure(head.clone())?;
+            tx.execute("UPDATE records SET host_ms = ?1, chars = ?2 WHERE id = ?3", params![host_ms, chars, id])?;
+        }
         tx.commit()?;
-        Ok(written)
+        Ok(Written { id, version, seq, head })
     }
 
     pub fn find(&self, q: &FindQuery) -> anyhow::Result<Vec<FindHit>> {
@@ -523,10 +587,35 @@ mod tests {
         assert!(delta > DEFAULT_TTL_MS - 60_000 && delta <= DEFAULT_TTL_MS, "{delta}");
         assert!(s.path().starts_with(s.home().join("sessions")));
         assert_eq!(s.path().file_name().unwrap().to_str().unwrap(), format!("{}.sqlite", s.session()));
-        let format: i64 = s.conn().query_row("SELECT format FROM file_meta", [], |r| r.get(0)).unwrap();
-        assert_eq!(format, 3);
+        let (format, session): (i64, String) = s.conn().query_row("SELECT format, session FROM file_meta", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((format, session.as_str()), (4, s.session()));
         assert_eq!(s.expires_ms().unwrap(), Some(exp));
         assert_eq!(s.mcp_session_id().unwrap(), None);
+    }
+
+    /// The ledger lives for years: a format 3 ledger made by 0.1 keeps getting format 3 rows, so
+    /// it goes on verifying as one chain.
+    #[test]
+    fn an_older_file_is_written_in_its_own_format() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let path = {
+            let s = Store::create(t.path()).unwrap();
+            s.conn().execute("UPDATE file_meta SET format = 3, session = NULL", []).unwrap();
+            s.path().to_path_buf()
+        };
+        let mut s = Store::open(t.path(), &path).unwrap();
+        let w = s.write_with(&input("a", "tool_call", json!(1)), Instant::now(), None, &[Evidence { sha256: [1; 32], bytes: 1, media: "text/plain" }]).unwrap();
+        let (salt, n): (Option<Vec<u8>>, i64) =
+            s.conn().query_row("SELECT salt, (SELECT COUNT(*) FROM record_evidence) FROM records WHERE id = ?1", [&w.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((salt, n), (None, 0));
+        let prev: Vec<u8> = s.conn().query_row("SELECT prev_hash FROM chain WHERE seq = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(prev, GENESIS.to_vec());
+        let sealed = crate::seal::seal(&s, &key).unwrap();
+        assert!(sealed.verified, "{:?}", crate::seal::verify(&sealed.path));
+        s.conn().execute("UPDATE file_meta SET format = 2", []).unwrap();
+        drop(s);
+        assert!(Store::open(t.path(), &path).is_err(), "formats before 3 are read, never written");
     }
 
     #[test]
@@ -585,9 +674,13 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, GENESIS.to_vec());
+        let genesis = genesis_v4(s.session(), None).unwrap();
+        assert_eq!(rows[0].1, genesis.to_vec());
         let r1 = s.get(&w1.id).unwrap().unwrap();
-        let digest = row_digest(&RowFields {
+        let (salt, host_ms, chars): (Vec<u8>, i64, i64) =
+            s.conn().query_row("SELECT salt, host_ms, chars FROM records WHERE id = ?1", [&w1.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let salt: [u8; 32] = salt.try_into().unwrap();
+        let digest = row_digest_v4(&RowFields {
             id: &w1.id,
             key: "a",
             version: 1,
@@ -602,9 +695,9 @@ mod tests {
             est_host_ms: Some(5),
             est_chars: Some(100),
             links: &[],
-        })
+        }, &RowV4 { salt: &salt, host_ms, chars, evidence: &[] })
         .unwrap();
-        assert_eq!(rows[0].2, chain_hash_v3(&GENESIS, &digest, rows[0].3, &thread_sha256("main")).to_vec());
+        assert_eq!(rows[0].2, chain_hash_v3(&genesis, &digest, rows[0].3, &thread_sha256("main")).to_vec());
         assert_eq!(rows[1].1, rows[0].2);
         assert_eq!(rows[1].4, w2.id);
         assert_eq!(hex_prefix(&rows[1].2, 12), w2.head);
@@ -629,6 +722,9 @@ mod tests {
         assert_eq!(s.get(&w.id).unwrap().unwrap()["chars"], 777);
         let (n, bytes): (i64, i64) = s.conn().query_row("SELECT COUNT(*), MAX(bytes) FROM evidence", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((n, bytes), (1, 42));
+        // Format 4 ties each evidence file to the record that names it.
+        let (rid, media): (String, String) = s.conn().query_row("SELECT record_id, media FROM record_evidence", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((rid, media.as_str()), (w.id, "text/plain"));
     }
 
     #[test]

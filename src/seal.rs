@@ -10,8 +10,10 @@ use serde_json::Value;
 
 use crate::canon::{canonical, sha256};
 use crate::now_ms;
-use crate::record::{FORMAT, GENESIS, IdFields, Link, RowFields, chain_hash, chain_hash_v2, chain_hash_v3, check_thread, record_id, row_digest, thread_sha256};
-use crate::store::{Store, chain_head};
+use crate::record::{
+    FORMAT, IdFields, Link, RowFields, RowV4, chain_hash, chain_hash_v2, chain_hash_v3, check_thread, record_id, record_id_v4, row_digest, row_digest_v4, thread_sha256,
+};
+use crate::store::{Store, chain_genesis, chain_head, file_format};
 
 /// The `.seal.json` sidecar. Byte fields are lowercase hex.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,7 +173,7 @@ pub fn seal_for(store: &Store, key: &SigningKey, reason: Reason) -> anyhow::Resu
     };
     std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
     let verified = verify(&path).is_ok();
-    witness(store, &sidecar);
+    witness(store, &sidecar, key);
     if verified {
         prune_superseded(store.home(), store.session(), seq, &path);
     }
@@ -195,7 +197,7 @@ pub struct LegacyPrune {
 /// seal goes only if the newest verifies and its chain holds the older seal's head at the
 /// older seq. Each removed seal is first written to the witness folder (with reason `legacy`),
 /// so its signed head and time outlive the file. Nothing is removed unless `confirm`.
-pub fn prune_legacy(home: &Path, witness: &Path, confirm: bool) -> anyhow::Result<Vec<LegacyPrune>> {
+pub fn prune_legacy(home: &Path, witness: &Path, key: &SigningKey, confirm: bool) -> anyhow::Result<Vec<LegacyPrune>> {
     let mut by_session: std::collections::BTreeMap<String, Vec<(i64, PathBuf)>> = std::collections::BTreeMap::new();
     for e in std::fs::read_dir(home.join("seals"))?.flatten() {
         let path = e.path();
@@ -222,18 +224,13 @@ pub fn prune_legacy(home: &Path, witness: &Path, confirm: bool) -> anyhow::Resul
             if sc.reason.is_some() || seq >= newest_seq {
                 continue;
             }
-            let head: Option<Vec<u8>> = if seq == 0 {
-                Some(GENESIS.to_vec())
-            } else {
-                conn.query_row("SELECT hash FROM chain WHERE seq = ?1", [seq], |r| r.get(0)).optional()?
-            };
-            if head.map(hex::encode).as_deref() != Some(sc.chain_head.as_str()) {
+            if !chain_holds(&conn, seq, &sc.chain_head) {
                 continue;
             }
             if confirm {
                 let mut entry = crate::witness::Entry::from_sidecar(&sc);
                 entry.reason = Some("legacy".into());
-                crate::witness::append(witness, &entry)?;
+                crate::witness::append(witness, &entry, key)?;
                 std::fs::remove_file(&path)?;
                 let _ = std::fs::remove_file(sidecar_path(&path));
             }
@@ -250,20 +247,28 @@ pub fn prune_legacy(home: &Path, witness: &Path, confirm: bool) -> anyhow::Resul
 pub const WITNESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Write a new seal to the store's witness folder; a failure goes to stderr.
-fn witness(store: &Store, sidecar: &Sidecar) {
+fn witness(store: &Store, sidecar: &Sidecar, key: &SigningKey) {
     if let Some(dir) = store.witness() {
-        witness_within(dir, sidecar, WITNESS_WAIT);
+        witness_within(dir, sidecar, key, WITNESS_WAIT);
     }
 }
 
-/// Append the seal's witness line on a thread of its own and wait at most `wait` for it. A
-/// write still blocked after that is left to finish by itself and the seal goes ahead, so one
-/// stuck folder can't hold the store. Returns whether the line landed in time.
-fn witness_within(dir: &Path, sidecar: &Sidecar, wait: std::time::Duration) -> bool {
+/// Append the seal's witness line, signed by `key`, on a thread of its own and wait at most
+/// `wait` for it. A write still blocked after that is left to finish by itself and the seal
+/// goes ahead, so one stuck folder can't hold the store. Returns whether the line landed in time.
+fn witness_within(dir: &Path, sidecar: &Sidecar, key: &SigningKey, wait: std::time::Duration) -> bool {
+    let (to, entry, key) = (dir.to_path_buf(), crate::witness::Entry::from_sidecar(sidecar), key.clone());
+    run_within(dir, wait, move || crate::witness::append(&to, &entry, &key))
+}
+
+/// Run `write` on a thread of its own and wait at most `wait` for it; see [`witness_within`].
+fn run_within<F>(dir: &Path, wait: std::time::Duration, write: F) -> bool
+where
+    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::channel();
-    let (to, entry) = (dir.to_path_buf(), crate::witness::Entry::from_sidecar(sidecar));
     std::thread::spawn(move || {
-        let _ = tx.send(crate::witness::append(&to, &entry).map_err(|e| format!("{e:#}")));
+        let _ = tx.send(write().map_err(|e| format!("{e:#}")));
     });
     match rx.recv_timeout(wait) {
         Ok(Ok(())) => true,
@@ -311,14 +316,24 @@ pub fn prune_superseded(home: &Path, session: &str, seq: i64, newer: &Path) -> V
 /// Whether the chain in `conn` has `head` (lowercase hex) at `seq`; seq 0 is the genesis.
 fn chain_holds(conn: &Connection, seq: i64, head: &str) -> bool {
     let at: Option<Vec<u8>> = if seq == 0 {
-        Some(GENESIS.to_vec())
+        chain_genesis(conn).ok().map(|g| g.to_vec())
     } else {
         conn.query_row("SELECT hash FROM chain WHERE seq = ?1", [seq], |r| r.get(0)).optional().ok().flatten()
     };
     at.is_some_and(|h| hex::encode(h) == head.to_ascii_lowercase())
 }
 
-/// The format 2 row digest of record `rid`, read from `conn`, with `at_ms` from its chain row.
+/// The evidence record `rid` names, as `(sha256, bytes, media)`, from a format 4 file.
+fn record_evidence(conn: &Connection, rid: &str) -> rusqlite::Result<Vec<([u8; 32], i64, String)>> {
+    let rows: Vec<(Vec<u8>, i64, String)> = conn
+        .prepare("SELECT sha256, bytes, media FROM record_evidence WHERE record_id = ?1")?
+        .query_map([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows.into_iter().map(|(sha, bytes, media)| (<[u8; 32]>::try_from(sha.as_slice()).unwrap_or([0; 32]), bytes, media)).collect())
+}
+
+/// The row digest of record `rid` as its file's format computes it, read from `conn`, with
+/// `at_ms` from its chain row.
 fn stored_row_digest(conn: &Connection, rid: &str, at_ms: i64) -> anyhow::Result<[u8; 32]> {
     type Row = (String, i64, String, String, String, String, String, String, Option<i64>, Option<i64>, Option<i64>);
     let r: Row = conn.query_row(
@@ -331,7 +346,7 @@ fn stored_row_digest(conn: &Connection, rid: &str, at_ms: i64) -> anyhow::Result
         .query_map([rid], |l| Ok((l.get(0)?, l.get(1)?, l.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let body: Value = serde_json::from_str(&r.5)?;
-    row_digest(&RowFields {
+    let fields = RowFields {
         id: rid,
         key: &r.0,
         version: r.1,
@@ -346,7 +361,14 @@ fn stored_row_digest(conn: &Connection, rid: &str, at_ms: i64) -> anyhow::Result
         est_host_ms: r.9,
         est_chars: r.10,
         links: &links,
-    })
+    };
+    if file_format(conn)? >= 4 {
+        let (salt, host_ms, chars): (Vec<u8>, i64, i64) = conn.query_row("SELECT salt, host_ms, chars FROM records WHERE id = ?1", [rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let salt = <[u8; 32]>::try_from(salt.as_slice()).map_err(|_| anyhow::anyhow!("record {rid} has a malformed salt"))?;
+        let evidence = record_evidence(conn, rid)?;
+        return row_digest_v4(&fields, &RowV4 { salt: &salt, host_ms, chars, evidence: &evidence });
+    }
+    row_digest(&fields)
 }
 
 /// `seals/<session>-<seq>.thread-<first 8 hex of the thread's sha256>.sqlite`.
@@ -394,7 +416,12 @@ pub fn seal_thread(store: &Store, key: &SigningKey, thread: &str) -> anyhow::Res
         copy.execute(&format!("DELETE FROM links WHERE from_id IN {gone}"), [])?;
         copy.execute(&format!("DELETE FROM records_fts WHERE id IN {gone}"), [])?;
         copy.execute(&format!("DELETE FROM records WHERE id IN {gone}"), [])?;
-        copy.execute("DELETE FROM evidence WHERE NOT EXISTS (SELECT 1 FROM records r WHERE instr(json(r.body), lower(hex(evidence.sha256))) > 0)", [])?;
+        if format >= 4 {
+            copy.execute(&format!("DELETE FROM record_evidence WHERE record_id IN {gone}"), [])?;
+            copy.execute("DELETE FROM evidence WHERE sha256 NOT IN (SELECT sha256 FROM record_evidence)", [])?;
+        } else {
+            copy.execute("DELETE FROM evidence WHERE NOT EXISTS (SELECT 1 FROM records r WHERE instr(json(r.body), lower(hex(evidence.sha256))) > 0)", [])?;
+        }
         // Merge the full-text index so withheld text is not left in old segments.
         copy.execute("INSERT INTO records_fts (records_fts) VALUES ('optimize')", [])?;
         copy.execute("UPDATE file_meta SET retention = 'seal', thread = ?1", [thread])?;
@@ -420,7 +447,7 @@ pub fn seal_thread(store: &Store, key: &SigningKey, thread: &str) -> anyhow::Res
     };
     std::fs::write(sidecar_path(&path), canonical(&sidecar)?)?;
     let verified = verify(&path).is_ok();
-    witness(store, &sidecar);
+    witness(store, &sidecar, key);
     Ok(ThreadSealed { sealed: Sealed { path, sidecar, verified }, records, withheld })
 }
 
@@ -486,16 +513,10 @@ struct StoredRow {
     est_chars: Option<i64>,
     host_ms: Option<i64>,
     chars: Option<i64>,
+    /// Format 4 only.
+    salt: Option<Vec<u8>>,
 }
 
-/// `file_meta.format`; a file without the column predates it and is format 1.
-fn file_format(conn: &Connection) -> rusqlite::Result<i64> {
-    let has: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('file_meta') WHERE name = 'format'", [], |r| r.get(0))?;
-    if has == 0 {
-        return Ok(1);
-    }
-    conn.query_row("SELECT format FROM file_meta", [], |r| r.get(0))
-}
 
 /// A sealed copy and its sidecar, each read from disk exactly once. Verification and every
 /// later read use these bytes, so the file can't be swapped between the check and the use.
@@ -602,13 +623,23 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
     } else {
         "SELECT seq, prev_hash, hash, at_ms, record_id, NULL, NULL, NULL FROM chain ORDER BY seq"
     };
+    // Format 4 names the file's session in file_meta, and the chain starts from its digest.
+    if format >= 4 {
+        let session: Option<String> = conn.query_row("SELECT session FROM file_meta", [], |r| r.get(0)).map_err(db)?;
+        if session.as_deref() != Some(sc.session.as_str()) {
+            return Err("sidecar session does not match the file".into());
+        }
+    }
+    let genesis = chain_genesis(conn).map_err(|e| format!("sealed file unreadable: {e}"))?;
     let mut chain = conn.prepare(chain_sql).map_err(db)?;
-    let mut rec = conn
-        .prepare(
-            "SELECT key, version, kind, lane, lane_reason, json(body), model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars
-             FROM records WHERE id = ?1",
-        )
-        .map_err(db)?;
+    let rec_sql = if format >= 4 {
+        "SELECT key, version, kind, lane, lane_reason, json(body), model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars, salt
+         FROM records WHERE id = ?1"
+    } else {
+        "SELECT key, version, kind, lane, lane_reason, json(body), model, session, at_ms, expires_ms, est_host_ms, est_chars, host_ms, chars, NULL
+         FROM records WHERE id = ?1"
+    };
+    let mut rec = conn.prepare(rec_sql).map_err(db)?;
     // Files from before cross-session links have no `to_session` column; every link is local there.
     let has_to_session: i64 =
         conn.query_row("SELECT COUNT(*) FROM pragma_table_info('links') WHERE name = 'to_session'", [], |r| r.get(0)).map_err(db)?;
@@ -633,7 +664,7 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
             })
         })
         .map_err(db)?;
-    let mut prev = GENESIS;
+    let mut prev = genesis;
     let mut seq_expected = 1i64;
     let mut on_chain = 0i64;
     let mut withheld = 0i64;
@@ -679,6 +710,7 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
                     est_chars: r.get(11)?,
                     host_ms: r.get(12)?,
                     chars: r.get(13)?,
+                    salt: r.get(14)?,
                 })
             })
             .optional()
@@ -722,7 +754,7 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
             }
         }
         let body: Value = serde_json::from_str(&r.body).map_err(|_| format!("record body unreadable at seq {seq}"))?;
-        let id = record_id(&IdFields {
+        let id_fields = IdFields {
             key: &r.key,
             version: r.version,
             kind: &r.kind,
@@ -730,7 +762,22 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
             body: &body,
             model: &r.model,
             session: &r.session,
-        })
+        };
+        // Format 4: a 32-byte salt, and the measured cost, which its row digest covers.
+        let v4 = if format >= 4 {
+            let salt = r.salt.as_deref().and_then(|s| <[u8; 32]>::try_from(s).ok()).ok_or_else(|| format!("record salt malformed at seq {seq}"))?;
+            let (Some(host_ms), Some(chars)) = (r.host_ms, r.chars) else {
+                return Err(format!("record cost fields missing at seq {seq}"));
+            };
+            let evidence = record_evidence(conn, &rid).map_err(db)?;
+            Some((salt, host_ms, chars, evidence))
+        } else {
+            None
+        };
+        let id = match &v4 {
+            Some((salt, ..)) => record_id_v4(&id_fields, salt),
+            None => record_id(&id_fields),
+        }
         .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
         if id != rid {
             return Err(format!("record id mismatch at seq {seq}"));
@@ -746,7 +793,7 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
                 }
             }
             // The chain row's at_ms stands in for the record's; the two are compared below.
-            let digest = row_digest(&RowFields {
+            let fields = RowFields {
                 id: &rid,
                 key: &r.key,
                 version: r.version,
@@ -761,7 +808,11 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
                 est_host_ms: r.est_host_ms,
                 est_chars: r.est_chars,
                 links: &row_links,
-            })
+            };
+            let digest = match &v4 {
+                Some((salt, host_ms, chars, evidence)) => row_digest_v4(&fields, &RowV4 { salt, host_ms: *host_ms, chars: *chars, evidence }),
+                None => row_digest(&fields),
+            }
             .map_err(|e| format!("cannot canonicalize record at seq {seq}: {e}"))?;
             match tsha {
                 Some(t) => chain_hash_v3(&prev, &digest, at_ms, &t),
@@ -801,6 +852,20 @@ fn verify_loaded(snap: &Snapshot) -> Result<Verified, String> {
     if stray != 0 {
         return Err(format!("{stray} link(s) not on the chain"));
     }
+    // Format 4: every evidence row is named by a record on the chain, with the same size.
+    if format >= 4 {
+        let loose: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM record_evidence WHERE record_id NOT IN (SELECT id FROM records))
+                      + (SELECT COUNT(*) FROM evidence e WHERE NOT EXISTS (SELECT 1 FROM record_evidence x WHERE x.sha256 = e.sha256 AND x.bytes = e.bytes))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if loose != 0 {
+            return Err(format!("{loose} evidence row(s) not on the chain"));
+        }
+    }
     let last_seq = seq_expected - 1;
     if last_seq != sc.chain_seq {
         return Err(format!("chain seq mismatch: file {last_seq}, sidecar {}", sc.chain_seq));
@@ -826,7 +891,7 @@ struct ChainRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{LinkInput, RecordInput};
+    use crate::record::{GENESIS, LinkInput, RecordInput};
     use serde_json::json;
     use std::time::Instant;
 
@@ -919,7 +984,9 @@ mod tests {
         let s = seal(&store, &key).unwrap();
         assert!(s.verified);
         assert_eq!(s.sidecar.chain_seq, 0);
-        assert_eq!(s.sidecar.chain_head, hex::encode(GENESIS));
+        // Format 4 starts the chain from the session's digest, not zeros.
+        assert_eq!(s.sidecar.chain_head, hex::encode(crate::record::genesis_v4(store.session(), None).unwrap()));
+        assert_ne!(s.sidecar.chain_head, hex::encode(GENESIS));
     }
 
     #[test]
@@ -966,6 +1033,8 @@ mod tests {
             ("UPDATE records SET at_ms = at_ms + 1 WHERE key = 'b'", "record at_ms mismatch at seq 2"),
             ("UPDATE records SET id = 'x' WHERE key = 'b'", "record missing at seq 2"),
             ("UPDATE file_meta SET retention = 'session'", "retention is \"session\", not \"seal\""),
+            // Format 4: the HTTP session binding is in the chain's start.
+            ("UPDATE file_meta SET mcp_session_id = 'someone-else'", "chain prev_hash mismatch at seq 1"),
         ];
         for (sql, want) in cases {
             let f = fx();
@@ -998,6 +1067,9 @@ mod tests {
             ("UPDATE records SET expires_ms = expires_ms + 1 WHERE key = 'b'", 2),
             ("UPDATE records SET est_host_ms = 1 WHERE key = 'b'", 2),
             ("UPDATE records SET est_chars = 1 WHERE key = 'b'", 2),
+            // Format 4 hashes the measured cost too; earlier formats signed whatever was there.
+            ("UPDATE records SET host_ms = host_ms + 1 WHERE key = 'b'", 2),
+            ("UPDATE records SET chars = chars + 1 WHERE key = 'b'", 2),
         ];
         for (sql, seq) in cases {
             let f = fx();
@@ -1014,7 +1086,11 @@ mod tests {
             ("UPDATE records SET host_ms = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
             ("UPDATE records SET chars = NULL WHERE key = 'b'", "record cost fields missing at seq 2"),
             ("INSERT INTO links (from_id, to_id, rel) VALUES ('x', 'y', 'cites')", "1 link(s) not on the chain"),
-            ("UPDATE file_meta SET format = 4", "unknown file format 4"),
+            ("UPDATE file_meta SET format = 5", "unknown file format 5"),
+            ("UPDATE file_meta SET session = 'other'", "sidecar session does not match the file"),
+            ("UPDATE records SET salt = zeroblob(32) WHERE key = 'b'", "record id mismatch at seq 2"),
+            ("UPDATE records SET salt = NULL WHERE key = 'b'", "record salt malformed at seq 2"),
+            ("INSERT INTO evidence (sha256, bytes, media) VALUES (zeroblob(32), 1, 'text/plain')", "1 evidence row(s) not on the chain"),
         ];
         for (sql, want) in cases {
             let f = fx();
@@ -1306,8 +1382,21 @@ mod tests {
     /// the line still arrives once the file opens.
     #[test]
     fn a_blocked_witness_does_not_hold_the_seal() {
-        use std::io::Read;
         let t = tempfile::tempdir().unwrap();
+        // A write held up (as by a macOS privacy prompt) is left behind after the wait.
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(!run_within(t.path(), std::time::Duration::from_millis(200), move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            tx.send(()).unwrap();
+            Ok(())
+        }));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the seal waited {:?}", started.elapsed());
+        // It still finishes on its own.
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(run_within(t.path(), std::time::Duration::from_secs(1), || Ok(())));
+
+        // A witness file that isn't a regular file (here a FIFO) is refused at once, not waited on.
         let home = t.path().join("sym");
         let mut s = Store::create(&home).unwrap();
         let key = crate::keys::load_or_create(&home).unwrap();
@@ -1317,15 +1406,9 @@ mod tests {
         std::fs::create_dir_all(&wdir).unwrap();
         let fifo = std::ffi::CString::new(wdir.join(crate::witness::FILE).to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-
         let started = Instant::now();
-        assert!(!witness_within(&wdir, &sealed.sidecar, std::time::Duration::from_millis(200)));
+        assert!(!witness_within(&wdir, &sealed.sidecar, &key, std::time::Duration::from_secs(2)));
         assert!(started.elapsed() < std::time::Duration::from_secs(1), "the seal waited {:?}", started.elapsed());
-
-        let mut line = String::new();
-        std::fs::File::open(wdir.join(crate::witness::FILE)).unwrap().read_to_string(&mut line).unwrap();
-        let e: crate::witness::Entry = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(e, crate::witness::Entry::from_sidecar(&sealed.sidecar));
     }
 
     #[test]
@@ -1342,9 +1425,9 @@ mod tests {
         let ts = seal_thread(&s, &key, "chat").unwrap();
         s.write(&input("c", json!(3)), Instant::now()).unwrap();
         let second = seal_for(&s, &key, Reason::Checkpoint).unwrap();
-        let entries = crate::witness::read(&wdir.join(crate::witness::FILE)).unwrap();
+        let entries = crate::witness::load(&wdir.join(crate::witness::FILE), &[hex::encode(key.verifying_key().to_bytes())]).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], crate::witness::Entry::from_sidecar(&first.sidecar));
+        assert_eq!(entries[0].seal_part(), crate::witness::Entry::from_sidecar(&first.sidecar));
         assert_eq!((entries[1].thread.as_deref(), entries[2].reason.as_deref()), (Some("chat"), Some("checkpoint")));
         use crate::witness::{Check, check};
         let sid = s.session().to_string();
@@ -1364,7 +1447,7 @@ mod tests {
             c.execute("UPDATE records SET lane_reason = 'rewritten' WHERE key = 'a'", []).unwrap();
             let rows: Vec<(i64, String, i64, Option<String>)> =
                 c.prepare("SELECT seq, record_id, at_ms, thread FROM chain ORDER BY seq").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_, _>>().unwrap();
-            let mut prev = GENESIS;
+            let mut prev = chain_genesis(&c).unwrap();
             for (seq, rid, at_ms, thread) in rows {
                 let d = stored_row_digest(&c, &rid, at_ms).unwrap();
                 let h = chain_hash_v3(&prev, &d, at_ms, &thread_sha256(thread.as_deref().unwrap()));
@@ -1412,12 +1495,12 @@ mod tests {
         std::fs::copy(&foreign.path, &alien).unwrap();
         std::fs::copy(sidecar_path(&foreign.path), sidecar_path(&alien)).unwrap();
 
-        let dry = prune_legacy(&home, &wdir, false).unwrap();
+        let dry = prune_legacy(&home, &wdir, &key, false).unwrap();
         assert_eq!(dry.len(), 1);
         assert_eq!(dry[0].kept, kept.path);
         assert_eq!(dry[0].superseded, vec![legacy[1].path.clone(), legacy[2].path.clone()]);
         assert!(legacy[1].path.exists() && !wdir.exists(), "a dry run changes nothing");
-        let done = prune_legacy(&home, &wdir, true).unwrap();
+        let done = prune_legacy(&home, &wdir, &key, true).unwrap();
         assert_eq!(done[0].superseded.len(), 2);
         assert!(!legacy[1].path.exists() && !sidecar_path(&legacy[2].path).exists());
         assert!(alien.exists() && kept.path.exists());
@@ -1427,7 +1510,7 @@ mod tests {
         // The kept seal still checks out against the lines written for the removed ones.
         assert_eq!(crate::witness::check(Snapshot::load(&kept.path).unwrap().conn(), s.session(), 4, &lines), Ok(crate::witness::Check::Ok { entries: 2 }));
         // Running again finds nothing more.
-        assert!(prune_legacy(&home, &wdir, true).unwrap()[0].superseded.is_empty());
+        assert!(prune_legacy(&home, &wdir, &key, true).unwrap()[0].superseded.is_empty());
     }
 
     #[test]
@@ -1477,6 +1560,9 @@ mod tests {
         drop(s);
         {
             let c = Connection::open(&path).unwrap();
+            // Format 4 files make chain record ids unique; anyone who can write the file can
+            // drop that index, so verify checks it too.
+            c.execute_batch("DROP INDEX chain_record").unwrap();
             c.execute(
                 "INSERT INTO records (id, key, version, kind, lane, lane_reason, body, model, session, at_ms, expires_ms, host_ms, chars)
                  SELECT 'f00d', 'x', 2, 'result', 'canonical', 'forged', jsonb('{\"held\":true}'), model, session, at_ms, expires_ms, 1, 1 FROM records WHERE id = ?1",
@@ -1498,6 +1584,43 @@ mod tests {
         let sealed = seal(&s, &key).unwrap();
         assert!(!sealed.verified);
         assert_eq!(verify(&sealed.path).unwrap_err(), "1 chain row(s) repeat a record");
+    }
+
+    /// Review finding: the evidence table and a withheld record's id were outside every hash, or
+    /// guessable. Format 4 hashes the evidence a record names and salts each id.
+    #[test]
+    fn format4_covers_evidence_and_salts_withheld_ids() {
+        let t = tempfile::tempdir().unwrap();
+        let key = crate::keys::load_or_create(t.path()).unwrap();
+        let mut s = Store::create(t.path()).unwrap();
+        let ev = crate::store::Evidence { sha256: [7u8; 32], bytes: 42, media: "text/plain" };
+        let secret = s.write_in("other", &input("secret", json!("guessable")), Instant::now(), None, &[]).unwrap();
+        s.write_in("mine", &input("tool.exec", json!({"tool": "exec"})), Instant::now(), Some(10), &[ev]).unwrap();
+        let full = seal(&s, &key).unwrap();
+        assert!(full.verified);
+        for (sql, want) in [
+            ("UPDATE record_evidence SET bytes = 43", "chain hash mismatch at seq 2"),
+            ("UPDATE evidence SET bytes = 43", "1 evidence row(s) not on the chain"),
+            ("DELETE FROM record_evidence", "chain hash mismatch at seq 2"),
+        ] {
+            let copy = t.path().join("copy.sqlite");
+            std::fs::copy(&full.path, &copy).unwrap();
+            std::fs::copy(sidecar_path(&full.path), sidecar_path(&copy)).unwrap();
+            tamper(&copy, sql);
+            resign(&copy, &key);
+            assert_eq!(verify(&copy).unwrap_err(), want, "{sql}");
+        }
+        // A thread seal keeps the withheld record's id, which no longer follows from its content.
+        let ts = seal_thread(&s, &key, "mine").unwrap();
+        assert!(ts.sealed.verified);
+        let c = Snapshot::load(&ts.sealed.path).unwrap();
+        let kept: String = c.conn().query_row("SELECT record_id FROM chain WHERE seq = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, secret.id);
+        let body = json!("guessable");
+        let guess = IdFields { key: "secret", version: 1, kind: "observation", lane: "conditional", body: &body, model: "m", session: s.session() };
+        assert_ne!(record_id(&guess).unwrap(), kept);
+        let salts: i64 = c.conn().query_row("SELECT COUNT(*) FROM records WHERE salt IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(salts, 1, "the withheld record's salt left with it");
     }
 
     /// Review finding: verify read the sealed file and its sidecar more than once, so a file

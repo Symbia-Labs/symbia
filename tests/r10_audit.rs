@@ -38,10 +38,12 @@ async fn promote_witness_and_open_over_stdio() {
     let (ok, out, err) = verify(&home, &newest, &wdir);
     assert!(ok, "{out}{err}");
     assert!(out.lines().any(|l| l.starts_with("witness ok (")), "{out}");
-    // The first seal, offered on its own, is behind what the witness saw: a rollback.
-    let (ok, out, _) = verify(&home, &first_seal, &wdir);
-    assert!(ok);
-    assert!(out.contains("witness behind (seen seq"), "{out}");
+    // The first seal, offered on its own, is behind what the witness saw: a rollback. Since 0.2
+    // that fails verify (exit 1), where it used to pass with a note.
+    let (ok, out, err) = verify(&home, &first_seal, &wdir);
+    assert!(!ok);
+    assert!(out.starts_with("ok "), "{out}");
+    assert!(err.contains("witness behind (seen seq"), "{err}");
     // The witness file names the session, the ledger, and each seal's reason.
     let lines = std::fs::read_to_string(wdir.join("witness.jsonl")).unwrap();
     assert!(lines.contains("\"reason\":\"explicit\"") && lines.contains("\"reason\":\"ledger\"") && lines.contains("\"reason\":\"exit\""), "{lines}");
