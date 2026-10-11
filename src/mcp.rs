@@ -1651,7 +1651,17 @@ mod tests {
             let pidfile = w.path().join("child.pid");
             let r = exec(&s, &format!("sleep 60 & echo $! > {}; wait", pidfile.display()), w.path(), 300, None).await;
             let id = r["job"].as_str().unwrap().to_string();
-            let child: i64 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+            // The shell writes the pid shortly after it starts; under load that can be after the yield.
+            let pid_text = (0..100)
+                .find_map(|_| {
+                    let t = std::fs::read_to_string(&pidfile).ok().filter(|t| t.ends_with('\n'));
+                    if t.is_none() {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    t
+                })
+                .expect("the child's pid file");
+            let child: i64 = pid_text.trim().parse().unwrap();
             let k = parse(job_call(&s, &id, JobAction::Kill).await);
             assert_eq!((k["running"].clone(), k["exit"].clone(), k["killed"].clone()), (json!(false), json!("killed"), json!("job")), "{k}");
             let gone = (0..50).any(|_| {

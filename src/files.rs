@@ -125,29 +125,109 @@ fn open_error(path: &Path, e: &std::io::Error) -> String {
     }
 }
 
+/// The path the system holds for an open file: `F_GETPATH` on macOS, `/proc/self/fd` elsewhere.
+pub fn fd_path(f: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX bytes into `buf`.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+    }
+}
+
+/// Largest file `edit` and `append` read whole.
+pub const EDIT_BYTES_MAX: u64 = 16 * 1024 * 1024;
+/// Largest image file `read` loads.
+pub const IMAGE_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// Open `real` (a path the policy already allowed) and check again what was actually opened.
+/// The check and the open are separate steps, so a folder on the way could be swapped for a
+/// symlink in between; the path of the open file is what's checked here, against `access`.
+/// The open doesn't follow a final symlink and doesn't block, and only regular files and
+/// folders are kept, so a FIFO or device can't hang the call. `None` if nothing is there.
+fn open_verified(policy: &Policy, real: &Path, access: Access) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(real) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(open_error(real, &e)),
+    };
+    let meta = file.metadata().map_err(io)?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(format!("{} is not a regular file", real.display()));
+    }
+    let at = fd_path(&file).map_err(|e| format!("open {}: {e}", real.display()))?;
+    if let Err(e) = policy.check(&show(&at), access) {
+        return Err(format!("denied: {} changed during the call and is now {} ({e})", real.display(), at.display()));
+    }
+    Ok(Some(file))
+}
+
+/// Read at most `max` bytes from `f`; more than that is an error naming the cap.
+fn read_capped(mut f: impl Read, max: u64, what: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    f.by_ref().take(max + 1).read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", what.display()))?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{} is over {} MB, the cap for this tool", what.display(), max / (1024 * 1024)));
+    }
+    Ok(bytes)
+}
+
 /// Write `bytes` to a temp file beside `path`, then rename it over `path`. With `create_only`
 /// the temp file is hard-linked instead, which fails if `path` already exists. `mode` is the
-/// existing file's permissions, kept on the new one. Just before the rename the directory's
-/// realpath is checked against `policy` again, in case it was swapped for a symlink.
+/// existing file's permissions, kept on the new one. The folder is opened once and its open
+/// path checked against `policy`; the temp file, the rename and the link all happen relative
+/// to that handle, so a folder swapped for a symlink after the check can't redirect the write.
 pub fn atomic_write(policy: &Policy, path: &Path, bytes: &[u8], create_only: bool, mode: Option<std::fs::Permissions>) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().ok_or_else(|| std::io::Error::other("path has no parent"))?;
     let name = path.file_name().ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    let d = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    let at = fd_path(&d)?;
+    policy.check(&show(&at.join(name)), Access::Write).map_err(std::io::Error::other)?;
     let mut r = [0u8; 4];
     getrandom::fill(&mut r).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let tmp = dir.join(format!(".{}.symbia-{}.tmp", name.to_string_lossy(), hex::encode(r)));
+    let tmp = CString::new(format!(".{}.symbia-{}.tmp", name.to_string_lossy(), hex::encode(r))).map_err(std::io::Error::other)?;
+    let target = CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    let dfd = d.as_raw_fd();
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: openat on a directory handle we hold, with a NUL-terminated name; checked below.
+    let fd = unsafe { libc::openat(dfd, tmp.as_ptr(), flags, 0o666 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         if let Some(mode) = mode {
             f.set_permissions(mode)?;
         }
         f.sync_all()?;
-        let dir_real = std::fs::canonicalize(dir)?;
-        policy.check(&show(&dir_real), Access::Write).map_err(std::io::Error::other)?;
-        if create_only { std::fs::hard_link(&tmp, path) } else { std::fs::rename(&tmp, path) }
+        // SAFETY: both names are NUL-terminated and relative to the directory handle we hold.
+        let r = unsafe {
+            if create_only { libc::linkat(dfd, tmp.as_ptr(), dfd, target.as_ptr(), 0) } else { libc::renameat(dfd, tmp.as_ptr(), dfd, target.as_ptr()) }
+        };
+        if r != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
     })();
     if create_only || result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        // SAFETY: as above; a failure to remove the temp file leaves only the temp file.
+        unsafe {
+            libc::unlinkat(dfd, tmp.as_ptr(), 0);
+        }
     }
     result
 }
@@ -158,7 +238,8 @@ pub fn atomic_write(policy: &Policy, path: &Path, bytes: &[u8], create_only: boo
 /// (default and cap 2,000) and 256 KB. Binary files (NUL bytes or not UTF-8) are refused.
 pub fn read(policy: &Policy, path: &str, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
     let real = checked(policy, path, Access::Read, &mut facts.path)?;
-    read_at(&real, offset, limit, facts)
+    let file = open_verified(policy, &real, Access::Read)?.ok_or_else(|| format!("open {}: no such file", real.display()))?;
+    read_file(file, &real, offset, limit, facts)
 }
 
 /// What `read` sends back.
@@ -204,7 +285,7 @@ pub fn store_evidence(dir: &Path, bytes: &[u8]) -> Result<[u8; 32], String> {
 pub fn read_any(policy: &Policy, evidence: &Path, path: &str, offset: Option<u64>, limit: Option<u64>, full: bool, facts: &mut Facts) -> Result<ReadOut, String> {
     use crate::images::{SNIFF_BYTES, Sniff, sniff};
     let real = checked(policy, path, Access::Read, &mut facts.path)?;
-    let mut file = open_nofollow(&real).map_err(|e| open_error(&real, &e))?;
+    let mut file = open_verified(policy, &real, Access::Read)?.ok_or_else(|| format!("open {}: no such file", real.display()))?;
     if file.metadata().map_err(io)?.is_dir() {
         return Err(format!("{} is a directory; use list", real.display()));
     }
@@ -213,14 +294,21 @@ pub fn read_any(policy: &Policy, evidence: &Path, path: &str, offset: Option<u64
     match sniff(&head) {
         Sniff::Image(format) => {
             let mut data = head;
-            file.read_to_end(&mut data).map_err(io)?;
+            data.extend(read_capped(file, IMAGE_BYTES_MAX - SNIFF_BYTES as u64, &real)?);
             image_at(&real, &data, format, full, evidence, facts).map(ReadOut::Image)
         }
-        Sniff::Heic => read_at(&real, offset, limit, facts)
+        Sniff::Heic => read_open(file, &real, offset, limit, facts)
             .map(ReadOut::Text)
             .map_err(|e| if e.starts_with("binary") { format!("{e}; HEIC images are not supported, convert to PNG or JPEG") } else { e }),
-        Sniff::Other => read_at(&real, offset, limit, facts).map(ReadOut::Text),
+        Sniff::Other => read_open(file, &real, offset, limit, facts).map(ReadOut::Text),
     }
+}
+
+/// [`read_at`] on a file already opened and checked, from its start.
+fn read_open(mut file: std::fs::File, real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
+    use std::io::Seek;
+    file.rewind().map_err(io)?;
+    read_file(file, real, offset, limit, facts)
 }
 
 fn image_at(real: &Path, data: &[u8], format: crate::images::Format, full: bool, evidence: &Path, facts: &mut Facts) -> Result<SentImage, String> {
@@ -250,9 +338,8 @@ fn image_at(real: &Path, data: &[u8], format: crate::images::Format, full: bool,
     Ok(SentImage { bytes: s.bytes, media: s.sent_format.media(), sha256, text })
 }
 
-/// [`read`] after the policy check, on its realpath.
-fn read_at(real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
-    let file = open_nofollow(real).map_err(|e| open_error(real, &e))?;
+/// [`read`] on a file opened and checked by [`open_verified`]; `real` names it in replies.
+fn read_file(file: std::fs::File, real: &Path, offset: Option<u64>, limit: Option<u64>, facts: &mut Facts) -> Result<String, String> {
     if file.metadata().map_err(io)?.is_dir() {
         return Err(format!("{} is a directory; use list", real.display()));
     }
@@ -567,13 +654,9 @@ pub fn search(policy: &Policy, a: &SearchArgs, deadline: Duration, facts: &mut F
 
 // ---------------------------------------------------------------- write and edit
 
-/// Open the target of a write or edit with `O_NOFOLLOW`. `None` if it does not exist yet.
-fn open_target(real: &Path) -> Result<Option<std::fs::File>, String> {
-    let file = match open_nofollow(real) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(open_error(real, &e)),
-    };
+/// Open the target of a write or edit through [`open_verified`]. `None` if it does not exist yet.
+fn open_target(policy: &Policy, real: &Path) -> Result<Option<std::fs::File>, String> {
+    let Some(file) = open_verified(policy, real, Access::Write)? else { return Ok(None) };
     if file.metadata().map_err(io)?.is_dir() {
         return Err(format!("{} is a directory", real.display()));
     }
@@ -601,9 +684,9 @@ pub fn append(policy: &Policy, path: &str, content: &str, facts: &mut Facts) -> 
 fn append_at(policy: &Policy, real: &Path, content: &str, facts: &mut Facts) -> Result<String, String> {
     let mut bytes = Vec::new();
     let mut keep = None;
-    if let Some(mut f) = open_target(real)? {
+    if let Some(f) = open_target(policy, real)? {
         keep = Some(mode(&f)?);
-        f.read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", real.display()))?;
+        bytes = read_capped(f, EDIT_BYTES_MAX, real)?;
         facts.sha256_before = Some(hex::encode(crate::canon::sha256(&bytes)));
     }
     bytes.extend_from_slice(content.as_bytes());
@@ -618,7 +701,7 @@ fn append_at(policy: &Policy, real: &Path, content: &str, facts: &mut Facts) -> 
 
 /// [`write`] after the policy check, on its realpath.
 fn write_at(policy: &Policy, real: &Path, content: &str, create_only: bool, facts: &mut Facts) -> Result<String, String> {
-    let existing = open_target(real)?;
+    let existing = open_target(policy, real)?;
     let mut keep = None;
     if let Some(f) = existing {
         keep = Some(mode(&f)?);
@@ -668,12 +751,11 @@ fn edit_checked(policy: &Policy, path: &str, old: &str, new: &str, all: bool, fa
 
 /// [`edit`] or [`edit_all`] after the policy check, on its realpath.
 fn edit_at(policy: &Policy, real: &Path, old: &str, new: &str, all: bool, facts: &mut Facts) -> Result<String, String> {
-    let Some(mut file) = open_target(real)? else {
+    let Some(file) = open_target(policy, real)? else {
         return Err(format!("read {}: no such file", real.display()));
     };
     let keep = mode(&file)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|e| format!("read {}: {e}", real.display()))?;
+    let bytes = read_capped(file, EDIT_BYTES_MAX, real)?;
     facts.sha256_before = Some(hex::encode(crate::canon::sha256(&bytes)));
     let text = std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8 text", real.display()))?;
     let (pos, edited, replaced) = if all {
@@ -1065,7 +1147,7 @@ mod tests {
         let real = p.check(&s(&f), Access::Write).unwrap();
         std::fs::remove_file(&f).unwrap();
         std::os::unix::fs::symlink(&outside, &f).unwrap();
-        let e = read_at(&real, None, None, &mut Facts::default()).unwrap_err();
+        let e = open_verified(&p, &real, Access::Read).unwrap_err();
         assert!(e.contains("is a symlink"), "{e}");
         let e = edit_at(&p, &real, "secret", "owned", false, &mut Facts::default()).unwrap_err();
         assert!(e.contains("is a symlink"), "{e}");
@@ -1080,11 +1162,55 @@ mod tests {
         let (t, root, p) = setup();
         let outside = t.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        // A directory that resolves outside the roots by the time of the rename.
+        // A directory that resolves outside the roots by the time of the write: refused as a
+        // symlink when it is the folder itself, and by its open path when it is further up.
         std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
         let e = atomic_write(&p, &root.join("d/f.txt"), b"x", false, None).unwrap_err();
+        // macOS answers ENOTDIR for a symlink opened as a folder without following; Linux ELOOP.
+        assert!(matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{e}");
+        std::fs::create_dir_all(outside.join("e")).unwrap();
+        let e = atomic_write(&p, &root.join("d/e/f.txt"), b"x", false, None).unwrap_err();
         assert!(e.to_string().contains("outside the allowed roots"), "{e}");
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(outside.join("e")).unwrap().count(), 0);
+    }
+
+    /// Review finding: the policy checked a path, then the tools opened it by path again, so a
+    /// folder on the way swapped for a symlink in between led outside the roots or onto the
+    /// deny list. What was opened is now checked by its own path.
+    #[test]
+    fn a_folder_swapped_for_a_symlink_mid_call_is_caught_on_the_open_file() {
+        let (t, root, p) = setup();
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f.txt"), "inside").unwrap();
+        let real = p.check(&s(&root.join("d/f.txt")), Access::Read).unwrap();
+        // Swap the folder after the check.
+        std::fs::remove_dir_all(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+        let e = open_verified(&p, &real, Access::Read).unwrap_err();
+        assert!(e.contains("changed during the call"), "{e}");
+        let e = edit_at(&p, &real, "secret", "owned", false, &mut Facts::default()).unwrap_err();
+        assert!(e.contains("changed during the call"), "{e}");
+        assert_eq!(std::fs::read_to_string(outside.join("f.txt")).unwrap(), "secret");
+    }
+
+    #[test]
+    fn fifos_are_refused_and_big_files_capped() {
+        let (_t, root, p) = setup();
+        let fifo = root.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let e = read(&p, &s(&fifo), None, None, &mut Facts::default()).unwrap_err();
+        assert!(e.contains("not a regular file") && started.elapsed() < Duration::from_secs(2), "{e}");
+        let big = root.join("big.txt");
+        std::fs::write(&big, vec![b'a'; (EDIT_BYTES_MAX + 1) as usize]).unwrap();
+        let e = edit(&p, &s(&big), "a", "b", &mut Facts::default()).unwrap_err();
+        assert!(e.contains("the cap for this tool"), "{e}");
+        let e = append(&p, &s(&big), "x", &mut Facts::default()).unwrap_err();
+        assert!(e.contains("the cap for this tool"), "{e}");
     }
 
     #[test]
