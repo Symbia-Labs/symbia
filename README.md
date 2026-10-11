@@ -379,10 +379,10 @@ Where to keep it: outside the data folder (required) and outside your roots, so 
 - writes go only to the roots, the temporary folders (`/private/tmp`, `/private/var/folders`) and `/dev`;
 - the deny list above is neither readable nor writable, and `SYMBIA_HOME` and the protected paths are not writable;
 - with `"exec_read": "home"` (the default) nothing in your home folder is readable except the roots, a few shell and toolchain files, and `evidence/`. When the only root is the home folder, that is nearly everything, which is one more reason to set `roots`;
-- `open`, `launchctl`, `osascript` and `osacompile` can't be run, and LaunchServices opens and Apple Events are refused, so a command can't hand work to a process outside the sandbox that way;
+- `open`, `launchctl`, `osascript` and `osacompile` can't be run from their system paths, and LaunchServices opens and Apple Events are refused, so a command can't hand work to a process outside the sandbox that way;
 - `"exec_network": "deny"` blocks outbound network, DNS lookups through `mDNSResponder` included.
 
-A command cannot start a sandbox of its own inside this one. Not covered: a program of the command's own making that talks to `launchd` or another system service directly over its socket; treat code you let `exec` build and run with that in mind. On Linux there is no sandbox yet.
+A command cannot start a sandbox of its own inside this one. Not covered: the launchers are refused by path, so a copy of one elsewhere isn't. macOS 26 kills such a copy itself; macOS 15 runs it. Nor is a program of the command's own making that talks to `launchd` or another system service directly. Treat code you let `exec` build and run with that in mind. On Linux there is no sandbox yet.
 
 **`exec_unlock` (a stopgap).** `{"exec_unlock": [".config/gh"]}` re-opens named deny-list entries to commands run through `exec`, so a tool such as `gh` can use its own login. Only deny-list entries are accepted, and `keys/` can never be unlocked. The file tools still refuse those paths. It re-opens the entry to every command, not just one tool, so any command could read what it holds. Each exec record made while it is set carries `unlocked`, `status` shows it, and the server notes it on stderr at start.
 

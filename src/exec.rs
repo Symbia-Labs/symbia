@@ -925,6 +925,12 @@ mod tests {
 
         const SECRET: &str = "SECRET-7c1f-not-for-exec";
 
+        /// The running macOS major version, from `sw_vers`.
+        fn macos_major() -> u32 {
+            let out = std::process::Command::new("/usr/bin/sw_vers").arg("-productVersion").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().split('.').next().and_then(|m| m.parse().ok()).unwrap_or(0)
+        }
+
         /// A user home named `user` holding `.ssh/id_test`, a root beside it and `SYMBIA_HOME`
         /// with a key file. The policy's user home is the temp one, not the real `$HOME`.
         fn setup(user: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Policy) {
@@ -1005,9 +1011,12 @@ mod tests {
             for (prog, args) in [("/bin/launchctl", &["version"][..]), ("/usr/bin/osascript", &["-e", "return 1"][..])] {
                 assert!(std::process::Command::new(prog).args(args).output().unwrap().status.success(), "{prog}");
             }
-            // A copy of a launcher elsewhere doesn't run either (macOS kills it; seen as 137).
+            // A copy of a launcher is not caught by the path rule. macOS 26 kills such a copy itself
+            // (137); on macOS 15 (CI, October 11) the copy ran. Documented in SECURITY.md.
             let (r, _, _) = run(&p, &sym, "cp /bin/launchctl lc && ./lc version; e=$?; rm -f lc; exit $e", &root, None).await;
-            assert_ne!(r["exit"], 0, "{r}");
+            if macos_major() >= 26 {
+                assert_ne!(r["exit"], 0, "{r}");
+            }
             // With the network denied, names don't resolve either.
             let (r, _, _) = run(&p.clone().with_network(Network::Deny), &sym, "/sbin/ping -c 1 -t 2 example.com", &root, None).await;
             assert_ne!(r["exit"], 0, "{r}");

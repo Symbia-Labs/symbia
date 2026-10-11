@@ -32,7 +32,7 @@ These are documented limits, not vulnerabilities:
 - A seal's `reason` isn't covered by its signature. Editing it can change what gets pruned, but not what the seal proves.
 - Anyone with the private key in `keys/device.ed25519` can sign seals as that device.
 - With the default roots (the whole home folder) the file tools and `exec` can write anywhere in the home folder outside the deny list and protected paths. `status` and the startup message say so. Set `roots`.
-- The macOS sandbox profile starts from `(allow default)` and takes away. It refuses the launchers (`open`, `launchctl`, `osascript`, `osacompile`), LaunchServices opens and Apple Events, but a program a command builds itself could still talk to `launchd` or another system service over its socket. That path is untested.
+- The macOS sandbox profile starts from `(allow default)` and takes away. It refuses the launchers (`open`, `launchctl`, `osascript`, `osacompile`) by path, and LaunchServices opens and Apple Events outright. A copy of a launcher in another folder is not refused by the profile: macOS 26 kills it, but on macOS 15 it runs (seen in CI). A program a command builds itself could also talk to `launchd` or another system service directly; that path is untested.
 - A witness can't show from its own contents that lines were cut off its end. Keep a copy that leaves the machine and compare against it.
 - Witness lines written before 0.2 are unsigned. They still load, ahead of the first signed line.
 - Seals and session files of format 3 and earlier don't cover `host_ms`, `chars`, evidence rows or the HTTP binding, and their thread seals keep unsalted record ids. They verify as before; new files are format 4.
