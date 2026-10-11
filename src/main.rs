@@ -11,6 +11,7 @@ const USAGE: &str = "usage: symbia mcp
        symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder or witness.jsonl>]
        symbia show <sealed.sqlite> [--trust <hex>]...
        symbia get <sealed.sqlite> <key or id> [--trust <hex>]...
+       symbia config
        symbia prune-legacy [--confirm]
        symbia trust add <hex> <label>
        symbia trust list
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
             Some((p, trust)) if p.len() == 2 => run_get(Path::new(p[0]), p[1], &trust),
             _ => usage(),
         },
+        ["config"] => report("symbia config", show_config()),
         ["prune-legacy"] => report("symbia prune-legacy", prune_legacy(false)),
         ["prune-legacy", "--confirm"] => report("symbia prune-legacy", prune_legacy(true)),
         ["trust", "add", key, label] => report("symbia trust", trust_add(key, label)),
@@ -329,6 +331,16 @@ fn run_verify(path: &Path, extra: &[&str], witness: Option<&Path>) -> ExitCode {
 /// Remove seals made before seals recorded a reason, where a newer full seal covers them. Each
 /// removed seal is written to the witness first, so a witness must be configured. A dry run
 /// unless `confirm`.
+/// Print the settings in effect, each with where it came from. Fails as `symbia mcp` would on a
+/// file it can't start with.
+fn show_config() -> anyhow::Result<()> {
+    let home = symbia::home::from_env()?;
+    let user = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let e = symbia::policy::Policy::effective(&home, Path::new(&user))?;
+    println!("{}", serde_json::to_string_pretty(&e)?);
+    Ok(())
+}
+
 fn prune_legacy(confirm: bool) -> anyhow::Result<()> {
     let home = symbia::home::from_env()?;
     let policy = symbia::policy::Policy::from_env(&home)?;

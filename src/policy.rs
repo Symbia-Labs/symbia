@@ -157,21 +157,24 @@ pub enum ExecRead {
     DenyList,
 }
 
-/// `$SYMBIA_HOME/config.json`. Every key is optional.
+/// `$SYMBIA_HOME/config.json`. Every key is optional; an unknown key is an error, so a typo
+/// can't leave a setting at its default unnoticed. `read_roots` and `exec_read_allow` add to
+/// their defaults.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Read-write roots for the tools; default the user's home.
     pub roots: Option<Vec<String>>,
     pub exec_network: Network,
     pub exec_read: ExecRead,
-    /// Paths under the home exec may still read with `exec_read: "home"`.
+    /// Paths under the home exec may still read with `exec_read: "home"`, besides
+    /// [`EXEC_READ_ALLOW_DEFAULT`].
     pub exec_read_allow: Vec<String>,
     /// Exec command rules in Claude Code's syntax: `"chmod:*"` or an exact command.
     pub exec_deny: Vec<String>,
     /// Also load `Bash(...)` deny rules from Claude Code's settings files.
     pub exec_import_claude_rules: bool,
-    /// Read-only roots for the file tools.
+    /// Read-only roots for the file tools, besides [`READ_ROOTS_DEFAULT`].
     pub read_roots: Vec<String>,
     /// Deny-list entries re-opened for exec only (a logged stopgap, e.g. `".config/gh"`).
     pub exec_unlock: Vec<String>,
@@ -191,10 +194,10 @@ impl Default for Config {
             roots: None,
             exec_network: Network::Allow,
             exec_read: ExecRead::Home,
-            exec_read_allow: EXEC_READ_ALLOW_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            exec_read_allow: Vec::new(),
             exec_deny: Vec::new(),
             exec_import_claude_rules: true,
-            read_roots: READ_ROOTS_DEFAULT.iter().map(|s| s.to_string()).collect(),
+            read_roots: Vec::new(),
             exec_unlock: Vec::new(),
             resume_window_ms: crate::session::RESUME_WINDOW_DEFAULT_MS,
             exec_unsandboxed: Vec::new(),
@@ -289,6 +292,47 @@ impl Policy {
         Self::load(symbia_home, Path::new(&home))
     }
 
+    /// The settings in effect for `symbia config`: each key's value and whether it came from
+    /// the defaults, `config.json`, or both (the lists that add to their defaults). The file
+    /// is checked as the server checks it at start, so a file that would fail start fails here.
+    pub fn effective(symbia_home: &Path, user_home: &Path) -> anyhow::Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        Self::load(symbia_home, user_home)?;
+        let cfg = symbia_home.join("config.json");
+        let raw: serde_json::Map<String, Value> = match std::fs::read(&cfg) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(_) => serde_json::Map::new(),
+        };
+        let defaults = json!({
+            "roots": [user_home.display().to_string()],
+            "read_roots": READ_ROOTS_DEFAULT,
+            "exec_read": "home",
+            "exec_read_allow": EXEC_READ_ALLOW_DEFAULT,
+            "exec_network": "allow",
+            "exec_deny": [],
+            "exec_import_claude_rules": true,
+            "exec_unlock": [],
+            "exec_unsandboxed": [],
+            "resume_window_ms": crate::session::RESUME_WINDOW_DEFAULT_MS,
+            "embed": null,
+            "witness": null,
+        });
+        let mut settings = serde_json::Map::new();
+        for (key, default) in defaults.as_object().into_iter().flatten() {
+            let entry = match (raw.get(key), key.as_str()) {
+                (None, _) => json!({"value": default, "from": "default"}),
+                (Some(Value::Array(yours)), "read_roots" | "exec_read_allow") => {
+                    let mut all = default.as_array().cloned().unwrap_or_default();
+                    all.extend(yours.iter().cloned());
+                    json!({"value": all, "from": "default + config.json"})
+                }
+                (Some(v), _) => json!({"value": v, "from": "config.json"}),
+            };
+            settings.insert(key.clone(), entry);
+        }
+        Ok(json!({"file": cfg.display().to_string(), "exists": cfg.is_file(), "settings": settings}))
+    }
+
     /// A policy with these roots and every other setting at its default.
     pub fn new(roots: &[PathBuf], symbia_home: &Path, user_home: &Path) -> anyhow::Result<Self> {
         Self::with_config(roots, symbia_home, user_home, &Config::default())
@@ -296,7 +340,10 @@ impl Policy {
 
     /// A policy with these roots and the rest of `c` (its `roots` key is ignored).
     pub fn with_config(roots: &[PathBuf], symbia_home: &Path, user_home: &Path, c: &Config) -> anyhow::Result<Self> {
-        let spell = |list: &[String]| -> anyhow::Result<Vec<Spelled>> { list.iter().map(|p| Spelled::new(&expand(p, user_home)?)).collect() };
+        // The defaults are always kept; the config adds to them.
+        let spell = |defaults: &[&str], list: &[String]| -> anyhow::Result<Vec<Spelled>> {
+            defaults.iter().copied().chain(list.iter().map(String::as_str)).map(|p| Spelled::new(&expand(p, user_home)?)).collect()
+        };
         let roots = roots.iter().map(|r| Spelled::new(r)).collect::<anyhow::Result<_>>()?;
         let deny = DENY_IN_HOME
             .iter()
@@ -337,14 +384,14 @@ impl Policy {
         let policy = Self {
             roots,
             evidence: Spelled::new(&symbia_home.join("evidence"))?,
-            read_roots: spell(&c.read_roots)?,
+            read_roots: spell(&READ_ROOTS_DEFAULT, &c.read_roots)?,
             deny,
             protected,
             own,
             user_home: Spelled::new(user_home)?,
             network: c.exec_network,
             exec_read: c.exec_read,
-            exec_read_allow: spell(&c.exec_read_allow)?,
+            exec_read_allow: spell(&EXEC_READ_ALLOW_DEFAULT, &c.exec_read_allow)?,
             exec_deny: c.exec_deny.clone(),
             import_claude_rules: c.exec_import_claude_rules,
             exec_unlock: c.exec_unlock.clone(),
@@ -817,8 +864,44 @@ mod tests {
         assert_eq!((p.exec_read(), p.import_claude_rules(), p.exec_deny()), (ExecRead::DenyList, false, &["chmod:*".to_string()][..]));
         assert!(p.exec_read_paths().contains(&user.join(".tool").as_path()));
         assert!(!p.exec_read_paths().contains(&user.join(".zshrc").as_path()));
+        // An entry of your own adds to the defaults rather than replacing them.
+        assert!(p.exec_read_paths().contains(&user.join(".cargo").as_path()));
+        assert!(p.exec_read_paths().contains(&user.join(".zprofile").as_path()));
         std::fs::write(sym.join("config.json"), r#"{"exec_read": "everything"}"#).unwrap();
         assert!(Policy::load(&sym, &user).is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_not_a_default() {
+        let (_t, user, sym, _p) = setup();
+        // "root" for "roots" used to leave the whole home as the root without a word.
+        std::fs::write(sym.join("config.json"), r#"{"root": ["~/work"]}"#).unwrap();
+        let e = format!("{:#}", Policy::load(&sym, &user).unwrap_err());
+        assert!(e.contains("unknown field `root`") && e.contains("config.json"), "{e}");
+        std::fs::write(sym.join("config.json"), r#"{"exec_unsandboxed": [{"program": "/usr/bin/git", "arg": ["push"]}]}"#).unwrap();
+        assert!(format!("{:#}", Policy::load(&sym, &user).unwrap_err()).contains("unknown field `arg`"));
+    }
+
+    #[test]
+    fn effective_settings_say_where_each_came_from() {
+        let (_t, user, sym, _p) = setup();
+        let e = Policy::effective(&sym, &user).unwrap();
+        assert_eq!(e["exists"], false);
+        assert_eq!(e["settings"]["roots"], serde_json::json!({"value": [user.display().to_string()], "from": "default"}));
+        std::fs::write(sym.join("config.json"), serde_json::json!({"roots": ["~/work"], "read_roots": ["~/ref"], "exec_network": "deny"}).to_string()).unwrap();
+        let e = Policy::effective(&sym, &user).unwrap();
+        let s = &e["settings"];
+        assert_eq!((s["roots"]["from"].as_str(), s["exec_network"]["value"].as_str()), (Some("config.json"), Some("deny")));
+        assert_eq!(s["read_roots"], serde_json::json!({"value": ["~/.cargo/registry", "~/.rustup/toolchains", "~/ref"], "from": "default + config.json"}));
+        assert_eq!(s["exec_read_allow"]["from"], "default");
+        // Every key the file accepts is listed, and nothing else.
+        let keys: Vec<&String> = s.as_object().unwrap().keys().collect();
+        let all: serde_json::Map<String, serde_json::Value> = keys.iter().map(|k| ((*k).clone(), s[k.as_str()]["value"].clone())).collect();
+        assert!(serde_json::from_value::<Config>(serde_json::Value::Object(all)).is_ok());
+        assert_eq!(keys.len(), 12);
+        // A file the server would refuse is refused here too.
+        std::fs::write(sym.join("config.json"), r#"{"witnes": "~/w"}"#).unwrap();
+        assert!(Policy::effective(&sym, &user).is_err());
     }
 
     #[test]

@@ -24,6 +24,8 @@ We are publishing these here rather than as GitHub security advisories. Several 
 - **`find` leaves out `tool_call` records** unless `kind: "tool_call"` asks for them.
 - **`report` scores only results linked `results_of` to a prediction.** Totals from 0.1.x that counted unlinked results go down.
 - The search index is rebuilt once on first use, and records are embedded again.
+- **An unknown key in `config.json` stops the server** with the key named. Before, a typo such as `"root"` for `"roots"` was ignored and the setting stayed at its default; for `roots`, that meant the whole home folder.
+- **`read_roots` and `exec_read_allow` add to their built-in lists** instead of replacing them. Before, adding one entry dropped the shell startup files, `~/.cargo`, `~/.rustup` and git's config from what sandboxed commands may read.
 
 ### Findings and fixes
 
@@ -81,6 +83,7 @@ We are publishing these here rather than as GitHub security advisories. Several 
 
 ### Also
 
+- `symbia config` prints the settings in effect, each with where it came from (the defaults, `config.json`, or both), and fails on a file the server would refuse. Found while answering "how are defaults and user settings managed?" during this release: the answer was one file, no way to see the result, and the two traps above. *Tests:* `an_unknown_key_is_an_error_not_a_default`, `effective_settings_say_where_each_came_from`, `config_prints_the_settings_in_effect_and_refuses_a_typo`.
 - The README's Tools table has rows for `open` and `promote`, and `tests/docs_sync.rs` fails when a command in the usage text isn't in the README or a tool has no row in the Tools table.
 
 ## 0.1.1

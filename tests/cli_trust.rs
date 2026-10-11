@@ -116,3 +116,21 @@ fn serve_refuses_non_loopback_without_allow_remote() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("SYMBIA_HTTP_TOKEN"), "{out:?}");
 }
+
+#[test]
+fn config_prints_the_settings_in_effect_and_refuses_a_typo() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg = |args: &[&str]| Command::new(BIN).args(args).env("SYMBIA_HOME", t.path()).env("HOME", &home).output().unwrap();
+    std::fs::write(t.path().join("config.json"), r#"{"roots": ["~/work"]}"#).unwrap();
+    let out = cfg(&["config"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["settings"]["roots"], json!({"value": ["~/work"], "from": "config.json"}));
+    assert_eq!(v["settings"]["exec_read"]["from"], "default");
+    std::fs::write(t.path().join("config.json"), r#"{"root": ["~/work"]}"#).unwrap();
+    let out = cfg(&["config"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out).contains("unknown field `root`"), "{}", text(&out));
+}

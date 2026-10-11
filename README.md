@@ -33,6 +33,7 @@ The binary is `target/release/symbia`.
 | `symbia verify <sealed.sqlite> [--trust <hex>]... [--witness <folder>]` | Check a seal. Exit 0 and `ok <session> seq N head <12 hex>` (for a thread seal, also the thread and its kept and withheld counts), or exit 1 and the reason. With `--witness`, also check the seal against the witness file: a seal the witness never saw, or one older than the newest it saw, exits 1 with `witness not witnessed` or `witness behind` on stderr. |
 | `symbia show <sealed.sqlite> [--trust <hex>]...` | Verify a seal as `verify` does, then print its records in chain order, each prediction with its verdict (held, broke, mixed or open), and the commands run through `exec`. A seal that fails is not shown: exit 1 and the reason. |
 | `symbia get <sealed.sqlite> <key or id> [--trust <hex>]...` | Verify a seal, then print one record in full as JSON: by id, or the newest version of a key, with its links both ways. Exit 1 if the seal fails or holds no such record. |
+| `symbia config` | Print the settings in effect as JSON, each with where it came from: the defaults, `config.json`, or both. Exits 1 with the reason on a file the server would refuse at start. |
 | `symbia prune-legacy [--confirm]` | Remove seals made by builds before seals recorded a reason, where a newer full seal of the same session covers them. Each is written to the witness first, so a witness must be set. A dry run unless `--confirm`. |
 | `symbia trust add <hex> <label>` / `symbia trust list` | Pin a public key, or list pinned keys. |
 | `symbia --version` | Print the build. |
@@ -356,7 +357,7 @@ Where to keep it: outside the data folder (required) and outside your roots, so 
 | `sessions/` | Live session files, one SQLite file per session, and a `.lock` beside each one a `symbia mcp` process holds. |
 | `seals/` | Sealed copies and their signed `.seal.json` sidecars. |
 | `evidence/` | Full stdout and stderr of `exec` runs and images as sent by `read`, named by sha256. |
-| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock`, `exec_unsandboxed` and `read_roots` tune the shell sandbox and the file tools; `resume_window_ms` sets how `symbia mcp` resumes sessions; `embed` sets up search by meaning (see Search); `witness` names the witness folder (see Auditing). |
+| `config.json` | Optional. `roots` sets the folders the file and shell tools may use; `exec_read`, `exec_read_allow`, `exec_network`, `exec_deny`, `exec_unlock`, `exec_unsandboxed` and `read_roots` tune the shell sandbox and the file tools; `resume_window_ms` sets how `symbia mcp` resumes sessions; `embed` sets up search by meaning (see Search); `witness` names the witness folder (see Auditing). Read once at start. A key it doesn't know stops the server with an error, so a typo can't fall back to a default unnoticed. `read_roots` and `exec_read_allow` add to their built-in lists; every other key replaces its default. `symbia config` shows the result. |
 | `index.sqlite` | The search index across sessions and seals. Derived data: safe to delete. |
 | `ledger/` | Promoted seals and `ledger.sqlite`, the long-lived ledger. |
 
